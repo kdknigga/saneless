@@ -1140,24 +1140,9 @@ class _Init:
     """
     What the module remembers about the current ``sane_init``.
 
-    Module-level and **mutated, never rebound**, for the reason ``_Wedge``
-    gives: rebinding a module-level name needs a ``global`` statement, which
-    the ``PL`` rules in ruff's ``select`` reject, and the project forbids adding
-    a second suppression to say otherwise.  Keeping it beside ``_WEDGE`` also
-    keeps this module's process-global state in one place rather than two.
-
-    ``host`` is the configured ``host`` argument the initialising construction
-    passed, and it is what a later construction is compared against: what the
-    comparison has to catch is a second operator-configured host arriving
-    while SANE is already initialised with the first.  ``effective`` is the
-    host list SANE's net backend will
-    actually read, which differs from ``host`` whenever a non-empty
-    ``SANE_NET_HOSTS`` was exported, and it is what that comparison's warning
-    names, so the operator is pointed at the host SANE is really using.
-
-    ``written`` and ``previous`` let ``shutdown()`` undo saneless's own write,
-    so a later init writes its own host rather than finding the old one and
-    reporting it as set externally.
+    Mutated, never rebound.  A later construction's host is compared against
+    ``host``, and the warning names ``effective``, which differs whenever a
+    non-empty ``SANE_NET_HOSTS`` was exported.
 
     Attributes:
         done: Whether ``sane.init()`` has returned successfully and not yet
@@ -1181,13 +1166,9 @@ class _Init:
     version: object = None
 
 
-# Guards every read and write of _INIT.  Three threads reach it in production
-# -- whichever builds the backend, whichever shuts it down, and the worker that
-# re-initialises SANE at the start of a scan job -- and "look, then initialise"
-# is a check and a write that must not be split, or a racing pair of
-# constructions would each see an uninitialised SANE and call sane_init twice.
-# It is not reentrant, so shutdown() and _ensure_initialised() are called one
-# after the other and never one inside the other.
+# "Look, then initialise" must not be split, or two racing constructions both
+# call sane_init.  Not reentrant: shutdown() and _ensure_initialised() are
+# called one after the other, never one inside the other.
 _INIT_LOCK = threading.Lock()
 _INIT = _Init()
 
@@ -1197,36 +1178,15 @@ class _OpenHandles:
     """
     How many device handles this process has open right now.
 
-    ``sane_exit`` closes every handle that is still open, and on the net
-    backend each close is a request that waits for saned's reply
-    (``backend/net.c``: ``sane_exit`` calls ``sane_close`` on each one).  On a
-    host that has silently vanished that wait was measured to last longer than
-    40 seconds on both supported libsane builds.  So SANE is only restarted
-    when no handle is open, and this record is what makes "no handle is open"
-    something ``SaneBackend.reinitialise()`` can check rather than assume.
+    On the net backend ``sane_exit`` closes each open handle with a request
+    that waits for saned's reply, measured to outlast 40 seconds on a vanished
+    host, so SANE is restarted only when this record holds no handle.  Handles
+    are kept by identity, so closing one twice cannot count another as closed.
 
-    Handles are kept by identity rather than as a bare count, so closing one
-    handle twice cannot also count a different, still-open handle as closed.
-    A handle's identity is stable while it is recorded, because whoever
-    closes it holds a reference to it until then.
-
-    Module-level and **mutated, never rebound**, for the reason ``_Wedge``
-    gives.  A handle left open by a read that never returned stays recorded
-    until the reader thread closes it, because until then it is exactly the
-    kind of open handle ``sane_exit`` would try to close.
-
-    It also enforces one cancel per timed-out read.  Once the timeout's own
-    cancel has gone out on a handle, two more used to follow it: the feeder
-    iterator's finaliser (``_SaneIterator.__del__`` calls ``cancel()``) when
-    the iterator was dropped, and the routine cancel before close.  On the
-    ``net`` backend each is a request to a host that may have stopped
-    answering, and both ran on the worker thread with no bound.  So a handle
-    on which a cancel was issued is recorded in ``cancelled``; the device
-    context skips its routine cancel for it, and the feeder's iterator is
-    parked here instead of dropped.  ``_handle_closed`` drops a parked
-    iterator only once the handle is closed, when its finaliser's cancel is
-    refused by python-sane ("SaneDev object is closed") before it reaches
-    SANE, and swallowed.
+    It also enforces one cancel per timed-out read: on ``net`` each cancel is
+    an unbounded request.  A cancelled handle skips the routine cancel before
+    close, and its feeder iterator, whose ``__del__`` calls ``cancel()``, is
+    parked until the handle is closed, when python-sane refuses that cancel.
 
     Attributes:
         handles: The ``id()`` of each handle opened by ``_open_device`` and
@@ -1243,9 +1203,8 @@ class _OpenHandles:
     parked: dict[int, object] = field(default_factory=dict)
 
 
-# Guards every read and write of _OPEN_HANDLES.  It is taken inside
-# _WEDGE_LOCK by the reader that closes a stuck handle late, and never the
-# other way round, so the two cannot deadlock.
+# Taken inside _WEDGE_LOCK, never the other way round, so the two cannot
+# deadlock.
 _HANDLES_LOCK = threading.Lock()
 _OPEN_HANDLES = _OpenHandles()
 
@@ -1266,9 +1225,8 @@ def _handle_closed(dev: SaneDevice) -> None:
     """
     Record a handle as closed, whether or not its close succeeded.
 
-    Its cancel record goes with it, and so does any iterator parked for it,
-    which is dropped here, after the close and outside the lock: its
-    finaliser's cancel then meets a closed handle and never reaches SANE.
+    A parked iterator is dropped here, after the close and outside the lock,
+    so its finaliser's cancel meets a closed handle and never reaches SANE.
 
     Args:
         dev: The handle.
@@ -1316,9 +1274,8 @@ def _park_iterator(dev: SaneDevice, iterator: object) -> bool:
     """
     Hold a cancelled handle's feeder iterator until the handle is closed.
 
-    Dropping it any earlier would run its finaliser's cancel on an open
-    handle: a second cancel after the one already issued, and on the worker
-    thread, where nothing bounds it.
+    Dropping it earlier would send a second, unbounded cancel on the open
+    handle from the worker thread.
 
     Args:
         dev: The handle the iterator drives.
@@ -1347,72 +1304,35 @@ def _handles_open() -> int:
         return len(_OPEN_HANDLES.handles)
 
 
-# What a scan job is told when SANE cannot be restarted because a handle is
-# open.  It names no device and no host: the count does not know which device
-# the handle belongs to, and a net: id is a LAN address (ASVS 4.0.3 V7).
+# Names no device and no host: a net: id is a LAN address.
 _HANDLE_OPEN_REFUSAL: Final = (
     "Could not start a scan: a scanner handle from an earlier operation is "
     "still open, and SANE cannot be restarted safely while it is. Restart "
     "saneless if this does not clear."
 )
 
-# The prefix every acquisition thread is named with, so a stuck reader is
-# identifiable in a ``faulthandler`` dump or a debugger without guessing.
+# Thread names, so a stuck reader or cancel shows up in a faulthandler dump.
 _READER_THREAD_PREFIX = "sane-read-"
-
-# The name of the thread that cancels a timed-out read, for the same reason:
-# a cancel the scanner is slow to answer leaves it running past the grace.
 _CANCEL_THREAD_NAME = "sane-cancel"
 
-# How long a failed read waits for the threads the backend started for it to
-# end, before anything may cancel the read.
+# How long a failed read waits for the native threads the backend started for
+# it to end, before anything may cancel the read.
 #
-# Some backends read the scanner on a native thread of their own, started by
-# ``sane_start``, and stop it from ``sane_cancel`` with an *asynchronous*
-# ``pthread_cancel``, which kills the thread at whatever instruction it has
-# reached: libsane's ``test`` backend on every cancel, and ``avision``, ``hp``,
-# ``umax`` and ``hp3500`` when a scan is cancelled.  When the thread is inside
-# the C library holding one of its locks -- a ``malloc`` arena lock, as it
-# frees its buffers on the way out -- the lock is never released.  The thread
-# then deadlocks on itself as it ends, and ``sane_cancel``, which waits for it,
-# never returns; or another lock is left held and the process hangs later.
+# Some backends (``test``, ``avision``, ``hp``, ``umax``, ``hp3500``) stop their
+# reader thread from ``sane_cancel`` with an asynchronous ``pthread_cancel``.
+# A reader killed while holding a C-library lock, such as a ``malloc`` arena
+# lock, never releases it, and ``sane_cancel`` or a later call hangs.  A read
+# that fails at ``sane_start`` still has its reader running about one time in
+# twenty, so it is cancelled only once that reader has ended.
 #
-# A read that fails does so within a fraction of a millisecond of
-# ``sane_start`` when the backend reports the error before reading, and the
-# cancel used to follow at once: python-sane's ``snap()`` sends it itself, and
-# the feeder iterator's finaliser right after.  The reader thread was then
-# still running, about one time in twenty measured.  So a failed read now
-# waits for the threads it started to end, and only then is it cancelled --
-# by the device context, or by the feeder iterator's finaliser.  The ``test``
-# backend's reader ends within a millisecond when nothing is reading from it;
-# one second is ample, and it bounds the cost when a reader does not end on
-# its own, such as one blocked writing a page nobody will read.  The cancel
-# then finds it blocked in a system call, where a cancel is harmless.
-#
-# Which threads?  The process's native thread ids (``/proc/self/task``) are
-# read immediately before the read starts, and the wait is for ids that are
-# new since then and are not Python threads.  Python threads -- the web
-# server's, the job worker's, this module's own reader and cancel threads --
-# are recognised by ``threading.enumerate()``'s ``native_id`` and never waited
-# for, re-read on every poll so one that starts during the wait is recognised
-# too.  No second read can be running alongside: the server's scans all hold
-# the worker's scanner gate, and the CLI makes one scan at a time.  A native thread some other library starts in the
-# window would be waited for until it ends or the bound runs out: one second
-# at most, and only after a read has already failed.  A thread id reused
-# within the window would go unnoticed, which only means not waiting.
-#
-# What this does not cover: a read cancelled while it is still running -- a
-# page that timed out, Ctrl-C, a server stop -- has to be cancelled then and
-# there, so on the backends above that cancel can still hit a reader holding
-# a lock, and nothing here bounds what follows.  Nor does it reach a backend
-# that cancels its own reader inside ``sane_read`` as a page ends normally.
+# The wait is for native thread ids new since the read started that are not
+# Python threads; the scanner gate and the CLI ensure no second read runs
+# alongside.  A read cancelled while still running (timeout, Ctrl-C, server
+# stop) is not covered: it must be cancelled then and there.
 _BACKEND_THREAD_EXIT_SECONDS: Final = 1.0
 
-# How often the wait above looks again.  A reader ends in well under a
-# millisecond once it has finished, so finer polling would buy nothing.
 _BACKEND_THREAD_POLL_SECONDS: Final = 0.001
 
-# Where Linux lists this process's native threads, one directory per id.
 _TASK_DIR: Final = Path("/proc/self/task")
 
 
@@ -1438,8 +1358,7 @@ def _await_backend_threads(
     """
     Wait, bounded, for native threads started since ``before`` to end.
 
-    Python threads are excluded, as the comment on
-    ``_BACKEND_THREAD_EXIT_SECONDS`` explains.
+    Python threads are excluded; see ``_BACKEND_THREAD_EXIT_SECONDS``.
 
     Args:
         before: The ids ``_native_thread_ids`` returned just before the read
@@ -1476,9 +1395,8 @@ def _restore_sane_net_hosts() -> None:
     Undo saneless's own ``SANE_NET_HOSTS`` write, and forget it either way.
 
     The caller holds ``_INIT_LOCK``.  The variable is put back only while it
-    still holds the value saneless wrote: absent again when it was absent,
-    empty again when it was exported empty.  A value someone else wrote after
-    init is theirs and is left alone.
+    still holds the value saneless wrote; a value someone else wrote after
+    init is left alone.
     """
     if _INIT.written is not None and os.environ.get(SANE_NET_HOSTS) == _INIT.written:
         if _INIT.previous is None:
@@ -1493,41 +1411,15 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
     """
     Initialise SANE unless it already is, whoever asks.
 
-    ``sane_init`` is a process-global call, not a per-object one, so the
-    guard is here rather than in ``SaneBackend.__init__``: three one-shot CLI
-    commands and the web server each build their own backend, and a second
-    ``sane_init`` without a ``sane_exit`` between them is at best wasted work.
-    It is a guard and not a singleton deliberately -- every one of those
-    callers keeps getting its own ``SaneBackend``, which is what lets the tests
-    and the CLI construct one wherever they need it.  The per-job restart,
-    ``SaneBackend.reinitialise()``, calls ``shutdown()`` first, so it passes
-    this guard with SANE uninitialised.
+    ``sane_init`` is process-global, so the guard is here, not in
+    ``SaneBackend.__init__``: every caller still builds its own backend.
 
-    A later construction naming a *different* host is the case worth a WARNING
-    rather than silence.  The net backend reads ``SANE_NET_HOSTS`` when SANE
-    initialises it (``backend/net.c`` ``sane_init``, which the dll backend
-    calls lazily), so a host configured while SANE is already initialised is
-    not used for this process's own opens until the next initialisation, while
-    the operator who configured it has every reason to believe it is in
-    effect.  Listings are held to the same host list: a listing child's
-    ``SANE_NET_HOSTS`` comes from ``effective_sane_net_hosts``, which prefers
-    an exported value, and the host this function exported at init is one, so
-    the later backend's listings dial it too.  The warning names the host list
-    that was in effect at init, which is what SANE is using.  Only host names from the operator's
-    own configuration or environment are named, which the existing INFO line
-    already logs; no credential is in scope here (ASVS 4.0.3 V7).
+    A later construction naming a different host gets a WARNING: the net
+    backend reads ``SANE_NET_HOSTS`` only when SANE initialises, so that host
+    is not used until the next initialisation.
 
-    ``log_level`` is the level of the success lines.  A construction logs them
-    at INFO; the per-job restart passes DEBUG and logs one line of its own, so
-    each scan job adds one INFO line rather than three.
-
-    The failure translation is ``ScanError`` because a SANE that will not start
-    is a scanning failure the caller reports, and it catches ``Exception``
-    because python-sane raises ``_sane.error``, ``RuntimeError`` or
-    ``AttributeError`` with no shared base.  A failed init records
-    nothing, the environment included, so the next construction tries again
-    rather than assuming an initialised SANE that is not there, and does not
-    mistake this attempt's host for one set externally.
+    A failed init records nothing, the environment included, so the next
+    construction tries again.
 
     Args:
         host: Colon-separated sane-net hosts from the caller's configuration,
@@ -1554,10 +1446,8 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
                     host,
                 )
             return _INIT.version
-        # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
-        # scanners.  Multiple hosts are separated by colons — see sane-net(5).
         # An exported non-empty value wins over the configured host; an
-        # exported empty value names no host and counts as unset.
+        # exported empty value counts as unset.
         exported = exported_sane_net_hosts()
         if host and not exported:
             _INIT.previous = os.environ.get(SANE_NET_HOSTS)
@@ -1590,10 +1480,8 @@ def _read_outstanding() -> bool:
     """
     Report whether any thread is still inside a SANE read or its cancel.
 
-    The shutdown path has no handle to ask about, so it needs this
-    process-wide answer rather than one about a single device.  A read being
-    cancelled counts from the moment its cancel is decided on, because the
-    wedge is recorded before the cancel fires.
+    A read being cancelled counts from the moment its cancel is decided on,
+    because the wedge is recorded before the cancel fires.
 
     Returns:
         True if a read or cancel recorded in the wedge has not come back.
@@ -1607,44 +1495,17 @@ def shutdown(*, log_level: int = logging.INFO) -> None:
     """
     Shut SANE down for this process, or explain why it was not.
 
-    Called at an entry point's shutdown, and by ``SaneBackend.reinitialise()``
-    at the start of a scan job, under the scanner gate and only once it has
-    checked that no handle is open.  Never from a request path, and never from
-    an interpreter-exit hook, which would run while a daemon reader thread may
-    still be inside ``sane_read``.  It is idempotent, so an entry point that
-    closes more than one backend calls ``sane_exit`` once.
+    Called at an entry point's shutdown and by
+    ``SaneBackend.reinitialise()``; never from an interpreter-exit hook, which
+    would run while a daemon reader may still be inside ``sane_read``.
+    Idempotent.
 
-    ``log_level`` is the level of the "SANE shut down" line: INFO at an entry
-    point's shutdown, DEBUG on the per-job restart, which logs its own line.
-    The skip lines keep their levels.
+    The call is skipped, with a log line, when SANE was never initialised, or
+    while a read has not returned: ``sane_exit`` closes every open handle
+    holding the GIL, which is close-while-reading on all of them at once.
 
-    Two conditions skip the call rather than making it, and both are logged
-    because a silently skipped shutdown is indistinguishable from one that
-    happened:
-
-    - **SANE was never initialised in this process.** There is nothing to undo,
-      and ``sane_exit`` before ``sane_init`` is undefined by the standard.
-    - **A read has not returned.** ``sane_exit`` closes every open handle by
-      specification, and ``PySane_exit`` runs holding the GIL while
-      ``sane_read`` has released it -- exactly the close-while-reading sequence
-      ``_open_device`` already refuses on one handle, applied to
-      all of them at once.  At an entry point's shutdown the process is ending
-      anyway, so an un-exited SANE costs nothing next to a segfault on the way
-      out.  The per-job restart refuses before it gets here, so on that path
-      this check is a second guard, not the first.
-
-    Nothing escapes: a failing ``sane_exit`` is logged with its traceback and
-    swallowed, because at an entry point's shutdown the process is on its way
-    out and an exception here would replace whatever error the operator is
-    being shown.  On the per-job restart the ``sane_init`` that follows is what
-    reports a SANE that a failed exit left broken.
-    The guard is re-armed either way, so a later ``SaneBackend`` initialises
-    rather than assuming a SANE that a failed exit may well have left broken.
-
-    ``SANE_NET_HOSTS`` is put back as it was before init when it still holds
-    the value saneless wrote, so a later init writes its own host rather than
-    finding this one and reporting it as set externally.  The two early
-    returns leave it alone, because SANE is still initialised there.
+    A failing ``sane_exit`` is logged and swallowed, and the guard is re-armed
+    either way, so a later ``SaneBackend`` initialises afresh.
     """
     with _INIT_LOCK:
         if not _INIT.done:
@@ -1687,25 +1548,13 @@ def _cancel_read(dev: SaneDevice, done: threading.Event) -> None:
     """
     Cancel a blocked read, on the thread ``_settle_or_wedge`` starts for it.
 
-    The cancel runs on a thread of its own and not on the worker's, and that
-    is a correctness requirement rather than tidiness.  On the ``net`` backend
-    ``sane_cancel`` is ``sanei_w_call(SANE_NET_CANCEL)`` -- a blocking RPC on
-    the control wire, issued before the local data fd is closed -- so against a
-    saned that has stopped answering it hangs whoever calls it.  Whoever calls
-    it here would be the worker thread running the whole job, so the grace
-    would bound nothing at all (``backend/net.c``).
+    On the ``net`` backend ``sane_cancel`` is a blocking RPC that hangs
+    against a saned that stopped answering, so on the worker thread the grace
+    would bound nothing.  It is sound off-thread because ``sane_cancel``
+    releases the GIL, as ``sane_read`` does.
 
-    It is sound to call at all only because ``sane_cancel`` releases the GIL,
-    as ``sane_read`` does, which is what lets one Python thread cancel what
-    another is blocked in (``_sane.c`` 2.9.2, verified).  The thread is a
-    daemon for the same reason the reader is: if the RPC never returns, it
-    must not keep the process alive.
-
-    A failing cancel is logged and swallowed.  There is nothing else to do
-    with it -- the read is already lost -- and an exception here would reach
-    ``threading.excepthook`` and nobody else.  Either way the thread gives up
-    its token on the wedge as it ends, and closes the handle if it is the last
-    one out (``_release_wedge``).
+    A failing cancel is logged and swallowed; the read is already lost.
+    Either way the thread gives up its wedge token (``_release_wedge``).
 
     Args:
         dev: The device handle the blocked read is inside.
@@ -1735,14 +1584,9 @@ def _begin_settle(dev: SaneDevice, done: threading.Event, label: str) -> bool:
     """
     Record the wedge before the cancel fires, unless the read just returned.
 
-    The check and the write are one critical section because the reader may
-    return in the instant between the timeout and this call.  Reading ``done``
-    under the same lock the reader takes *after* setting it is what makes that
-    window closed rather than merely narrow.
-
-    Written first, and not once the grace has run out, so that nothing the
-    worker is interrupted by while it waits can leave the handle unrecorded
-    and closable under a read that is still running.
+    The check and the write are one critical section: the reader takes the
+    same lock after setting ``done``, which closes the window in which it
+    returns just after the timeout.
 
     Args:
         dev: The handle the reader is inside.
@@ -1776,13 +1620,10 @@ def _end_settle(
     """
     Stop waiting: clear the wedge if nothing is left inside SANE, else keep it.
 
-    The reader counts as finished once ``done`` is set, because its work is
-    over by then and all it has left is to give up its token.  The cancel
-    thread counts as finished once it has given up its own, or if it never
-    started, which is what an interrupt landing before it was built, or
-    before or inside its ``start()``, can leave behind.  ``cancel_started`` and ``is_alive()`` are
-    both consulted for the reason ``_acquire_with_timeout`` gives for the
-    reader.
+    The reader counts as finished once ``done`` is set.  The cancel thread
+    counts as finished once it has given up its token, or if an interrupt
+    stopped it from starting; ``cancel_started`` and ``is_alive()`` cover the
+    two halves of an interrupted ``start()``.
 
     Args:
         done: The event identifying this acquisition.
@@ -1816,18 +1657,10 @@ def _release_wedge(dev: SaneDevice, done: threading.Event, holder: str) -> None:
     """
     Give up one thread's token, and close the handle if it was the last.
 
-    Called by the reader as it returns and by the cancel thread as it ends.
-    The last of them closes, rather than the thread that gave up on them,
-    because by then the thread that gave up has long since raised -- and only
-    the last one out knows that nothing is left inside SANE on the handle,
-    which is the one fact SANE requires before any other operation may run on
-    it.  While the worker is still waiting out the grace (``settling``) it
-    owns the outcome, so nothing closes here.
-
-    A close failure is logged and never raised: this runs in a daemon thread
-    whose exception nobody would see, and an unhandled one would surface in a
-    test run as a ``PytestUnhandledThreadExceptionWarning`` turned into an
-    error.
+    Only the last one out knows nothing is left inside SANE on the handle,
+    which SANE requires before any other operation.  While the worker is
+    still ``settling`` it owns the outcome, so nothing closes here.  A close
+    failure is logged, never raised, as this runs on a daemon thread.
 
     Args:
         dev: The handle to release.
@@ -1853,9 +1686,7 @@ def _release_wedge(dev: SaneDevice, done: threading.Event, holder: str) -> None:
             dev.close()
         except Exception:
             logger.warning("Could not close the released scanner", exc_info=True)
-        # Counted as closed either way, as _open_device does: the close was
-        # attempted, and counting the handle open forever would refuse every
-        # later scan job's SANE restart until saneless itself was restarted.
+        # Counted as closed either way, or every later SANE restart refuses.
         _handle_closed(dev)
         _clear_wedge()
 
@@ -1864,12 +1695,9 @@ def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
     """
     Record which device is wedged, and report that it is.
 
-    The acquisition helper knows the handle but not its SANE name; the device
-    context manager knows both.  This is where the two meet, so the refusal a
-    later call raises can name the device the operator has to deal with.
-
-    Only the device id is recorded.  No host string and no credential from
-    ``SANE_NET_HOSTS`` is written anywhere on this path (ASVS 4.0.3 V7).
+    The device context knows the SANE name the acquisition helper lacks, so
+    the later refusal can name the device.  Only the device id is recorded,
+    never a host string.
 
     Args:
         dev: The handle being released, or not.
@@ -1890,14 +1718,9 @@ def _refuse_if_wedged(device_id: str, operation: str) -> None:
     """
     Refuse a new SANE operation while a read is still outstanding.
 
-    Called before anything is opened, because the refusal is worthless
-    otherwise: ``sane_open`` on a device whose previous read never returned is
-    itself one of the operations the SANE standard forbids.
-
-    The wedge is not permanent.  When the late read finally returns, the
-    reader thread closes the handle and clears this record, so a transient
-    network hang recovers without a restart -- which is why the message says
-    "if it does not" rather than "restart saneless".
+    Called before anything is opened: ``sane_open`` on a device whose read
+    never returned is itself forbidden.  The wedge clears itself when the late
+    read returns, hence "if it does not" in the message.
 
     Args:
         device_id: The device the refused call was for.
@@ -1912,8 +1735,7 @@ def _refuse_if_wedged(device_id: str, operation: str) -> None:
             return
         wedged_id = _WEDGE.device_id or "the scanner"
         label = _WEDGE.page_label or "an earlier page"
-    # Both ids can come from discovery, which is LAN-supplied text, and this
-    # message reaches the terminal, the log and a traceback as it is built.
+    # Both ids can be LAN-supplied text bound for the terminal and log.
     shown = neutralise_controls(device_id)
     wedged_msg = (
         f"Could not {operation} {shown}: a read on "
@@ -1931,22 +1753,14 @@ def _settle_or_wedge(
     """
     Run the cancel tail: record the wedge, cancel, wait out the grace, decide.
 
-    The wait is for both threads that may be inside SANE on the handle: the
-    reader, and the thread sending the cancel (``_cancel_read``).  Both come
-    out of one grace, so a scanner slow to answer the cancel holds the worker
-    for the grace and no longer.  A cancel still in flight when the grace runs
-    out leaves the handle wedged even if the read has returned, since closing
-    under a cancel is no safer than closing under a read.
+    The reader and the cancel thread share one grace.  A cancel still in
+    flight when it runs out leaves the handle wedged even if the read
+    returned: closing under a cancel is no safer than under a read.
 
-    The wedge is recorded first, before the clock is read or the cancel
-    thread is built, so an interrupt landing in any of that work finds it
-    standing and the device context leaves the handle alone.  The decision is
-    taken in a ``finally``, so an interrupt landing during the wait -- a
-    second Ctrl-C, say -- still ends it.  A signal can still land in the few
-    instructions between the record and the ``try``, or in that ``finally``
-    itself; the record then stays settling and is never cleared, which
-    refuses later scans until a restart but never closes a handle under a
-    running call.
+    The wedge is recorded first and decided in a ``finally``, so an interrupt
+    during the wait still ends it.  A signal landing between the record and
+    the ``try`` leaves it settling forever, which refuses later scans but
+    never closes a handle under a running call.
 
     Args:
         dev: The handle the blocked read is inside.
@@ -1961,8 +1775,6 @@ def _settle_or_wedge(
         if not, in which case the handle is wedged and nothing may touch it.
 
     """
-    # The wedge is recorded before anything else, so that an interrupt
-    # landing in the work that follows finds it standing.
     if not _begin_settle(dev, done, label):
         return True
     began = time.monotonic()
@@ -1976,8 +1788,7 @@ def _settle_or_wedge(
             name=_CANCEL_THREAD_NAME,
             daemon=True,
         )
-        # Noted before the cancel goes out, so no later cleanup can race it
-        # into sending a second one (``_OpenHandles``).
+        # Before the cancel goes out, so no later cleanup sends a second one.
         _note_cancel_issued(dev)
         canceller.start()
         started = True
@@ -2019,68 +1830,19 @@ def _acquire_with_timeout(
     """
     Run one blocking SANE acquisition under a wall-clock bound.
 
-    ``signal.alarm`` is not safe off the main thread, so the bound has to come
-    from a second thread either way.  What changed is *which* second thread.
-    The thread pool that used to supply it was the wrong one: every worker
-    ``concurrent.futures`` starts is non-daemon, and its ``_python_exit``
-    hook -- registered with ``threading._register_atexit`` -- joins all of
-    them at interpreter exit.  A pooled worker stuck in a blocking C call
-    therefore stops the process from exiting at all: ``docker stop`` waits out
-    its grace and then SIGKILLs, and a test session hangs.  Measured on
-    CPython 3.14.2 against a real blocking read: pooled worker stuck, never
-    exits; non-daemon thread stuck, never exits; ``daemon=True`` thread stuck,
-    exits in 0.24 s.
+    Each acquisition gets a fresh ``daemon=True`` thread: a non-daemon or
+    pooled thread stuck in a blocking C call is joined at interpreter exit and
+    stops the process from exiting at all.
 
-    So each acquisition gets a fresh ``daemon=True`` thread.  A thread per page
-    costs nothing beside a multi-second scan, and -- unlike a shared pool --
-    one stuck read cannot poison the next job.
+    On timeout, or any exception once the reader may have started, the wedge
+    is recorded, the read cancelled and both waited for (``_settle_or_wedge``).
+    The late value is discarded unconditionally: measured on real libsane, a
+    cancelled ``snap()`` hands back a truncated image rather than raising, and
+    it passes ``_validate_page_image``.
 
-    On timeout the sequence is record the wedge, cancel, wait, then close
-    only if the read returned and the cancel came back.  The cancel goes out
-    on a thread of its own, and the wait for both is bounded by one grace
-    (``_settle_or_wedge``).  **The late value is discarded unconditionally.**
-    Only whether the reader *returned* is consulted, never what it returned:
-    measured on real libsane, a cancelled ``snap()`` hands back a truncated
-    image rather than raising -- 3779x242 of a full page -- and that image
-    clears ``_validate_page_image``, so "use it, it arrived after all" would
-    put one more page in the PDF than the error message claims.
-
-    A ``KeyboardInterrupt`` arriving while this waits takes the identical path
-    and is then re-raised, so Ctrl-C during a read leaves the device in the
-    same state a timeout does.  So does any other exception once the reader
-    has started, since no exception type may leave a running read behind a
-    handle the device context is about to close.  A second one arriving during the grace ends
-    the wait early and replaces the first, but the wedge written before the
-    cancel still stands, so the handle is not closed under the read.
-
-    ``reader.start()`` is inside the guarded block, so an interrupt landing
-    once the thread exists cannot abandon it with no cancel ever fired.  The
-    handler then asks whether there *is* a reader before running the cancel
-    tail, because the other end of that window is real too and worse: an
-    interrupt arriving before the thread was created would otherwise fire
-    ``dev.cancel()`` on a handle with no read in progress, block for the whole
-    grace on an event nothing will ever set, and then mark a wedge that nothing
-    could ever clear -- ``_release_wedge`` is only called from a reader's
-    ``finally``, and there would be no reader.  Every later ``scan_pages`` and
-    ``get_capabilities`` would refuse and ``shutdown()`` would permanently skip
-    ``sane.exit()``.
-
-    ``started`` and ``is_alive()`` are both consulted because they answer for
-    different halves of that window: the flag for an interrupt after
-    ``start()`` returned, and the liveness check for one that landed inside it,
-    after the thread had already been handed to the OS.
-
-    When the work fails, the reader waits, up to a second, for the native
-    threads the backend started for the read to end before it reports the
-    failure, so that no cancel sent afterwards -- by the device context or by
-    the feeder iterator's finaliser -- can land on a backend thread that is
-    still running (``_BACKEND_THREAD_EXIT_SECONDS``).  The timeout path cannot
-    wait like that: a read still running has to be cancelled as it is.
-
-    The reader catches ``BaseException`` and stores it: nothing may reach
-    ``threading.excepthook``, where an unhandled thread exception becomes a
-    ``PytestUnhandledThreadExceptionWarning`` and, under this project's
-    ``filterwarnings = ["error"]``, an error in an unrelated test.
+    With no reader started there is nothing to settle; a cancel there would
+    record a wedge no reader could ever clear.  A failed read waits for the
+    backend's own threads before reporting (``_BACKEND_THREAD_EXIT_SECONDS``).
 
     Args:
         dev: The open handle the work will block inside.
@@ -2105,13 +1867,11 @@ def _acquire_with_timeout(
     slot = _Slot()
 
     def read() -> None:
-        # Listed before the work starts the read, so the threads the backend
-        # starts for it are the ones that are new afterwards.
         before = _native_thread_ids()
         try:
             slot.value = work()
         except BaseException as exc:
-            # Handed to the waiter rather than raised: see the docstring.
+            # Handed to the waiter: nothing may reach threading.excepthook.
             slot.error = exc
             # Before ``done`` is set, so nothing can cancel this failed read
             # while the backend's own reader is still running.
@@ -2129,14 +1889,9 @@ def _acquire_with_timeout(
         started = True
         finished = done.wait(budget.timeout)
     except BaseException:
-        # Ctrl-C, or a SIGTERM/SIGHUP (or a server stop) raised as
-        # ScanInterrupted, landed while this thread waited on the read -- or
-        # the wait itself failed.  Whatever it was, a reader that has started
-        # must be settled exactly as on a timeout: cancel the read and wait
-        # for it, so the handle is never closed under a read that is still
-        # running.  With no reader started there is nothing to settle.  The
-        # exception is re-raised unchanged either way, so the caller still
-        # tells a cancel from an interruption.
+        # A started reader is settled exactly as on a timeout, so the handle
+        # is never closed under a running read; the exception is re-raised
+        # unchanged.
         if started or reader.is_alive():
             _settle_or_wedge(dev, done, budget.grace, page_label)
         raise
@@ -2156,18 +1911,9 @@ class _PageBudget:
     """
     How long one page may take, how long its cancel may, and how many a pass may.
 
-    Bundled into one record rather than passed as separate parameters because
-    ``_acquire_pages`` and ``_snap_flatbed`` would otherwise sit past ruff's
-    ``PLR0913`` argument limit, and this project neither raises the limit nor
-    suppresses the rule. Both acquisition paths take the same record, so
-    one sheet is bounded the same way whichever way it was presented; the page
-    cap means nothing to the flatbed path, which takes one sheet.
-
-    A scan builds one from the page the device agreed to send
-    (``_page_budget_seconds``), so the timeout grows with the page. Every
-    default is the module constant both paths share, so "one sheet is one
-    sheet, whichever way it was presented" is expressed in the default rather
-    than merely asserted about it.
+    Both acquisition paths take the same record, so one sheet is bounded the
+    same way whichever way it was presented; the flatbed path ignores the
+    page cap.
 
     Attributes:
         timeout: Maximum seconds to wait for the sheet.
@@ -2186,9 +1932,6 @@ class _PageBudget:
     page: str | None = None
 
 
-# The shared default instance.  A module constant and not an inline
-# ``_PageBudget()`` in the signature, because a call in a default argument is
-# what ruff's B008 rejects; a frozen instance is safe to share.
 _DEFAULT_PAGE_BUDGET = _PageBudget()
 
 
@@ -2220,77 +1963,29 @@ def _acquire_pages(
     """
     Spool the validated ADF pages, and report what was skipped or not kept.
 
-    A page flows device -> validate -> crop -> ``sink.add`` -> record, one at a
-    time, and no list of images exists anywhere along it.  The
-    only image-typed name that outlives a loop iteration is the one page being
-    acquired, which is why the live-page high-water mark a 12-page scan
-    measures is 2 and not 1: the loop variable still references page *k-1*
-    while page *k* is being read.  That is left alone deliberately -- a ``del``
-    added to make the number 1 would exist only to satisfy a test.
+    Pages flow one at a time to the sink; no list of images exists.
 
-    ``multi_scan()`` returns an iterator object and cannot raise, so the call
-    is not guarded.  python-sane's ``_SaneIterator.__next__`` converts exactly
-    one message into ``StopIteration``, and that is the only feeder-empty
-    signal there is.  Every other exception is a real fault -- a jam, an open
-    cover, a busy device, an I/O error -- and is reported as itself.
+    python-sane's iterator turns exactly one message into ``StopIteration``,
+    the only feeder-empty signal.  Every other exception is a real fault (a
+    jam, an open cover, a busy device) and is reported as itself; do not infer
+    "feeder empty" from a failure on the first page.
 
-    The zero-page ``FeederEmptyError`` at the end is how a feeder that produced
-    no page reports itself, which is true: it has no paper in it.
-    (``_snap_flatbed`` raises the same error when the device answers its
-    single acquisition with "Document feeder out of documents".)  Do not
-    re-introduce a first-page special case here; inferring "the feeder is
-    empty" from "it failed on iteration zero" made a jam, an open cover and a
-    busy device all tell the operator to load paper.
-
-    A page that fails its integrity checks is skipped and counted, not fatal:
-    one corrupt sheet must not fail a fifty-sheet job.  A batch in which
-    *every* fed page was rejected does raise, because returning an empty list
-    would reach ``assemble_pdf([])`` and record a job that produced nothing as
-    a success.
-
-    Reaching the page cap is not a failure either. The overrun can only be
-    seen on the sheet *past* the cap, so that sheet has been fed and acquired
-    by the time it is recognised; it is discarded without validation or the
-    sink, the feed is stopped, and its number goes back to the caller with the
-    pages already kept. A capped pass in which every kept-or-skipped sheet was
-    unreadable still raises, exactly as an uncapped one does.
-
-    **A skipped page may break manual-duplex parity, and that is accepted
-    deliberately.** One skipped front makes ``len(front_pages) !=
-    len(back_pages)``, which ``pipeline.py`` routes to its duplex-mismatch
-    delivery -- two partial PDFs plus a warning instead of
-    one interleaved document.  That is the honest response: a page the device
-    could not read genuinely means the two manual-duplex passes no longer
-    correspond.  The promise that manual-duplex page parity survives forbids
-    parity broken by *policy* -- the backend silently discarding a clean blank
-    back page -- and not parity broken by a page that could not be read at all.
-    Parity broken that way is reported, never hidden.  The pipeline goes
-    further than the count: it splits a manual-duplex run into its
-    ``(fronts)`` and ``(backs)`` PDFs whenever either pass skipped a sheet,
-    even when the counts still match, because two passes that each lost a
-    different sheet agree on the count and pair every later page wrongly.
+    An unreadable page is skipped and counted, but a pass in which every fed
+    page was unreadable raises.  A skipped page may break manual-duplex
+    parity; the pipeline reports that rather than hiding it.
 
     Args:
         dev: Open SANE device handle.
-        sink: Where each accepted page goes.  ``add`` is called exactly once
-            per accepted page, after it passed its integrity checks and was
-            cropped, and nothing here retains the image afterwards.
-        framing: Its crop is applied to each accepted page before the sink
-            sees it, so what is spooled is what the PDF embeds, and its
-            resolution -- the one the device read back -- is the dpi the sink
-            records the page at.  The caller builds it from the paper size,
-            that resolution and whether the scan area was set on the device.
-        budget: The per-page timeout, the grace a timed-out read is given
-            to come back after it has been cancelled, and the most sheets the
-            pass keeps.  The first two are injectable so a test proving the
-            unresponsive-cancel path need not wait out the module's real ten
-            seconds; the cap is chosen by the caller from the source.
+        sink: Where each accepted page goes, once, after validation and crop.
+        framing: The crop applied to each accepted page and the dpi the sink
+            records it at.
+        budget: The per-page timeout, the cancel grace, and the most sheets
+            the pass keeps.
 
     Returns:
         The records the sink returned, in acquisition order, how many fed
         sheets were skipped for failing their integrity checks, and the
-        number of the sheet fed past the cap when there was one.  Both facts
-        leave the backend inside ``ScanBatch`` and by no other route.
+        number of the sheet fed past the cap when there was one.
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
@@ -2303,12 +1998,8 @@ def _acquire_pages(
 
     records: list[PageRecord] = []
     page_num = 0
-    # Returned to the caller rather than kept local: the operator is told how
-    # many sheets were skipped, not left to find it in a log line, and
-    # ScanBatch is that count's one channel. It is deliberately kept out of the
-    # pipeline's blank-page removal count: that field means empty-page
-    # detection and is shown to users as pages removed for being blank, so
-    # reporting a corrupt page through it would tell them something untrue.
+    # Kept apart from the pipeline's blank-page count: a corrupt page was not
+    # removed for being blank.
     rejected_pages = 0
     sheet_not_kept: int | None = None
     try:
@@ -2323,8 +2014,6 @@ def _acquire_pages(
             except StopIteration:
                 break
             except ScanError:
-                # FeederEmptyError subclasses ScanError, so saneless's own
-                # errors -- including the timeout path's -- propagate here.
                 raise
             except Exception as exc:
                 scan_error_msg = (
@@ -2332,12 +2021,8 @@ def _acquire_pages(
                 )
                 raise ScanError(scan_error_msg) from exc
 
-            # The overrun is detected on the page *past* the cap, not on the
-            # cap itself: a legitimate maximal stack only learns it is finished
-            # when the next probe raises, so stopping at equality would reject
-            # a full hopper.  That sheet has been fed, so it is discarded here,
-            # before validation or the sink, and not counted in page_num: the
-            # checks below are about the sheets the pass kept or skipped.
+            # Detected on the sheet past the cap, since a full hopper only ends
+            # when the next probe raises; that fed sheet is discarded uncounted.
             if page_num >= budget.max_pages:
                 sheet_not_kept = page_num + 1
                 logger.warning(
@@ -2350,35 +2035,22 @@ def _acquire_pages(
 
             page_num += 1
 
-            # Integrity only: nonzero dimensions and minimum raw size. Whether
-            # the page is worth keeping is the pipeline's decision, not ours.
             if not _validate_page_image(page_image, page_num):
-                # Skip and count, never abort. The per-page WARNING naming the
-                # page number and the reason comes from _validate_page_image.
                 rejected_pages += 1
                 continue
 
-            # Cropped here, per page, instead of over a finished list
-            # afterwards.  The sink is where this page stops being ours, so
-            # everything that has to happen to it happens before the hand-off
-            # -- and what is spooled is exactly what the PDF embeds.
             records.append(sink.add(framing.crop(page_image), dpi=framing.resolution))
     finally:
-        # A cancel already issued means one more, from the iterator's
-        # finaliser, would be a second unbounded request on this thread, so the
-        # handle's record takes the iterator and drops it after the close.
-        # Otherwise the reference is dropped here, which is safe even for a
-        # wedged device: the reader thread's own callable keeps the iterator
-        # alive until its read returns.
+        # After a cancel, the iterator's finaliser would send a second,
+        # unbounded one, so it is parked until the close.  Otherwise dropping
+        # it is safe: a wedged reader's callable keeps it alive.
         if not _park_iterator(dev, iterator):
             del iterator
 
     if page_num == 0:
         raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE)
 
-    # Paper was fed but none of it was readable. This is a distinct condition
-    # from an empty feeder and is reported distinctly: the operator needs to
-    # hear "unreadable", not "load paper".
+    # "Unreadable", not "load paper".
     if rejected_pages == page_num:
         all_rejected_msg = (
             f"All {page_num} page(s) fed were unreadable and were skipped "
@@ -2394,36 +2066,14 @@ def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
     """
     Pick the single-sided document feeder a manual-duplex pass scans through.
 
-    The operator's ``requested`` source wins when the device reports it and it
-    is a single-sided feeder, so someone who deliberately chose one of two
-    feeders gets that one. "Reports it" means what it means for every other
-    source: ``_match_source`` ignores case and surrounding whitespace and
-    returns the device's spelling, so ``"adf"`` picks a listed ``"ADF"``
-    rather than merely the first feeder. Otherwise the first reported single-sided feeder is
-    used -- read from the device, never guessed. Hardcoding the short feeder
-    name was declined: consumer feeders report ``"Automatic Document
-    Feeder"``, and a name the device does not list would fail on exactly the
-    hardware manual duplex exists for.
+    The ``requested`` source wins when the device reports it (as
+    ``_match_source`` matches) and it is a single-sided feeder; otherwise the
+    first single-sided feeder the device reports is used.
 
-    Whether a source feeds, and whether it scans both sides, is asked of
-    ``classify_source`` and nothing else, so no call site can classify a
-    source differently from another.
-
-    A feeder that scans both sides (``SourceKind.FEEDER_DUPLEX``) is never
-    used. Each pass through it returns 2N pages, the two passes' counts agree,
-    ``saneless.duplex.interleave_duplex`` pairs a front+back sequence with a
-    reversed back+front one, and the job reports ``DONE`` with 4N pages in
-    scrambled order. So "any feeder" is deliberately not good enough: when the operator
-    named a both-sides source and a single-sided one exists, the single-sided
-    one is used with a WARNING naming both; when every feeder scans both sides,
-    manual duplex is refused before any page, because a WARNING beside a green
-    ``DONE`` on an unattended appliance is still silent corruption.
-
-    There is deliberately no ``Auto`` fallback here. ``Auto`` does not feed,
-    and with ``auto_source_mode`` at its ``"flatbed"`` default substituting it
-    takes one platen snapshot per pass and reports success, so manual duplex
-    silently does not work at all. A device with no feeder is refused instead,
-    before any page.
+    A both-sides feeder is never used: each pass returns 2N pages whose
+    counts agree, so interleaving reports ``DONE`` with pages in scrambled
+    order.  There is no ``Auto`` fallback either, since ``Auto`` may take one
+    platen snapshot per pass and report success.
 
     Args:
         available_sources: The source names the device reports, from a
