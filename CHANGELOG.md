@@ -41,13 +41,28 @@ The first release, 0.2.0.
 
 ### Changed
 
-- Three groups of log lines carry a new logger name, so a log filter or alert
-  keyed on the name the release candidates used needs updating: the
-  `Auto-profiles:` lines now come from `saneless.startup_profiles` (was
-  `saneless.worker`), the manual-duplex warnings about mismatched resolutions
-  and a backs pass stopped at its page cap from `saneless.duplex` (was
-  `saneless.pipeline`), and the saned pre-probe lines from
-  `saneless.scanner.saned_probe` (was `saneless.checks`).
+- Some log lines carry a new logger name, so a log filter or alert keyed on the
+  name the release candidates used needs updating:
+  - the `Auto-profiles:` lines from start-up profile generation now come from
+    `saneless.startup_profiles` (was `saneless.worker`); the
+    `Auto-profiles: startup generation failed` error still comes from
+    `saneless.worker`;
+  - the manual-duplex warnings about mismatched resolutions and a backs pass
+    stopped at its page cap come from `saneless.duplex` (was
+    `saneless.pipeline`);
+  - the saned pre-probe lines come from `saneless.scanner.saned_probe` (was
+    `saneless.checks`);
+  - the warning that a paperless-ngx list could not be fetched comes from
+    `saneless.web.metadata_view` (was `saneless.web.routes`), and reads
+    "answering unavailable" where it read "using empty list";
+  - the debug line saying whether a prompt answer's owner matched comes from
+    `saneless.web.owner` (was `saneless.web.routes`), and starts
+    "Answer for job" where it started "Flip answer for job".
+
+  Two error lines that no release candidate logged come from the view modules:
+  the lazy list load's failure to read the job from
+  `saneless.web.metadata_view`, and the failure to render the job status from
+  `saneless.web.status_view`.
 
 ### Removed
 
