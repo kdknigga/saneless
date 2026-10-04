@@ -377,9 +377,11 @@ def test_an_oversized_header_is_refused_before_its_body() -> None:
     """
     with (
         _pipe_carrying(LENGTH_PREFIX.pack(MAX_HEADER_BYTES + 1)) as fd,
-        pytest.raises(ProtocolError),
+        pytest.raises((ProtocolError, ChildGoneError)) as refused,
     ):
         read_frame(fd, _no_wait, max_pixels=_LARGE_CAP)
+
+    assert type(refused.value) is ProtocolError
 
 
 def test_a_header_of_the_cap_is_read() -> None:
@@ -458,9 +460,14 @@ _SHORT_SENDS = [
 
 @pytest.mark.parametrize("sent", _SHORT_SENDS)
 def test_end_of_file_in_a_frame_means_the_child_is_gone(sent: bytes) -> None:
-    """A reply channel that closes before a whole frame is a gone child."""
-    with _pipe_carrying(sent) as fd, pytest.raises(ChildGoneError):
+    """A reply channel that closes before a whole frame is a gone child, not a bad one."""
+    with (
+        _pipe_carrying(sent) as fd,
+        pytest.raises((ChildGoneError, ProtocolError)) as ended,
+    ):
         read_frame(fd, _no_wait, max_pixels=_LARGE_CAP)
+
+    assert type(ended.value) is ChildGoneError
 
 
 def test_end_of_file_mid_page_means_the_child_is_gone() -> None:
