@@ -8,6 +8,9 @@ the same budget and show the same ticks the same way.  A ticked id the list
 no longer names, and a list that could not be loaded at all, are facts the
 page states rather than hides.  The contexts are built here, so the handlers
 only choose which one to render.
+
+The lazy list load also re-renders the Scan button, so the job it is rendered
+from is read here too, from the status view, in a way that never fails.
 """
 
 from __future__ import annotations
@@ -29,10 +32,15 @@ from saneless.vocabulary import (
     unlisted_tag_label,
 )
 from saneless.web import cache as web_cache
+from saneless.web import owner, scan_block, status_view
 from saneless.web.cache import MetadataUnavailableError
+from saneless.web.job_view import JobView
+from saneless.web.services import services
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from starlette.requests import Request
 
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import CachedList, MetadataCache
@@ -45,6 +53,7 @@ __all__ = [
     "cached_list_or_none",
     "correspondent_options_context",
     "metadata_retry_seconds",
+    "metadata_scan_state",
     "no_correspondent_options",
     "no_tag_list",
     "tag_list_context",
@@ -467,3 +476,46 @@ def metadata_retry_seconds(ttl: float) -> int:
         METADATA_RETRY_FLOOR_SECONDS,
         math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)),
     )
+
+
+def metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
+    """
+    Read what the lazy list load's Scan button is rendered from, never failing.
+
+    The job comes from the same status context the page builds, for the job
+    this browser follows, so an active job still disables the button.  The
+    loader polls until it is answered, and a poll cannot usefully receive an
+    error: a store read that fails would be written into the alert slot on
+    every tick, with the lists that did load thrown away and Scan held for
+    good.  So a failure is logged and the button is rendered as though no
+    job were running, with the blocked verdict, which comes from the
+    settings alone, kept.  The status poll owns the job and corrects the
+    button once it can read the job again.  Until then the poll reads the
+    same failing store and answers with its lost-contact fallback, which
+    carries no Scan button, so a press in that window is left to
+    ``start_scan``, which refuses or queues it.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The job view, or None, and whether the appliance blocks a scan.
+
+    """
+    svc = services(request)
+    try:
+        live = status_view.status_context(
+            svc.worker,
+            svc.job_store,
+            status_view.status_facts(
+                request,
+                followed_job_id=status_view.owned_active_job_id(
+                    svc.worker, svc.job_store, owner.presented_owner(request)
+                ),
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to read the job for the lazy list load")
+        return None, scan_block.block_for(svc.settings) is not None
+    job = live["job"]
+    return (job if isinstance(job, JobView) else None), bool(live["scan_blocked"])

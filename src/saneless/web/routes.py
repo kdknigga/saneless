@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import html
 import logging
-import secrets
-import uuid
-from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Final, assert_never
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
@@ -27,27 +22,14 @@ from starlette.responses import HTMLResponse, Response
 from saneless.checks import (
     POLL_PROBE_ATTEMPT_CAP,
 )
-from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
-from saneless.job import WEB_HISTORY_LIMIT
+from saneless.config import PaperlessId, resolve_job_title
 from saneless.scan_metadata import resolve_scan_metadata
-from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
-    HIDDEN_JOB_TITLE,
-    IDLE_LINE,
-    LOST_CONTACT_LINE,
-    MULTI_PAGE_DISABLED_REASON,
-    MULTI_PAGE_HELP,
-    MULTI_PAGE_LABEL,
     NO_SCRIPT_LINE,
-    PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
-    SCAN_BLOCKED_REASON,
-    SCAN_BLOCKED_URL_REASON,
     TAG_FILTER_LABEL,
     TITLE_MAX_LENGTH,
-    TOKEN_UNSET_JOB_ERROR,
-    URL_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -57,20 +39,18 @@ from saneless.vocabulary import (
     RequestRejection,
     SubmitResult,
     WorkerHealth,
-    busy_line,
-    flip_deadline_note,
-    flip_heading,
-    last_scan_detail,
-    last_scan_line,
-    non_owner_wait_line,
-    page_title,
-    pass_heading,
-    pass_prompt_copy,
     progress_label,
     scan_hold_reason,
     worker_health_detail,
 )
-from saneless.web import metadata_view, owner, strip_view
+from saneless.web import (
+    metadata_view,
+    owner,
+    profile_view,
+    scan_block,
+    status_view,
+    strip_view,
+)
 from saneless.web.errors import (
     RETRY_AFTER_SECONDS,
     TITLE_CONTROL_TYPE,
@@ -79,23 +59,16 @@ from saneless.web.errors import (
 )
 from saneless.web.job_view import (
     JobView,
-    build_job_view,
-    owns_detail,
-    scrub_for_owner,
 )
 from saneless.web.refresher import ManualProbe
 from saneless.web.services import PaperlessTestAnswer, services
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from saneless.config import ProfileConfig, Settings
-    from saneless.job import Job, JobStore
-    from saneless.vocabulary import PassPrompt, PassPromptCopy
+    from saneless.job import JobStore
     from saneless.worker import ScanWorker
 
-__all__ = ["router", "scan_is_blocked"]
+__all__ = ["router"]
 
 logger = logging.getLogger(__name__)
 
@@ -180,1264 +153,6 @@ where it is used.
 """
 
 
-def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | None:
-    """
-    Find the job the status area should report: the current one, else the latest.
-
-    The worker clears its current job id in ``_process_job``'s ``finally``, so a
-    request landing as a job ends -- a flip Continue or Abort in particular --
-    finds no current job.  Falling back to the most recent job makes that
-    request report the job that just ended instead of the idle "Ready to scan."
-    copy, which would claim nothing happened.  Every route that renders the
-    status area uses this one lookup, so none of them can drift.
-
-    The fallback skips rows rejected at submit.  A refused submit --
-    queue full, worker down or degraded -- writes a REJECTED row that is newer
-    than the job running at the time, yet it never ran, so it cannot be "the
-    job that just ended".  ``JobStore.latest_run_job`` leaves those rows out;
-    the lookup's contract is otherwise unchanged, and history still lists them.
-
-    The fallback also skips a refused submit whose REJECTED write the request
-    could not make and owed to the worker.  Until the worker writes it,
-    that row is PENDING with no marker and would render as "Starting scan..."
-    with the Scan button disabled, for a scan that never ran.  The
-    accepted residual window is a poll landing during the request's own write
-    attempt, between ``create_job`` and that write or the ``owe_rejection``
-    call after it failed.
-
-    Args:
-        worker: The scan worker, for the id of the job in flight.
-        job_store: The job store to read the job from.
-
-    Returns:
-        The current job, else the most recent job that ran, else None when no
-        job has ever run.
-
-    """
-    job = None
-    if worker.current_job_id:
-        job = job_store.get_job(worker.current_job_id)
-    if job is None:
-        job = job_store.latest_run_job(exclude_ids=worker.owed_rejection_ids())
-    return job
-
-
-def _owned_active_job_id(
-    worker: ScanWorker, job_store: JobStore, presented: str | None
-) -> str | None:
-    """
-    Find the newest active job the presenting browser owns, for the page to follow.
-
-    A full page load has no poll URL to carry a followed id, so without this
-    a reload while someone else's scan runs would report that scan to a
-    person whose own job is still queued behind it.  The candidates are the
-    worker's current job, when it is still active, and every queued job;
-    the newest ``created_at`` among the ones this browser owns wins.
-
-    Ownership is ``owns_detail``'s rule, not the flip prompt's: a job that
-    recorded no owner is nobody's, so it is never followed, and a browser
-    presenting no token owns nothing.  A refused submit whose REJECTED write
-    is still owed to the worker is PENDING with the submitter's token, yet it
-    will never run, so it is left out as ``_current_or_recent_job`` leaves it
-    out.
-
-    The token is compared here, in Python, and never put into a SQL
-    ``WHERE``: ``owns_detail`` compares in constant time, which an index
-    lookup does not, and the set being filtered is bounded by the queue cap,
-    so reading it whole costs nothing.  ``JobStore.latest_run_job`` filters
-    its excluded ids in Python for the same kind of reason.
-
-    Args:
-        worker: The scan worker, for the job in flight and the owed refusals.
-        job_store: The job store to read the candidates from.
-        presented: The owner token this request carries, or None.
-
-    Returns:
-        The id of the newest active job this browser owns, or None.
-
-    """
-    if presented is None:
-        return None
-    candidates = list(job_store.list_pending())
-    if worker.current_job_id:
-        current = job_store.get_job(worker.current_job_id)
-        if current is not None and current.is_active:
-            candidates.append(current)
-    owed = worker.owed_rejection_ids()
-    owned = [
-        job
-        for job in candidates
-        if job.id not in owed and owns_detail(presented, job.owner_token)
-    ]
-    if not owned:
-        return None
-    return max(owned, key=lambda job: job.created_at).id
-
-
-def _is_queued(worker: ScanWorker, job: Job | None) -> bool:
-    """
-    Report whether a job waits in the queue behind the one the worker runs.
-
-    A PENDING job the worker is not running is queued only while the worker
-    runs another: with nothing running it is about to start.  The busy line
-    and the tab title both read this, from the one call ``_status_context``
-    makes, so a tab titled "Queued" never sits over a "Starting scan..." line.
-
-    Args:
-        worker: The scan worker, for the id of the job in flight.
-        job: The job being rendered, or None when nothing has ever run.
-
-    Returns:
-        True for a PENDING job while the worker runs a different one.
-
-    """
-    return (
-        job is not None
-        and job.state is JobState.PENDING
-        and worker.current_job_id not in (None, job.id)
-    )
-
-
-def _busy_line(
-    worker: ScanWorker,
-    job_store: JobStore,
-    job: Job | None,
-    *,
-    presented: str | None,
-    queued: bool,
-) -> str | None:
-    """
-    Compose the one line the status area shows while the rendered job works.
-
-    Built here rather than composed in the template, because templates own no
-    vocabulary: a page that assembled its own sentence would be a second place
-    for the copy to drift from what ``vocabulary.busy_line`` says.
-
-    Four situations, in the precedence ``busy_line`` itself documents.  A
-    queued job -- PENDING while the worker runs a *different* one -- is told
-    what it is waiting for and how many jobs are ahead.  Whether it is queued
-    is decided once, by ``_is_queued`` in ``_status_context``, and passed in,
-    so the busy line and the tab title read one answer.
-    The job the worker is actually running, on its second
-    manual-duplex pass, leads with the pages counted on the first; on a later
-    pass of a multi-page document, it leads with the pages already kept.
-    Everything else is the plain progress prose, unchanged.
-
-    Both counts are the worker's, and so only ever passed for the job the
-    worker is running.  ``busy_line`` reads each only in the state it belongs
-    to, so passing both here cannot put a count on the wrong line.
-
-    The zero case reads as being next in line; a count of none ahead is never
-    spelled out as a number, because it is technically true and reads like a
-    bug.  That rule lives in ``vocabulary.busy_line``, so this
-    function passes the count through and does not restate it.
-
-    The queued line names a job other than the one being rendered, so it is
-    gated on its own: the running job's title reaches only the browser that
-    started the running job, by the same rule ``build_job_view`` applies, and
-    everyone else waits for the generic title.
-
-    Args:
-        worker: The scan worker, for the job in flight and its front count.
-        job_store: The job store, for the running job's title and the position.
-        job: The job being rendered, or None when nothing has ever run.
-        presented: The owner token this request carries, or None.
-        queued: Whether the job waits behind the one the worker is running.
-
-    Returns:
-        One line of plain text, or None when there is no job to describe.
-
-    """
-    if job is None:
-        return None
-    running_id = worker.current_job_id
-    if queued:
-        running = job_store.get_job(running_id) if running_id else None
-        ahead = job_store.queue_position(job.id, running=running_id)
-        if running is not None and ahead is not None:
-            title = (
-                running.title
-                if owns_detail(presented, running.owner_token)
-                else HIDDEN_JOB_TITLE
-            )
-            return busy_line(job.state, queue_title=title, queue_ahead=ahead)
-    if job.id == running_id:
-        return busy_line(
-            job.state,
-            front_pages=worker.front_pages,
-            pages_kept=worker.pages_kept,
-        )
-    return busy_line(job.state)
-
-
-@dataclass(frozen=True, slots=True)
-class _StatusFacts:
-    """
-    The per-request facts a status render needs beyond the worker and store.
-
-    Bundled rather than passed one by one because passing them separately
-    would take ``_status_context`` past ``PLR0913``'s five-parameter ceiling.
-    A suppression is forbidden in this project, and ``create_job`` already
-    had to take the same route, so the frozen dataclass is the established
-    answer here.
-
-    Every field is read off the request in ``_status_facts`` and nowhere else,
-    which is what stops a route added later from acquiring or losing a fact by
-    forgetting about it -- the same discipline ``refresh_checks`` and
-    ``is_owner`` already follow.
-
-    ``settings`` is the running configuration, carried so ``_status_context``
-    can build the job's view: which host paths the owner's text names by
-    setting is read from it.
-
-    ``claimed`` and ``claimed_pass`` are the flip answer and the multi-page
-    answer this request itself claimed, each with the job it names.  They are
-    two fields rather than one because the two waits have two answer types,
-    and a flip answer must never be read as a multi-page one.
-    """
-
-    settings: Settings
-    claimed: tuple[str, FlipOutcome] | None = None
-    claimed_pass: tuple[str, PassAnswer] | None = None
-    followed_job_id: str | None = None
-    owner_token: str | None = None
-    scan_blocked: bool = False
-
-
-def _status_facts(
-    request: Request,
-    *,
-    followed_job_id: str | None,
-    claimed: tuple[str, FlipOutcome] | None = None,
-    claimed_pass: tuple[str, PassAnswer] | None = None,
-) -> _StatusFacts:
-    """
-    Read every per-request status fact off the request, in one place.
-
-    ``owner_token`` and ``scan_blocked`` are both derived here rather than at
-    each call site, so a new status-rendering route cannot silently lose the
-    owner's flip prompt or hand back an enabled Scan button on a blocked
-    appliance.  Only the two facts a route genuinely knows
-    about itself -- the answer it just claimed, and the job the browser is
-    following -- are passed in.
-
-    ``followed_job_id`` has no default, so every caller has to decide which
-    job its status area follows, and the type checkers refuse a call that did
-    not.  A default of None once let the flip and multi-page answers silently
-    hand the area to the current-job URL, so the next poll reported whatever
-    the worker ran instead of the job the operator had just answered.  A route
-    that genuinely follows nothing in particular passes None and says so.
-
-    ``scan_blocked`` is derived from ``Settings``, which is loaded once at
-    process start, so it cannot change while the process runs: there is no live
-    flip to orchestrate and ``POST /api/checks/refresh`` deliberately carries
-    neither the button nor the reason line, because re-running the checks
-    cannot change a verdict that was never read from them.
-
-    This unwraps the configured token, and the value goes to the predicate and
-    nowhere else: it is never logged, rendered or echoed, and the flag that
-    reaches the template is a bool (ASVS 4.0.3 V7.1.1).
-
-    Args:
-        request: The incoming request, for its cookies and the app's settings.
-        claimed: The job id and flip answer this request itself claimed, if any.
-        claimed_pass: The job id and multi-page answer this request itself
-            claimed, if any.
-        followed_job_id: The job this browser follows -- the one it
-            submitted, answered or owns -- or None to report the current job.
-
-    Returns:
-        The bundle ``_status_context`` reads.
-
-    """
-    settings = services(request).settings
-    return _StatusFacts(
-        settings=settings,
-        claimed=claimed,
-        claimed_pass=claimed_pass,
-        followed_job_id=followed_job_id,
-        owner_token=owner.presented_owner(request),
-        scan_blocked=_scan_block(settings) is not None,
-    )
-
-
-def _status_context(
-    worker: ScanWorker,
-    job_store: JobStore,
-    facts: _StatusFacts,
-) -> dict[str, object]:
-    """
-    Build the context ``partials/status.html`` renders from.
-
-    The job comes from ``_current_or_recent_job``, and the store's recorded
-    state still selects the branch the partial renders, so no route asserts a
-    state the store has not recorded.  It reaches the partial as a
-    ``JobView``, never the stored row: whether this browser sees the title,
-    the preview and the error and warning text, and in what form, is decided
-    in ``build_job_view``, once, from the token the request presents.  Every
-    status response -- the page, both polls, both flip answers and the scan
-    submit -- goes through here, so none can render more than the view holds.
-
-    What this adds is ``flip_answer``: for a
-    job the store still reads as ``AWAITING_FLIP``, whether its flip wait has
-    already been answered, and with what.  That is a fact the worker genuinely
-    holds, and it lets the partial acknowledge the answer instead of
-    re-rendering the Continue and Abort buttons as though the click did
-    nothing.
-
-    ``claimed`` exists because the worker may already have cleared its flip
-    coordinator by the time the route reads it: a route that just claimed an
-    answer is authoritative for its own job.  It is used only when it names
-    the job being rendered, so a posted foreign job id cannot acknowledge a
-    job nobody answered.
-
-    ``followed_job_id`` is the second such extra fact: the job this browser
-    submitted, baked into its poll URL by ``start_scan``.  It is used only to
-    select which job is rendered, and when it names no existing row the
-    function falls back to ``_current_or_recent_job``, so a browser whose job
-    has been pruned degrades to today's behaviour instead of meeting a 404.
-    The context key echoes back only an id that was actually found,
-    which is what keeps that fallback rendering byte-identical to the one
-    ``GET /api/jobs/current/status`` produces.
-
-    Args:
-        worker: The scan worker, for the job in flight and its flip answer.
-        job_store: The job store to read the job from.
-        facts: The per-request bundle ``_status_facts`` built.
-
-    ``refresh_checks`` is False here for every caller, and that is the whole of
-    the flag's policy: ``start_scan`` sets it True on its own, so a status poll
-    or a flip answer cannot carry an out-of-band strip.  Defaulting it in this
-    one builder rather than at each call site is what stops a route added later
-    from acquiring the behaviour by forgetting to say no.
-
-    ``is_owner`` is decided here, once, rather than at each call site, for the
-    same reason ``refresh_checks`` is: a route added later must not be able to
-    acquire or lose the gate by forgetting about it.  The partial reads the
-    flag and never the token, so the value itself has no path into the
-    markup.  It is computed from the stored row with ``owner.is_owner``, not from
-    the view's rule: a job that recorded no owner may be answered by anyone,
-    while its title and preview are nobody's.
-
-    ``scan_blocked`` rides along for the same reason again, and it is why every
-    out-of-band ``#scan-btn`` -- the scan submit's own response, both status
-    polls and both flip answers -- carries the blocked state: they all render
-    ``partials/scan_button.html`` from this one context, so no status response
-    can hand back an enabled button on an appliance that cannot upload.  On a
-    blocked appliance ``POST /api/scan`` is refused before it reaches its
-    success branch, so that one is unreachable today; it is included anyway,
-    because the property being defended is that the flag lives in one partial
-    fed from one builder, not that each caller remembered.
-
-    A job waiting on a multi-page question gets the same treatment through
-    ``_pass_wait_context``: its claimed answer, and, for a viewer who may
-    answer, the open question and its wording.  ``pass_heading``, the
-    prompt's first line naming the document, is built beside it for an owner
-    from the view's title, so the owner gate decides that title here too.
-
-    A job waiting for a person -- the flip, or a multi-page question -- also
-    gets its deadline, read by ``_wait_deadline`` for every viewer, not only
-    the owner: a deadline is a time and carries no job detail, which is what
-    lets ``non_owner_line`` tell anyone else when the wait gives up.  The
-    title still reaches the prompt only through the view, so ``flip_heading``
-    names the owner's real title, and a job that recorded no owner -- which
-    anyone may answer -- by the generic title.  ``flip_note`` says when the
-    flip wait ends and what then happens to the pages, or how long it lasts
-    until the worker has recorded when it began.
-
-    ``idle_line`` is what the area says with no job to report: the blocked
-    reason on an appliance that cannot upload, so the area never invites a
-    scan the button under it refuses, and ``IDLE_LINE`` otherwise.
-    ``page_title`` is the tab's title for this rendering, from the job's state
-    and never its title, which the tab list and the browser history would
-    show to anyone at the tablet.  Every status response carries it, so the
-    tab follows each change the area shows and keeps its title across a 204.
-
-    Returns:
-        This viewer's view of the job, its flip answer, the flip prompt's job
-        line and deadline note, the line a viewer who cannot answer a waiting
-        job sees, its multi-page answer, prompt, wording and job line, the
-        followed job's id, the one busy line, whether
-        the job is queued, the idle line, the tab title, whether this viewer
-        may answer the job's prompt, whether the Scan button is blocked and a
-        false strip-refresh flag.  ``flip_answer`` is None unless the rendered
-        job is ``AWAITING_FLIP`` and has been answered.
-
-    """
-    followed = (
-        job_store.get_job(facts.followed_job_id) if facts.followed_job_id else None
-    )
-    job = (
-        followed if followed is not None else _current_or_recent_job(worker, job_store)
-    )
-    answer: FlipOutcome | None = None
-    if job is not None and job.state is JobState.AWAITING_FLIP:
-        if facts.claimed is not None and facts.claimed[0] == job.id:
-            answer = facts.claimed[1]
-        else:
-            answer = worker.flip_answer(job.id)
-    view = (
-        build_job_view(job, presented=facts.owner_token, settings=facts.settings)
-        if job is not None
-        else None
-    )
-    is_owner = job is not None and owner.is_owner(facts.owner_token, job.owner_token)
-    queued = _is_queued(worker, job)
-    block = _scan_block(facts.settings)
-    deadline = _wait_deadline(worker, job)
-    flipping = job is not None and job.state is JobState.AWAITING_FLIP
-    return {
-        "job": view,
-        "flip_answer": answer,
-        "flip_heading": (
-            flip_heading(view.title)
-            if flipping and is_owner and view is not None
-            else None
-        ),
-        "flip_note": (
-            flip_deadline_note(
-                deadline=deadline,
-                timeout_seconds=facts.settings.output.operator_wait_timeout_seconds,
-            )
-            if flipping
-            else None
-        ),
-        "non_owner_line": (
-            non_owner_wait_line(job.state, deadline=deadline)
-            if job is not None and (flipping or job.state in PASS_WAIT_STATES)
-            else None
-        ),
-        "pass_heading": (
-            pass_heading(view.title)
-            if is_owner and view is not None and view.state in PASS_WAIT_STATES
-            else None
-        ),
-        **_pass_wait_context(worker, job, facts, is_owner=is_owner, deadline=deadline),
-        "refresh_checks": False,
-        "followed_job_id": followed.id if followed is not None else None,
-        "busy_line": _busy_line(
-            worker, job_store, job, presented=facts.owner_token, queued=queued
-        ),
-        "queued": queued,
-        "idle_line": block.reason if block is not None else IDLE_LINE,
-        "page_title": (
-            page_title(
-                view.state,
-                warning=view.warning,
-                category=view.error_category,
-                queued=queued,
-            )
-            if view is not None
-            else page_title(None)
-        ),
-        "is_owner": is_owner,
-        "scan_blocked": facts.scan_blocked,
-    }
-
-
-def _last_scan_context(view: JobView | None) -> dict[str, object]:
-    """
-    Turn a finished job on a fresh page into the "Last scan" lines.
-
-    A page loaded after a job ended would otherwise render that job's outcome
-    exactly as a live poll does -- red, in an alert, with the history reload --
-    and present an old result as news to whoever opens the page next, however
-    long ago it was.  So the full page, and only the full page, reports a job
-    that is not active as the past: the idle line, then one muted line naming
-    the outcome, the title and when it started, and the detail line a warning
-    or a failure carries.  Every status response keeps the live rendering, so
-    a poll that watches a job end still shows the outcome, alert included.
-
-    The lines are built from the job's view, so the owner gate still decides
-    the title and the warning and error text.  The time is ``created_at``,
-    worded "started", because a job records no finish time.
-
-    Args:
-        view: The job the status context chose, as this viewer may see it, or
-            None when no job has ever run.
-
-    Returns:
-        The keys that replace the live rendering, or an empty mapping when
-        there is no job or it is still active.  ``job`` becomes None, which
-        is what selects the idle branch and leaves the Scan button enabled.
-
-    """
-    if view is None or view.is_active:
-        return {}
-    return {
-        "job": None,
-        "last_job": view,
-        "last_scan_line": last_scan_line(
-            view.state,
-            warning=view.warning,
-            category=view.error_category,
-            title=view.title,
-            created_at=view.created_at,
-        ),
-        "last_scan_detail": last_scan_detail(
-            view.state,
-            warning=view.warning,
-            category=view.error_category,
-            error=view.error,
-        ),
-        "page_title": page_title(None),
-    }
-
-
-_SEEN_MAX_LENGTH: Final = 64
-"""
-The longest ``seen`` value a status poll compares against its token.
-
-A token is 24 hex characters.  A longer value cannot match, so it is ignored
-and the poll is answered in full -- never refused with a 422.  A refused poll
-would reach the page's error handling, and a poll's failure must never land in
-``#status-message``, where it would read as the operator's own mistake.
-"""
-
-_POLL_INTERVAL_SECONDS: Final = 1
-"""How often an active status area polls, in seconds."""
-
-_STATUS_TOKEN_BYTES: Final = 12
-"""The token's digest size: 24 hex characters in the poll URL."""
-
-_FOCUS_SCAN: Final = "scan"
-"""
-The value of a status poll's ``focus`` parameter that asks for the Scan button.
-
-A claimed Abort sends focus to Scan, but the button its own response renders
-is still disabled while the scan winds down, and a disabled button cannot take
-focus.  So the response bakes this into its poll URL, and the first rendering
-whose Scan button is enabled carries ``autofocus`` on it.
-
-The parameter is compared against this constant and never echoed: any other
-value is ignored, and a poll URL only ever carries this constant, so nothing a
-client sends reaches the markup.
-"""
-
-
-def _poll_url(
-    followed_job_id: str | None,
-    *,
-    seen: str,
-    attempt: int = 0,
-    focus_scan: bool = False,
-) -> str:
-    """
-    Build the URL a status area polls, in the one place any URL for it is built.
-
-    Templates compose no poll URL of their own: the page, both polls, the three
-    answer routes, the scan submit and the template-free fallback all render
-    the one this function returns, so none of them can drift on the path or
-    the query.
-
-    Args:
-        followed_job_id: The job the area follows, or None to follow whatever
-            the current job is.
-        seen: The token of the rendering the poll's element shows; empty for
-            a rendering that has not been hashed, which no poll matches.
-        attempt: The poll's retry count, carried only when non-zero.
-        focus_scan: Whether the poll still asks for focus on the Scan button,
-            carried as ``_FOCUS_SCAN`` only when true.
-
-    Returns:
-        The path and its query string, not yet HTML-escaped.
-
-    """
-    path = (
-        f"/api/jobs/{followed_job_id}/status"
-        if followed_job_id
-        else "/api/jobs/current/status"
-    )
-    params = {"seen": seen}
-    if attempt:
-        params["attempt"] = str(attempt)
-    if focus_scan:
-        params["focus"] = _FOCUS_SCAN
-    return f"{path}?{urlencode(params)}"
-
-
-def _followed_in(context: Mapping[str, object]) -> str | None:
-    """
-    Return the followed job id a status context carries, if any.
-
-    Args:
-        context: A context built by ``_status_context``.
-
-    Returns:
-        The id ``_status_context`` found and echoed, or None.
-
-    """
-    followed = context.get("followed_job_id")
-    return followed if isinstance(followed, str) else None
-
-
-def _status_token(request: Request, context: Mapping[str, object]) -> str:
-    """
-    Hash what a status poll would show this viewer, as the poll's ``seen`` token.
-
-    The token is a hash of the rendered bytes rather than of a hand-picked set
-    of facts, because what the viewer sees changes in ways such a set misses:
-    a preview stored mid-scan while the busy line stays the same, the owner
-    gate, the question number a multi-page prompt carries, the queue
-    position.  The rendering covers every one of them, and any later change to
-    the templates, by construction.
-
-    It hashes the canonical *poll* rendering, never the calling route's own:
-    the empty ``seen``, the one-second interval, no focus attribute, no
-    message clear, no strip refresh, and the terminal reload every poll
-    carries.  A scan submit or an answer carries extras a poll never does, so
-    a token computed from its own rendering would never match the first poll
-    after it, and every action would be followed by one needless swap -- one
-    that replaces the focused button and speaks the area again.
-
-    The one focus fact the canonical rendering keeps is ``focus_scan``: unlike
-    the status area's action-only ``autofocus``, it is poll-visible, because
-    it rides in the poll URL and is what a poll carrying it renders.
-
-    The hash is keyed with the process's ``status_token_key``.  The token
-    travels in a URL, and so into access logs; keyed, it is unlinkable to the
-    content and cannot be computed by anyone else.
-
-    Args:
-        request: The incoming request, for the app's templates and key.
-        context: The status context ``_status_context`` built for this viewer.
-
-    Returns:
-        The token, as hex.
-
-    """
-    svc = services(request)
-    canonical = svc.templates.get_template("partials/status_response.html").render(
-        {
-            **context,
-            "request": request,
-            "poll_url": _poll_url(
-                _followed_in(context),
-                seen="",
-                focus_scan=context.get("focus_scan") is True,
-            ),
-            "poll_interval": _POLL_INTERVAL_SECONDS,
-            "focus_status_area": False,
-            "clear_message": False,
-            "refresh_checks": False,
-            "terminal_reload": True,
-        }
-    )
-    return _keyed_digest(request, canonical)
-
-
-def _keyed_digest(request: Request, text: str) -> str:
-    """
-    Hash a rendering with the process key, as a status poll token.
-
-    This is the one definition of the token that both the real status
-    rendering and the lost-contact fallback carry, so the two cannot drift on
-    the key or the digest size.
-
-    Args:
-        request: The incoming request, for the app's ``status_token_key``.
-        text: The rendering to hash.
-
-    Returns:
-        The token, as hex.
-
-    """
-    return hashlib.blake2b(
-        text.encode(),
-        key=services(request).status_token_key,
-        digest_size=_STATUS_TOKEN_BYTES,
-    ).hexdigest()
-
-
-def _with_poll(
-    request: Request, context: Mapping[str, object], *, focus_scan: bool = False
-) -> tuple[str, dict[str, object]]:
-    """
-    Add the poll URL and interval to a status context, with its token baked in.
-
-    Every status rendering goes through here, so every one of them hands the
-    browser a poll URL whose ``seen`` names what it is showing.  htmx captures
-    an element's URL when it processes the element and never re-processes an
-    element a 204 left in place, so the URL a rendering bakes is the one every
-    poll from it presents until something changes.
-
-    ``focus_scan`` is the Scan button's pending request for focus, set by a
-    claimed Abort and then by each poll that carries it on.  It rides in the
-    poll URL and in the token, and the rendering puts ``autofocus`` on the
-    Scan button once that button is enabled.  The status area polls only while
-    its job is active, and the button is disabled for exactly that long, so the
-    first rendering that can honour the request is also the last one that
-    polls: focus is moved once.
-
-    Args:
-        request: The incoming request.
-        context: The status context ``_status_context`` built for this viewer.
-        focus_scan: Whether this rendering asks for focus on the Scan button.
-
-    Returns:
-        The token, and the context extended with ``focus_scan``, ``poll_url``
-        and ``poll_interval``.
-
-    """
-    focused = {**context, "focus_scan": focus_scan}
-    token = _status_token(request, focused)
-    return token, {
-        **focused,
-        "poll_url": _poll_url(_followed_in(context), seen=token, focus_scan=focus_scan),
-        "poll_interval": _POLL_INTERVAL_SECONDS,
-    }
-
-
-def _unchanged(seen: str, token: str) -> bool:
-    """
-    Report whether a poll's ``seen`` names the rendering it would be sent.
-
-    A value longer than any token is ignored rather than compared, and the
-    comparison is constant-time, so neither its length nor its content can be
-    probed.  An empty ``seen`` never matches.
-
-    Args:
-        seen: The token the poll presented.
-        token: The token of what the poll would render now.
-
-    Returns:
-        True when the poll can be answered with no content.
-
-    """
-    if not seen or len(seen) > _SEEN_MAX_LENGTH:
-        return False
-    return secrets.compare_digest(seen.encode(), token.encode())
-
-
-STATUS_BACKOFF_SECONDS: Final = (2, 5, 15)
-"""
-The intervals a status poll that cannot read its job steps through, in seconds.
-
-A failing poll's first retry comes after 2 s, its second after 5 s, and every
-later one after 15 s.  The first step is short because the common failure is a
-moment's lock contention on the job store, and the cap is long because a store
-that stays broken gains nothing from a browser asking every second.
-
-Polling never stops: the page has no script of its own to restart it, so a
-poll that gave up would leave the area frozen on the fallback line after the
-store healed.  At the cap the fallback is the same every time, so its poll is
-answered 204 and the area is not re-swapped or re-announced.
-
-Before the cap, each step's fallback carries a different poll URL, so it is
-swapped in, and a screen reader may read the same line again: at most once
-per step, three times in all.  That bounded repeat is accepted.  Skipping it
-would mean keeping the step out of the swapped markup, which only starting at
-the cap does, and that would turn a moment's lock contention into a 15 s wait.
-
-Read at call time rather than bound into a default, so a test can shorten it.
-"""
-
-
-def _confirmed_job_id(job_id: str | None) -> str | None:
-    """
-    Return a path job id in canonical form if it is a UUID, else None.
-
-    The lost-contact fallback cannot ask the store whether the id names a job,
-    so it echoes back only something that is well-formed: job ids are
-    ``str(uuid.uuid4())``, and anything else falls back to the current route.
-
-    Args:
-        job_id: The id from the poll's path, or None for the current route.
-
-    Returns:
-        The parsed id as its canonical string, or None.
-
-    """
-    if job_id is None:
-        return None
-    try:
-        return str(uuid.UUID(job_id))
-    except ValueError:
-        return None
-
-
-def _lost_contact_fallback(
-    request: Request,
-    job_id: str | None,
-    *,
-    attempt: int,
-    seen: str,
-    focus_scan: bool,
-) -> Response:
-    """
-    Answer a status poll that could not read or render its job.
-
-    Built in Python without a template, so a template fault cannot reach the
-    one path that has to survive it.  The body is the status area with a
-    fixed line and no exception text; the text goes to the server log only.
-    It carries no out-of-band Scan button, no ``#status-message`` clear and no
-    ``<title>``: nothing the poll could not read is asserted, and the alert
-    slot is left to the operator's own failed actions.
-
-    The next poll URL carries the next backoff step as ``attempt`` and the
-    fallback's own token as ``seen``.  The token hashes the markup built with
-    an empty ``seen``, the same shape ``_status_token`` hashes, so at the cap,
-    where the markup no longer changes, a poll presenting it gets a 204.  A
-    pending request for focus on the Scan button is carried on as well, so an
-    Abort whose wind-down the store could not report still focuses Scan once
-    the store heals.
-
-    Args:
-        request: The incoming request, for the token key.
-        job_id: The id from the poll's path, or None for the current route.
-        attempt: The failing poll's clamped attempt count.
-        seen: The token the poll presented.
-        focus_scan: Whether the poll still asks for focus on the Scan button.
-
-    Returns:
-        The fallback at 200, or an empty 204 when the poll already shows it.
-
-    """
-    step = min(attempt + 1, len(STATUS_BACKOFF_SECONDS))
-    interval = STATUS_BACKOFF_SECONDS[step - 1]
-    followed = _confirmed_job_id(job_id)
-    line = html.escape(LOST_CONTACT_LINE)
-
-    def body(token: str) -> str:
-        poll_url = html.escape(
-            _poll_url(followed, seen=token, attempt=step, focus_scan=focus_scan)
-        )
-        return (
-            f'<div id="status-area" tabindex="-1" hx-get="{poll_url}" '
-            f'hx-trigger="every {interval}s" hx-swap="outerHTML">\n'
-            f'  <p class="status-fallback">&#9888; {line}</p>\n'
-            "</div>\n"
-        )
-
-    token = _keyed_digest(request, body(""))
-    if _unchanged(seen, token):
-        return Response(status_code=204)
-    return HTMLResponse(status_code=200, content=body(token))
-
-
-def _answer_status_poll(
-    request: Request,
-    job_id: str | None,
-    *,
-    seen: str,
-    attempt: int,
-    focus_scan: bool,
-) -> Response:
-    """
-    Render a status poll for the followed job, falling back when that fails.
-
-    Both poll routes answer through here, so they cannot differ in how they
-    fail.  The render happens inside the guard as well as the context build,
-    because ``TemplateResponse`` renders in its constructor.
-
-    Args:
-        request: The incoming request.
-        job_id: The followed job's id, or None for the current route.
-        seen: The token the poll presented.
-        attempt: The poll's attempt count, straight from the query string.
-        focus_scan: Whether the poll asks for focus on the Scan button.
-
-    Returns:
-        The status partial, the lost-contact fallback, or an empty 204.
-
-    """
-    counted = min(max(attempt, 0), len(STATUS_BACKOFF_SECONDS))
-    svc = services(request)
-    try:
-        token, context = _with_poll(
-            request,
-            _status_context(
-                svc.worker,
-                svc.job_store,
-                _status_facts(request, followed_job_id=job_id),
-            ),
-            focus_scan=focus_scan,
-        )
-        if _unchanged(seen, token):
-            return Response(status_code=204)
-        return svc.templates.TemplateResponse(
-            request,
-            "partials/status_response.html",
-            {**context, "terminal_reload": True},
-        )
-    except Exception:
-        logger.exception("Failed to render the job status")
-        return _lost_contact_fallback(
-            request, job_id, attempt=counted, seen=seen, focus_scan=focus_scan
-        )
-
-
-def _wait_deadline(worker: ScanWorker, job: Job | None) -> datetime | None:
-    """
-    Read when the rendered job's wait for a person gives up, if it is known.
-
-    The flip wait's deadline comes from ``ScanWorker.flip_deadline`` and a
-    multi-page question's from ``ScanWorker.pass_deadline``; the job's stored
-    state says which wait it is in.  It is read once per rendering, for every
-    viewer and outside the owner gate: a deadline is a time and nothing else,
-    with no title or other job detail, so telling a viewer who cannot answer
-    when the wait ends discloses nothing the owner gate protects.
-
-    Args:
-        worker: The scan worker, which holds when each wait began.
-        job: The job being rendered, or None.
-
-    Returns:
-        The aware deadline, or None when the job is not waiting for a person
-        or the worker has not yet recorded when its wait began.
-
-    """
-    if job is None:
-        return None
-    if job.state is JobState.AWAITING_FLIP:
-        return worker.flip_deadline(job.id)
-    if job.state in PASS_WAIT_STATES:
-        return worker.pass_deadline(job.id)
-    return None
-
-
-def _pass_wait_context(
-    worker: ScanWorker,
-    job: Job | None,
-    facts: _StatusFacts,
-    *,
-    is_owner: bool,
-    deadline: datetime | None,
-) -> dict[str, object]:
-    """
-    Build the status context a job waiting on a multi-page question adds.
-
-    Three keys, all None unless the rendered job's row is in one of the
-    multi-page waiting states.
-
-    ``pass_answer`` is the answer already claimed for the job's latest
-    question, so the partial acknowledges it rather than re-rendering buttons
-    that look as though the click did nothing.  As with the flip answer, a
-    route that has just claimed one is authoritative for the job it named,
-    because the worker may move on before the route reads it back; the claim
-    counts only when it names the job being rendered.
-
-    ``pass_prompt`` and ``pass_copy`` are the open question and every sentence
-    it shows.  They are built only for a viewer who may answer, by the same
-    rule as the flip prompt: the owner, or anyone when the job recorded no
-    owner.  Nobody else gets a prompt number, a button or the scanner's error
-    text, because none of it is put in their context at all.  The error text
-    is a job detail rather than part of the question, so it follows the rule
-    the rest of the job view uses (``owns_detail``) rather than the answering
-    rule: a job that recorded no owner may be answered by anyone, but its
-    error text is nobody's, just as ``build_job_view`` hides that job's stored
-    error.  It is scrubbed of host paths and addresses before it goes into the
-    copy, so even the owner never sees one.
-
-    The copy's timeout note names ``deadline`` when there is one.  The
-    deadline is read by the caller for every viewer, outside the owner gate,
-    because it is a time and carries no job detail; the title that heads the
-    prompt stays gated through the view, in the caller.
-
-    Args:
-        worker: The scan worker, for the open question and its answer.
-        job: The job being rendered, or None.
-        facts: The per-request bundle, for the claimed answer and the settings.
-        is_owner: Whether this viewer may answer the job's questions.
-        deadline: When the open question gives up, from ``_wait_deadline``.
-
-    Returns:
-        ``pass_answer``, ``pass_prompt`` and ``pass_copy``.
-
-    """
-    answer: PassAnswer | None = None
-    prompt: PassPrompt | None = None
-    copy: PassPromptCopy | None = None
-    if job is not None and job.state in PASS_WAIT_STATES:
-        if facts.claimed_pass is not None and facts.claimed_pass[0] == job.id:
-            answer = facts.claimed_pass[1]
-        else:
-            answer = worker.pass_answer(job.id)
-        if answer is None and is_owner:
-            prompt = worker.pass_prompt(job.id)
-    if prompt is not None and job is not None:
-        error = (
-            scrub_for_owner(prompt.error, facts.settings)
-            if prompt.error and owns_detail(facts.owner_token, job.owner_token)
-            else None
-        )
-        # Replaced on the prompt itself rather than passed beside it: given no
-        # error, the copy falls back to the prompt's own, unscrubbed text.
-        copy = pass_prompt_copy(replace(prompt, error=error), deadline=deadline)
-    return {"pass_answer": answer, "pass_prompt": prompt, "pass_copy": copy}
-
-
-@dataclass(frozen=True, slots=True)
-class _ProfileOption:
-    """
-    One entry of the Profile select: what it submits and what it reads as.
-
-    Attributes:
-        name: The profile name, which is the ``value`` the option submits.
-            It is the wire contract ``POST /api/scan`` already takes, so only
-            the text a household member reads is new here.
-        label: The human name shown in the dropdown.
-        description: The sentence shown beneath the select for this profile.
-        manual_duplex: Whether the profile scans both sides by the manual
-            flip, which is what disables the Multiple pages checkbox when the
-            page opens on it.  Read here, from the same locked lookup as the
-            text, so the page never looks the profile up a second time.
-
-    """
-
-    name: str
-    label: str
-    description: str
-    manual_duplex: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _ProfileChoices:
-    """
-    What the Profile select offers, and which option it opens on.
-
-    Attributes:
-        options: The options to render, in the order they are rendered.
-        opening: The name of the option the page opens on: ``default`` when
-            it is offered, else the profile standing in for a hidden
-            ``default``, else the first option; ``""`` when there are none.
-
-    """
-
-    options: tuple[_ProfileOption, ...]
-    opening: str
-
-
-# The profile ``saneless scan`` uses when no ``--profile`` is named, which is
-# the one the page has to open on for an untouched form to mean the same.
-_DEFAULT_PROFILE: Final = "default"
-
-
-def _profile_options(worker: ScanWorker) -> _ProfileChoices:
-    """
-    Build the ordered option list the Profile select renders, and its opening.
-
-    Feeder profiles come first on a sheet-fed device, and this is
-    where ``has_flatbed`` is read: sheet-fed means the device reports no
-    flatbed source, and at render time the server's evidence for that is the
-    generated profile set, which mirrors the device's sources.  So the answer
-    is derived from the profiles already in hand -- no new device probe and no
-    new config key.
-
-    The classification comes from ``classify_source`` and from nowhere else:
-    its docstring states it is the only source-classification rule in the
-    codebase and forbids re-deriving the answer from the string.  That matters
-    most for the commonest real feeder name of all, whose first four letters
-    are the whole of the automatic rule -- an exact match is what keeps it out
-    of the single-page group, and this function inherits that answer rather
-    than asking again.
-
-    A generated ``default`` that equals another profile is not offered: it
-    would be a second option scanning the same way under the same words, and
-    the first profile it equals stands in for it, so the page still opens on
-    what ``saneless scan`` with no ``--profile`` does.  The name stays valid
-    everywhere else -- the CLI, the config and ``POST /api/scan`` all still
-    take it.  Any label two offered options still share then gets the profile
-    name after it, for every member of the group.
-
-    Args:
-        worker: The worker whose profile set is being rendered.
-
-    Returns:
-        One option per offered profile, feeder-first when the device is
-        sheet-fed and in configuration order otherwise, and the name of the
-        option the page opens on.
-
-    """
-    read: dict[str, ProfileConfig] = {}
-    for name in worker.profile_names():
-        profile = worker.get_profile(name)
-        if profile is None:
-            # Listing and looking up are two locked calls, so a profile
-            # rewritten between them can be gone by the time it is read.  One
-            # option fewer for one render is honest; a placeholder would not
-            # be, and there is nothing to show under a name that no longer
-            # names anything.
-            continue
-        read[name] = profile
-    # Over every profile read, the hidden twin included: a twin shares its
-    # stand-in's source, so leaving it out could never change the answer.
-    sheet_fed = not any(
-        classify_source(profile.source) is SourceKind.FLATBED
-        for profile in read.values()
-    )
-    stand_in = _default_stand_in(read)
-    if stand_in is not None:
-        del read[_DEFAULT_PROFILE]
-    entries = [
-        (
-            _ProfileOption(
-                name=name,
-                # A deployed config whose profiles predate the ``label`` key
-                # carries an empty human name: startup generation only runs on
-                # a bare default config, so it is skipped there, and a blank
-                # option is worse than a raw profile name.  ``saneless
-                # auto-profiles --force`` is what backfills the text, and the
-                # how-to says so.
-                label=profile.label or name,
-                description=profile.description,
-                manual_duplex=_is_manual_duplex(profile),
-            ),
-            classify_source(profile.source),
-        )
-        for name, profile in read.items()
-    ]
-    if sheet_fed:
-        # A stable sort, so configuration order survives inside each group and
-        # the only thing this changes is which group comes first.
-        entries.sort(key=lambda entry: not entry[1].uses_feeder)
-    options = _distinct_labels(tuple(option for option, _ in entries))
-    names = [option.name for option in options]
-    if _DEFAULT_PROFILE in names:
-        opening = _DEFAULT_PROFILE
-    elif stand_in is not None:
-        opening = stand_in
-    else:
-        opening = names[0] if names else ""
-    return _ProfileChoices(options=options, opening=opening)
-
-
-def _default_stand_in(profiles: dict[str, ProfileConfig]) -> str | None:
-    """
-    Name the profile a generated ``default`` twin is hidden behind, if any.
-
-    The whole profile is compared rather than a hand-picked subset of its
-    fields, the rule ``is_bare_default`` follows, so a field added to the
-    model later cannot be silently left out of the comparison, and any edit
-    an operator makes to ``default`` -- default tags, a title, a mode --
-    shows it again.  Only a generated ``default`` is hidden: one an operator
-    wrote is theirs to show, even when it happens to match another profile.
-
-    Args:
-        profiles: The profiles read for this render, in configuration order.
-
-    Returns:
-        The first profile in configuration order that equals a generated
-        ``default``, or None when ``default`` is absent, hand-written or
-        equal to no other profile.
-
-    """
-    default = profiles.get(_DEFAULT_PROFILE)
-    if default is None or not default.auto_generated:
-        return None
-    return next(
-        (
-            name
-            for name, profile in profiles.items()
-            if name != _DEFAULT_PROFILE and profile == default
-        ),
-        None,
-    )
-
-
-def _distinct_labels(
-    options: tuple[_ProfileOption, ...],
-) -> tuple[_ProfileOption, ...]:
-    """
-    Append the profile name to every label two or more options share.
-
-    A household member must never see two options with the same text and no
-    way to tell which is which.  Generated labels are already unique, but a
-    hand-written config can still collide, and so can an edited ``default``
-    beside the profile it was copied from.  Every member of a shared group is
-    suffixed, not only the later ones, so none of them reads as the plain one.
-
-    Args:
-        options: The options in render order.
-
-    Returns:
-        The same options in the same order, with shared labels made distinct.
-
-    """
-    counts = Counter(option.label for option in options)
-    return tuple(
-        replace(option, label=f"{option.label} ({option.name})")
-        if counts[option.label] > 1
-        else option
-        for option in options
-    )
-
-
-def _is_manual_duplex(profile: ProfileConfig) -> bool:
-    """
-    Say whether ``profile`` scans both sides by the manual flip.
-
-    The one place the web layer reads this, so the checkbox on the page, its
-    refresh and the refusal of a submit all agree on which profiles it means.
-
-    Args:
-        profile: The chosen profile.
-
-    Returns:
-        True only for a manual-duplex profile.
-
-    """
-    return profile.duplex == "manual"
-
-
-def _multi_page_field(*, manual_duplex: bool, ticked: bool) -> dict[str, object]:
-    """
-    Build the context the Multiple pages field renders from.
-
-    The full page and ``GET /api/profiles/multi-page`` both render the field
-    through this, so the two cannot disagree about when it is disabled or what
-    the line beneath it says.  The template composes no prose: the label and
-    the help line or the reason come from the vocabulary.
-
-    Args:
-        manual_duplex: Whether the chosen profile is manual duplex, which
-            disables the box and puts the reason in place of the help line.
-        ticked: Whether the box was ticked before this render.  A full page
-            load passes False, so the box is unticked on every load.
-
-    Returns:
-        The field's template context.
-
-    """
-    return {
-        "multi_page_label": MULTI_PAGE_LABEL,
-        "multi_page_disabled": manual_duplex,
-        # A disabled box is never also ticked: it would not be submitted, so a
-        # tick on it would show a choice the scan would not make.
-        "multi_page_checked": ticked and not manual_duplex,
-        "multi_page_help": (
-            MULTI_PAGE_DISABLED_REASON if manual_duplex else MULTI_PAGE_HELP
-        ),
-    }
-
-
-def _history_views(request: Request) -> list[JobView]:
-    """
-    Return the Job History rows as the browser making this request may see them.
-
-    One view per row, each decided by ``build_job_view`` from the token this
-    request presents: a row this browser started keeps its real title, and
-    every other row -- another browser's, or one that recorded no owner --
-    shows the generic title.  Time, profile, outcome and page counts are the
-    same for every viewer, so the table still shows the appliance is in use.
-    The full page and ``GET /api/jobs/history`` both read the rows here, so
-    the two cannot disagree about what a browser is shown.
-
-    Args:
-        request: The incoming request, for its owner token and the settings.
-
-    Returns:
-        The most recent jobs, newest first, as this browser's views.
-
-    """
-    svc = services(request)
-    presented = owner.presented_owner(request)
-    return [
-        build_job_view(job, presented=presented, settings=svc.settings)
-        for job in svc.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
-    ]
-
-
 @router.get("/")
 def index(request: Request) -> Response:
     """
@@ -1465,7 +180,7 @@ def index(request: Request) -> Response:
     # lazy thread returns at its first guard for ever and the strip never
     # leaves its cold-start rows.
     svc.refresher.note_watcher()
-    choices = _profile_options(svc.worker)
+    choices = profile_view.profile_options(svc.worker)
     # The option the page opens on, found by the name the choices chose, so the
     # select, the sentence beneath it and the Multiple pages field all read the
     # same profile.  None only when there are no options at all.
@@ -1486,25 +201,27 @@ def index(request: Request) -> Response:
     # queued; with none of its own active, it reports the current job.  Its
     # poll URL carries the token of what the first poll would render, so that
     # poll is answered 204 and the page's own rendering stays in place.
-    live = _status_context(
+    live = status_view.status_context(
         svc.worker,
         svc.job_store,
-        _status_facts(
+        status_view.status_facts(
             request,
-            followed_job_id=_owned_active_job_id(
+            followed_job_id=status_view.owned_active_job_id(
                 svc.worker, svc.job_store, owner.presented_owner(request)
             ),
         ),
     )
-    _, status = _with_poll(request, live)
+    _, status = status_view.with_poll(request, live)
     # A job that is no longer active is reported as the last scan, not as
     # news.  The poll token above is still the live rendering's, which no poll
     # asks for: an area with no active job does not poll.
     shown = live["job"]
-    last_scan = _last_scan_context(shown if isinstance(shown, JobView) else None)
-    block = _scan_block(svc.settings)
+    last_scan = status_view.last_scan_context(
+        shown if isinstance(shown, JobView) else None
+    )
+    block = scan_block.block_for(svc.settings)
 
-    jobs = _history_views(request)
+    jobs = profile_view.history_views(request)
 
     return svc.templates.TemplateResponse(
         request,
@@ -1525,7 +242,7 @@ def index(request: Request) -> Response:
             # The Multiple pages field for the profile the page opens on, and
             # never ticked: the choice is made per scan, so a page load starts
             # it afresh.
-            **_multi_page_field(
+            **profile_view.multi_page_field(
                 manual_duplex=opening_option is not None
                 and opening_option.manual_duplex,
                 ticked=False,
@@ -1695,7 +412,7 @@ class _ScanChoice:
 
     Grouped into one dependency because ``start_scan`` already takes five
     parameters, and one more would take it past ``PLR0913``'s ceiling.  A
-    suppression is not allowed, and ``_StatusFacts`` settled the answer to the
+    suppression is not allowed, and ``status_view.StatusFacts`` settled the answer to the
     same limit the same way.  Both fields are what decides how the job runs,
     which is why they, and not the title or the tags, travel together.
 
@@ -1806,78 +523,6 @@ def _unhealthy_rejection(
         case _:
             assert_never(worker_health)
     return outcome
-
-
-@dataclass(frozen=True, slots=True)
-class _ScanBlock:
-    """
-    Why no scan can start on this appliance, in each form a surface shows it.
-
-    Attributes:
-        rejection: What ``POST /api/scan`` is refused with.
-        job_error: The refused attempt's job-row error.
-        reason: The line beneath the disabled Scan button.
-
-    """
-
-    rejection: RequestRejection
-    job_error: str
-    reason: str
-
-
-_TOKEN_UNSET_BLOCK: Final = _ScanBlock(
-    RequestRejection.TOKEN_UNSET, TOKEN_UNSET_JOB_ERROR, SCAN_BLOCKED_REASON
-)
-_URL_UNSET_BLOCK: Final = _ScanBlock(
-    RequestRejection.URL_UNSET, URL_UNSET_JOB_ERROR, SCAN_BLOCKED_URL_REASON
-)
-
-
-def _scan_block(settings: Settings) -> _ScanBlock | None:
-    """
-    Decide whether paperless-ngx is configured well enough for a scan to start.
-
-    The one place the web layer decides it, so the Scan button, its reason
-    line and the route guard cannot disagree.  A placeholder token is named
-    first, then an empty ``paperless.url``, matching the status strip's
-    Paperless row.
-
-    This unwraps the configured token, and the value goes to the predicate
-    and nowhere else: it is never logged, rendered, echoed or put in the job
-    row, whose text names the problem and the file to edit and never the
-    secret (ASVS 4.0.3 V7.1.1).
-
-    Args:
-        settings: The settings the process started with.
-
-    Returns:
-        The block, or None when a scan may start.
-
-    """
-    if is_placeholder_token(settings.paperless.token.get_secret_value()):
-        return _TOKEN_UNSET_BLOCK
-    if not settings.paperless.url:
-        return _URL_UNSET_BLOCK
-    return None
-
-
-def scan_is_blocked(settings: Settings) -> bool:
-    """
-    Say whether this appliance refuses every scan, from ``_scan_block``'s rule.
-
-    The one answer outside this module needs: ``create_app`` records it on
-    the app's state once, because the settings cannot change while the
-    process runs, and the error rendering reads it there, so a refused Scan
-    press on a blocked appliance never hands back an enabled button.
-
-    Args:
-        settings: The settings the process started with.
-
-    Returns:
-        True when no scan can start.
-
-    """
-    return _scan_block(settings) is not None
 
 
 def _record_refused_submit(
@@ -2023,11 +668,11 @@ def _queued_status_fallback(job_id: str) -> str:
         The response body.
 
     """
-    poll_url = html.escape(_poll_url(job_id, seen=""))
+    poll_url = html.escape(status_view.poll_url(job_id, seen=""))
     line = html.escape(progress_label(JobState.PENDING))
     return (
         f'<div id="status-area" tabindex="-1" autofocus hx-get="{poll_url}" '
-        f'hx-trigger="every {_POLL_INTERVAL_SECONDS}s" hx-swap="outerHTML">\n'
+        f'hx-trigger="every {status_view.POLL_INTERVAL_SECONDS}s" hx-swap="outerHTML">\n'
         f'  <p class="busy-line">{line}</p>\n'
         "</div>\n"
         '<div id="status-message" hx-swap-oob="innerHTML"></div>\n'
@@ -2052,7 +697,7 @@ def _refuse_browser_navigation(request: Request) -> None:
     this appliance is usually reached over plain http on the LAN.
 
     This runs as a route dependency, ahead of every parameter, so it answers
-    before body validation does and before ``_scan_block`` writes a refused
+    before body validation does and before ``scan_block.block_for`` writes a refused
     attempt's row: a refused navigation started nothing and records nothing.
 
     Args:
@@ -2149,7 +794,7 @@ def start_scan(
     # Refused like an unknown profile, ahead of every refusal that writes a
     # row: this is a request the form would not have made, not an attempt to
     # scan that Job History should show.
-    if choice.multi_page and _is_manual_duplex(found):
+    if choice.multi_page and profile_view.is_manual_duplex(found):
         raise RequestRejected(RequestRejection.MULTI_PAGE_MANUAL_DUPLEX)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
     # The form shows the profile's default tags and correspondent already
@@ -2214,7 +859,7 @@ def start_scan(
     # An empty ``paperless.url`` is refused the same way: the upload would
     # fail for certain as a configuration error, and no consume-folder copy is
     # made for it, so the stack would be fed for a PDF that ends in failed/.
-    block = _scan_block(svc.settings)
+    block = scan_block.block_for(svc.settings)
     if block is not None:
         written = _record_refused_submit(svc.job_store, form, error=block.job_error)
         raise RequestRejected(block.rejection, job_id=written)
@@ -2259,13 +904,13 @@ def start_scan(
                 # reporting the scan this person started.  The token is built
                 # inside the guard too: it renders a template, and its
                 # failure must answer the fallback like any other.
-                _, status = _with_poll(
+                _, status = status_view.with_poll(
                     request,
-                    _status_context(
+                    status_view.status_context(
                         svc.worker,
                         svc.job_store,
                         replace(
-                            _status_facts(request, followed_job_id=job.id),
+                            status_view.status_facts(request, followed_job_id=job.id),
                             # The token this submit is owned by, which is the
                             # minted one when the browser presented none: the
                             # cookie carrying it has not reached the browser
@@ -2344,9 +989,9 @@ def current_job_status(
     the one thing a polling element cannot usefully receive.  Retargeted into
     ``#status-message`` it would re-write the page's one alert on every tick
     and leave it standing above "Done" once the store healed.  The failure is
-    logged and answered with ``_lost_contact_fallback`` instead: a fixed line
-    inside the status area that polls again on the ``STATUS_BACKOFF_SECONDS``
-    schedule and never stops.  The status area is deliberately not added to
+    logged and answered with status_view's lost-contact fallback instead: a
+    fixed line inside the status area that polls again on the
+    ``status_view.STATUS_BACKOFF_SECONDS`` schedule and never stops.  The status area is deliberately not added to
     ``render_error``'s own-target exemption, as the strip is: swapping
     ``error.html`` over ``#status-area`` would delete the element the scan
     form targets.
@@ -2355,19 +1000,23 @@ def current_job_status(
         request: The incoming HTTP request.
         seen: The token of the rendering the polling element shows.
         attempt: How many polls in a row have failed, as the previous fallback
-            named it.  Clamped into ``0..len(STATUS_BACKOFF_SECONDS)``, never
-            refused, and reset by the first poll that succeeds, whose URL
-            carries none.
-        focus: ``_FOCUS_SCAN`` when a claimed Abort asked for focus on the
-            Scan button; any other value is ignored and never echoed.
+            named it.  Clamped into
+            ``0..len(status_view.STATUS_BACKOFF_SECONDS)``, never refused, and
+            reset by the first poll that succeeds, whose URL carries none.
+        focus: ``status_view.FOCUS_SCAN`` when a claimed Abort asked for focus
+            on the Scan button; any other value is ignored and never echoed.
 
     Returns:
         The status partial, the lost-contact fallback, or an empty 204 when
         nothing has changed.
 
     """
-    return _answer_status_poll(
-        request, None, seen=seen, attempt=attempt, focus_scan=focus == _FOCUS_SCAN
+    return status_view.answer_status_poll(
+        request,
+        None,
+        seen=seen,
+        attempt=attempt,
+        focus_scan=focus == status_view.FOCUS_SCAN,
     )
 
 
@@ -2415,8 +1064,12 @@ def followed_job_status(
         or an empty 204 when nothing has changed.
 
     """
-    return _answer_status_poll(
-        request, job_id, seen=seen, attempt=attempt, focus_scan=focus == _FOCUS_SCAN
+    return status_view.answer_status_poll(
+        request,
+        job_id,
+        seen=seen,
+        attempt=attempt,
+        focus_scan=focus == status_view.FOCUS_SCAN,
     )
 
 
@@ -2785,7 +1438,9 @@ def get_multi_page_field(
     return svc.templates.TemplateResponse(
         request,
         "partials/multi_page_field.html",
-        _multi_page_field(manual_duplex=_is_manual_duplex(found), ticked=multi_page),
+        profile_view.multi_page_field(
+            manual_duplex=profile_view.is_manual_duplex(found), ticked=multi_page
+        ),
     )
 
 
@@ -2878,49 +1533,6 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
     )
 
 
-def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
-    """
-    Read what the lazy list load's Scan button is rendered from, never failing.
-
-    The job comes from the same status context the page builds, for the job
-    this browser follows, so an active job still disables the button.  The
-    loader polls until it is answered, and a poll cannot usefully receive an
-    error: a store read that fails would be written into the alert slot on
-    every tick, with the lists that did load thrown away and Scan held for
-    good.  So a failure is logged and the button is rendered as though no
-    job were running, with the blocked verdict, which comes from the
-    settings alone, kept.  The status poll owns the job and corrects the
-    button once it can read the job again.  Until then the poll reads the
-    same failing store and answers with its lost-contact fallback, which
-    carries no Scan button, so a press in that window is left to
-    ``start_scan``, which refuses or queues it.
-
-    Args:
-        request: The incoming request.
-
-    Returns:
-        The job view, or None, and whether the appliance blocks a scan.
-
-    """
-    svc = services(request)
-    try:
-        live = _status_context(
-            svc.worker,
-            svc.job_store,
-            _status_facts(
-                request,
-                followed_job_id=_owned_active_job_id(
-                    svc.worker, svc.job_store, owner.presented_owner(request)
-                ),
-            ),
-        )
-    except Exception:
-        logger.exception("Failed to read the job for the lazy list load")
-        return None, _scan_block(svc.settings) is not None
-    job = live["job"]
-    return (job if isinstance(job, JobView) else None), bool(live["scan_blocked"])
-
-
 @router.get("/api/metadata")
 def get_metadata(request: Request, profile: str | None = None) -> Response:
     """
@@ -2962,7 +1574,7 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
     no markers, so the markers keep saying the lists have not answered and a
     submit gets the submitted profile's own defaults.  A job store that
     cannot be read costs the lists nothing either (see
-    ``_metadata_scan_state``).
+    ``metadata_view.metadata_scan_state``).
 
     Args:
         request: The incoming HTTP request.
@@ -2990,7 +1602,7 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
     options = metadata_view.correspondent_options_context(
         svc, chosen, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
     )
-    job, scan_blocked = _metadata_scan_state(request)
+    job, scan_blocked = metadata_view.metadata_scan_state(request)
     return svc.templates.TemplateResponse(
         request,
         "partials/metadata_response.html",
@@ -3174,7 +1786,7 @@ def job_history(request: Request) -> Response:
     return svc.templates.TemplateResponse(
         request,
         "partials/history.html",
-        {"jobs": _history_views(request)},
+        {"jobs": profile_view.history_views(request)},
     )
 
 
@@ -3211,12 +1823,12 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     claimed = False
     if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.continue_flip(job_id)
-    _, context = _with_poll(
+    _, context = status_view.with_poll(
         request,
-        _status_context(
+        status_view.status_context(
             svc.worker,
             svc.job_store,
-            _status_facts(
+            status_view.status_facts(
                 request,
                 followed_job_id=job_id,
                 claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
@@ -3263,12 +1875,12 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     claimed = False
     if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.abort_flip(job_id)
-    _, context = _with_poll(
+    _, context = status_view.with_poll(
         request,
-        _status_context(
+        status_view.status_context(
             svc.worker,
             svc.job_store,
-            _status_facts(
+            status_view.status_facts(
                 request,
                 followed_job_id=job_id,
                 claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
@@ -3340,12 +1952,12 @@ def answer_multi_page(
     claimed = False
     if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.answer_pass(job_id, prompt, answer)
-    _, context = _with_poll(
+    _, context = status_view.with_poll(
         request,
-        _status_context(
+        status_view.status_context(
             svc.worker,
             svc.job_store,
-            _status_facts(
+            status_view.status_facts(
                 request,
                 followed_job_id=job_id,
                 claimed_pass=(job_id, answer) if claimed else None,

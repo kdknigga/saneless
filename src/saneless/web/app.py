@@ -57,7 +57,8 @@ from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
 from .host_guard import HostGuard
 from .refresher import CheckRefresher
-from .routes import router, scan_is_blocked
+from .routes import router
+from .scan_block import scan_is_blocked
 from .security_headers import STATIC_PATH, SecurityHeaders
 from .services import AppLifecycle, Services
 from .throttle import (
