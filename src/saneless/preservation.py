@@ -34,9 +34,7 @@ from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import make_private_dir
 from saneless.spool import BYTES_PER_MB
 
-# What a preserved artefact's title says it is.  The suffixes are spelled in
-# vocabulary, beside the title cap one of them bounds, and are re-exported
-# here for every caller that names a pass by its suffix.
+# Re-exported for every caller that names a pass by its title suffix.
 from saneless.vocabulary import (
     BACKS_SUFFIX,
     FRONTS_SUFFIX,
@@ -72,19 +70,16 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The workspace subdirectory a preserved PDF is assembled in, kept apart from
-# the finished PDF's own directory so a preservation can never be mistaken for,
-# or collide with, the document the run was trying to deliver.
+# The workspace subdirectory a preserved PDF is assembled in, kept apart so a
+# preservation can never collide with the document the run was delivering.
 PRESERVED_DIR_NAME: Final = "preserved"
 
 FAILED_DIR_WARN_THRESHOLD = 20
 """
-How many preserved PDFs make ``<data_dir>/failed/`` worth mentioning in the log.
+How many preserved scans make ``<data_dir>/failed/`` worth mentioning in the log.
 
-This is an *attention* threshold, not a retention policy. Reaching it changes
-nothing except that a WARNING is emitted: saneless never deletes, moves,
-truncates or rotates a file it preserved, because the whole point of preserving
-one was that it is the only remaining copy of a scanned document.
+An attention threshold, not a retention policy: reaching it only logs a
+WARNING, because a preserved file is the only remaining copy of a document.
 """
 
 # A preserved scan is a whole document, so only its owner may read it.
@@ -98,10 +93,8 @@ _COPY_INSTEAD_OF_LINK: Final = frozenset(
     {errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK}
 )
 
-# How many numbered names a PDF may try in failed/ before giving up.  Every
-# name is keyed on the job id and the second, so even the second one is a
-# coincidence; the bound only stops a directory that refuses every name from
-# looping forever.
+# How many numbered names a PDF may try in failed/ before giving up; the bound
+# only stops a directory that refuses every name from looping forever.
 _MAX_NAME_ATTEMPTS: Final = 100
 
 
@@ -109,11 +102,9 @@ def make_failed_dir(failed_dir: Path) -> None:
     """
     Create ``failed_dir`` and the ``data_dir`` it sits in, each owner-only.
 
-    Preserved scans are whole documents, so neither directory may be
-    readable by other local users. Each level gets its own call because a
-    ``mkdir`` with ``parents=True`` creates a missing parent with the default
-    permissions, ignoring the mode it was given. A directory that already
-    exists keeps its mode: one an earlier release created is left alone.
+    Each level gets its own call because ``mkdir`` with ``parents=True``
+    creates a missing parent with the default permissions.  A directory that
+    already exists keeps its mode.
 
     Args:
         failed_dir: The durable directory preserved scans go in, directly
@@ -154,25 +145,15 @@ def move_private(source: Path, destination: Path) -> None:
     """
     Move one file to ``destination``, privately, and never over another file.
 
-    Everything this moves lands in ``failed/``, which is never pruned, so a
-    file already at ``destination`` is somebody's document too: it is never
-    replaced, and the move refuses instead.
+    A file already at ``destination`` is somebody's document too, so it is
+    never replaced.
 
-    On one filesystem the move is a hard link followed by removing the
-    source.  Unlike a rename, a link refuses an existing destination; like
-    one, it keeps the mode the caller already gave the source.  Across
-    filesystems a link fails with ``EXDEV``, and ``shutil.move`` would then
-    copy through ``copy2``, which creates the destination with the umask's
-    mode and applies the source's only once the whole document is written:
-    inside a ``failed/`` an earlier release left at 0755, the scan would be
-    readable by every local user for the length of the copy.  So the copy is
-    made here instead -- also where the filesystem has no hard links -- into a
-    file created 0600 with ``O_EXCL``, and the source is removed only once the
-    copy is complete.  A copy that fails is removed, so no truncated document
-    is left behind.  Once the file is whole at ``destination`` the move has
-    succeeded, and a source that cannot then be removed is logged and left.
-    The two steps are not one: a process killed between them leaves the file
-    in both places, which loses nothing.
+    On one filesystem the move is a hard link, which refuses an existing
+    destination and keeps the source's mode, then removing the source.
+    Otherwise the copy is made into a file created 0600 with ``O_EXCL``,
+    never through ``shutil.move``, whose copy is readable under the umask's
+    mode until it finishes.  A failed copy is removed; a source that cannot be
+    removed afterwards is logged and left, which loses nothing.
 
     Args:
         source: The file to move, inside the job workspace.
@@ -214,15 +195,8 @@ def _remove_moved_source(source: Path, destination: Path) -> None:
     """
     Remove a moved file's source, once the file is whole at its destination.
 
-    The move has succeeded by then: the file is in ``failed/``.  A source
-    that cannot be removed loses nothing, so it is logged and left, rather
-    than raised as a move that failed -- which would have the report say
-    that a file already kept could not be kept.
-
-    Args:
-        source: The file just linked or copied.
-        destination: Where it now is.
-
+    A failure is logged, not raised, so the report never says a file already
+    kept could not be kept.
     """
     try:
         source.unlink()
@@ -240,39 +214,24 @@ def warn_if_failed_dir_growing(failed_dir: Path) -> None:
     """
     Log one WARNING when preserved scans have piled up in ``failed_dir``.
 
-    Warn only. Nothing in saneless prunes, sweeps, caps, rotates or deletes
-    anything in that directory: every file in it is a document that reached
-    paper and never reached paperless-ngx, and automatically deleting one
-    would be precisely the data loss preservation exists to prevent.
-    The control here is operator visibility, not enforcement. A
-    retention policy would need a config key and a user story that do not
-    exist yet.
+    Warn only: every file in that directory is a document that never reached
+    paperless-ngx, so nothing in saneless deletes from it.
 
-    **This function must never raise.** It is called while a run's failure is
-    already in flight; a raise here would replace the real failure with a
-    bookkeeping error and lose the failure message the job has to carry.
-    Any filesystem trouble -- a permission change, a race, the directory
-    disappearing underneath us -- ends the check silently instead.
+    **This function must never raise.** It runs while a run's failure is in
+    flight, and a raise would replace the real failure; any filesystem trouble
+    ends the check silently.
 
-    ``failed_dir`` holds two kinds of artefact, and both count. A preserved
-    scan is usually a PDF, but an assembly failure has no PDF to keep and
-    preserves the spooled page files themselves, as a job-keyed *directory*.
-    Counting only ``*.pdf`` would let a directory fill up with those
-    and report nothing, which is precisely the silence this warning exists to
-    break -- so a directory counts as one preserved scan and contributes its
-    whole recursive size to the total.
+    A page-file directory counts as one preserved scan, with its whole
+    recursive size, beside the PDFs.
 
     Args:
-        failed_dir: The directory preserved scans are moved into. Every scan
-            the caller preserved has already been moved in by the time this
-            runs, so all of them are included in the count.
+        failed_dir: The directory preserved scans are moved into.
 
     """
     try:
         preserved = list(failed_dir.glob("*.pdf"))
-        # The walk lives inside this try on purpose: a page directory removed
-        # underneath it -- by an operator draining failed/ while a job fails --
-        # raises OSError and must leave through the same silent return.
+        # Inside the try: a page directory removed underneath the walk raises
+        # OSError and must leave through the same silent return.
         page_dirs = [entry for entry in failed_dir.iterdir() if entry.is_dir()]
         if len(preserved) + len(page_dirs) < FAILED_DIR_WARN_THRESHOLD:
             return
@@ -284,8 +243,6 @@ def warn_if_failed_dir_growing(failed_dir: Path) -> None:
             if page.is_file()
         )
     except OSError:
-        # Deliberately silent, per the docstring: a bookkeeping failure must
-        # not displace the failure the caller is about to report.
         return
     logger.warning(
         "%d preserved scans (%.1f MB) have accumulated in %s -- saneless "
@@ -301,23 +258,17 @@ def move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> No
     """
     Move every spooled page file into ``destination``.
 
-    This is the last resort of every preservation: there is no PDF, because
-    building one failed or was refused, so the pages themselves are kept.
-
-    Each page moves to its own **explicit** destination path through
-    ``move_private``: ``tmp_dir`` and ``data_dir`` may be on different
-    filesystems, and the copy made across them must never be readable by
-    anyone else.
+    The last resort of every preservation, when there is no PDF.  Each page
+    moves through ``move_private``, since ``tmp_dir`` and ``data_dir`` may be
+    on different filesystems.
 
     Args:
-        spool_dir: The job's spool, inside the workspace that is about to be
-            unwound -- which is why every caller has to run inside it.
-        destination: The job-keyed directory to move the pages into. Created
-            here, and only if there is at least one page to put in it, so a
-            failure with an empty spool leaves no empty directory behind.
-        moved: Appended to as each page lands, in name order. An out-parameter
-            rather than a return value on purpose: when this raises on page 7
-            of 12, the caller still has to be able to say which six it kept.
+        spool_dir: The job's spool, inside the workspace about to be unwound.
+        destination: The job-keyed directory to move the pages into, created
+            only if there is at least one page.
+        moved: Appended to as each page lands, in name order.  An
+            out-parameter so that, when this raises part way, the caller can
+            still say which pages it kept.
 
     Raises:
         OSError: If the directory cannot be created or a move fails. Whatever
@@ -331,15 +282,11 @@ def move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> No
     make_private_dir(destination)
     for page_file in page_files:
         target = destination / page_file.name
-        # Owner-only before the move, not after. The source sits in the 0700
-        # workspace, so nobody else can open it in the meantime; a
-        # same-filesystem move is a hard link and an unlink, which keeps the
-        # mode, and a cross-filesystem one copies into a file created 0600
-        # with O_EXCL.  Neither ever replaces a file already there.
+        # Owner-only before the move, not after: the source sits in the 0700
+        # workspace, and a hard link keeps the mode it has.
         best_effort_chmod(page_file, _PRIVATE_FILE_MODE)
         move_private(page_file, target)
         moved.append(target)
-    # Once, after the loop, so the count reflects the finished state.
     warn_if_failed_dir_growing(destination.parent)
 
 
@@ -348,16 +295,6 @@ def _free_bytes(directory: Path) -> int:
     Return the bytes free on the filesystem holding ``directory``.
 
     The one place the disk rule measures, so a test can give it any number.
-
-    Args:
-        directory: An existing directory on the filesystem to measure.
-
-    Returns:
-        The free bytes an unprivileged process may use.
-
-    Raises:
-        OSError: If the directory cannot be measured.
-
     """
     return shutil.disk_usage(directory).free
 
@@ -382,19 +319,11 @@ def ensure_room_to_assemble(
     """
     Refuse, before it starts, an assembly the disk has no room for.
 
-    Assembling ``n`` pages writes a single-page PDF per page and then the
-    merged document, all beside the spool they were built from, so for a
-    moment the spool, the singles and the output coexist. Measured, the peak
-    is 2.00 times the spooled pages' size on top of the spool itself, which
-    is why the rule asks for twice the spool free. ``reserve_mb`` -- the
-    operator's ``min_free_space_mb`` -- is kept free on top, as every other
-    free-space check in saneless keeps it. Refusing up front leaves the disk
-    as it was, where running out half way would leave a truncated file and a
-    full disk behind.
-
-    The MB needed and the spool's MB are rounded up and the MB free is
-    rounded down, so the message never shows a need smaller than what is
-    free.
+    For a moment the spool, the single-page PDFs and the merged output
+    coexist; measured, that peak is twice the spooled pages' size on top of
+    the spool, so the rule asks for twice the spool free plus ``reserve_mb``.
+    The MB needed is rounded up and the MB free down, so the message never
+    shows a need smaller than what is free.
 
     Args:
         records: The pages about to be assembled.
@@ -457,27 +386,20 @@ class RunArtefacts:
         spool_dir: The directory holding the spooled page files.
         failed_dir: The durable directory everything kept goes in.
         reserve_mb: The ``min_free_space_mb`` reserve the disk rule keeps.
-            There is no resolution here: every preserved PDF lays each page
-            out at the dpi on the page's own record.
         stage: How far the run got.
         passes: One ``(title suffix, records)`` pair per acquisition pass, in
             pass order, with pass B's records in the order it scanned them.
         document: Every page accepted into the document, in document order,
-            unfiltered; None while there is none.  Simplex and manual duplex
-            set it only once acquisition has finished.  A run that accepts
-            passes into its document one at a time sets it while acquisition
-            is still going on, and ``passes`` then holds only the pass in
-            flight, whose pages are not part of it yet.
+            unfiltered; None while there is none.  A run that accepts passes
+            into it one at a time sets it during acquisition, and ``passes``
+            then holds only the pass in flight.
         pdfs: Assembled PDFs not yet delivered, still in the workspace.
-        accepted: Of those PDFs, each one paperless-ngx had already taken --
-            accepted by its API, or saved to its consume folder -- or may
-            have, because the run was interrupted while it was being sent,
-            with the words that say which.  Such a PDF is still kept, because
-            paperless-ngx may yet fail to consume it, but the sentence says it
-            got there, or may have, so nobody uploads it again unchecked.
-        unreadable_sheets: How many sheets the passes that finished reported
-            they could not read.  A pass that stopped part way never reports
-            its own, so zero means none is known, not that none was skipped.
+        accepted: Of those PDFs, each one paperless-ngx took or may have
+            taken, with the words that say which.  It is still kept, but the
+            sentence stops anyone uploading it again unchecked.
+        unreadable_sheets: How many sheets the finished passes reported they
+            could not read.  Zero means none is known, not that none was
+            skipped.
 
     """
 
@@ -557,8 +479,7 @@ class KeptGroup:
                 pages = part or f"The {self.count}"
                 return f"{pages} spooled page file(s) were preserved at {where}"
             case KeptKind.NOTHING:
-                # A group records something that was kept, so the report never
-                # builds one of this kind; reaching here is a bug.
+                # The report never builds a group of this kind.
                 msg = "A kept group cannot be of kind NOTHING"
                 raise ValueError(msg)
 
@@ -638,23 +559,8 @@ def _build_pdf(
     """
     Assemble ``records`` into one PDF in the workspace, if there is room.
 
-    Args:
-        artefacts: The run, for its workspace, title, job id and reserve.
-        records: The pages, in the order the PDF holds them, each laid out
-            at its own read-back dpi.
-        suffix: What part of the scan this is, such as ``FRONTS_SUFFIX``:
-            appended to the PDF's title, and a segment of its own in the
-            file name, where a long title cannot cut it off.  Empty for the
-            whole document.
-
-    Returns:
-        The assembled PDF, still inside the workspace.
-
-    Raises:
-        DiskSpaceError: If the disk rule refuses, or the assembly runs out
-            of space.
-        PdfError: If the assembly fails for any other reason.
-
+    ``suffix``, such as ``FRONTS_SUFFIX``, is appended to the title and is a
+    segment of its own in the file name, where a long title cannot cut it off.
     """
     ensure_room_to_assemble(records, artefacts.workspace, artefacts.reserve_mb)
     title = half_title(artefacts.title, suffix) if suffix else artefacts.title
@@ -673,14 +579,7 @@ def build_pass_pdf(
     Assemble one acquisition pass into its own PDF, unfiltered.
 
     Pass B runs over the flipped stack, so it scans the last sheet's back
-    first. A ``(backs)`` pass is therefore reversed here, so the PDF runs in
-    sheet order. When pass B fed the whole stack and no sheet was skipped,
-    its page N is the back of the ``(fronts)`` PDF's page N. A pass B that
-    stopped part way fed only the last sheets of the stack, so with ``k``
-    backs of ``n`` fronts, and every sheet fed once, its page 1 is the back
-    of fronts page ``n - k + 1``; ``_keep_passes`` says so in the report, or
-    that no page can be named when a sheet could not be read.
-
+    first; a ``(backs)`` pass is reversed here so the PDF runs in sheet order.
     Nothing is blank-filtered: an anomaly is kept whole for a person to look
     at.
 
@@ -710,16 +609,8 @@ def _keep_file(pdf: Path, failed_dir: Path) -> Path:
     A file already holding the PDF's name is never replaced: the PDF takes
     the next free numbered name instead (``<name>-2.pdf``, ``-3`` and so on).
 
-    Args:
-        pdf: The PDF, inside the workspace.
-        failed_dir: The durable directory, which must exist.
-
-    Returns:
-        Where the PDF now is.
-
     Raises:
         FileExistsError: If every numbered name is taken.
-        OSError: If the chmod or the move fails.
 
     """
     # Owner-only before the move, for the reason ``move_page_files`` gives.
@@ -740,16 +631,9 @@ def _discard_unkept(pdf: Path | None) -> None:
     """
     Delete a PDF built for ``failed/`` that could not be moved there.
 
-    It was built from the spooled pages, which are still in the spool: the
-    page-file fallback keeps them, or the workspace is left in place for the
-    next sweep.  So the PDF is only a copy, and left in the workspace it would
-    be joined by another whole copy of the document on every sweep that
-    failed the same way.  Never an assembled PDF from a delivery, which can be
-    the only copy.  A failure to delete it is logged and otherwise ignored.
-
-    Args:
-        pdf: The PDF, inside the workspace, or None when none was built.
-
+    It is only a copy of pages still in the spool, and left behind it would
+    gain another whole copy on every sweep that failed the same way.  Never
+    called for an assembled PDF from a delivery, which can be the only copy.
     """
     if pdf is None:
         return
@@ -792,8 +676,7 @@ def _keep_assembled(artefacts: RunArtefacts, report: PreservationReport) -> bool
     try:
         make_failed_dir(artefacts.failed_dir)
         for pdf in pdfs:
-            # One at a time, recorded as each lands, so a failure on the
-            # second still leaves the first named in the report.
+            # Recorded as each lands, so a later failure still names it.
             destination = _keep_file(pdf, artefacts.failed_dir)
             kept.append(destination)
             how = artefacts.accepted.get(pdf)
@@ -804,9 +687,8 @@ def _keep_assembled(artefacts: RunArtefacts, report: PreservationReport) -> bool
                 )
     except Exception as exc:
         _record_problem(report, "moving the assembled PDF(s)", exc)
-    # A PDF paperless-ngx took that could not be kept here is kept as its page
-    # files instead, and whoever assembles and uploads those would make the
-    # same duplicate, so the caution goes with them.
+    # A taken PDF that could not be kept here is kept as page files, and
+    # uploading those would make the same duplicate, so the caution goes too.
     for pdf in pdfs[len(kept) :]:
         how = artefacts.accepted.get(pdf)
         if how is not None:
@@ -854,18 +736,8 @@ def _keep_document_and_passes_in_flight(
     """
     Keep the document accepted so far, and beside it every pass still in flight.
 
-    Both are attempted whatever happens to the other: a document too large for
-    the disk rule does not stop a small pass in flight from being kept as a
-    PDF, and the reverse.
-
-    Args:
-        artefacts: The run, for its document, its passes and ``failed/``.
-        report: Where the kept PDFs and any failure are recorded.
-
-    Returns:
-        True when the document and every non-empty pass in flight were kept
-        as PDFs; False sends the caller to the page files, which hold both.
-
+    Both are attempted whatever happens to the other.  False sends the caller
+    to the page files, which hold both.
     """
     document_kept = _keep_document(artefacts, report)
     if not any(records for _, records in artefacts.passes):
@@ -894,7 +766,6 @@ def _keep_passes(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     kept: list[Path] = []
     pages = 0
     complete = True
-    # The PDF built and not yet kept, if any.
     pdf: Path | None = None
     try:
         make_failed_dir(artefacts.failed_dir)
@@ -924,24 +795,10 @@ def _pairing_caution(fronts: int, backs: int, unreadable: int) -> str | None:
     """
     Say how the kept ``(backs)`` pages pair with the ``(fronts)``, if needed.
 
-    Pairing by page number holds only while every sheet was fed exactly once
-    on both passes.  A sheet a pass reported it could not read breaks that
-    for certain, whatever the counts, so no page is named then.  Otherwise
-    the fewer backs of a pass B that stopped part way are the backs of the
-    last sheets, because pass B feeds the flipped stack from its last sheet;
-    that is still stated only on condition, because a pass B that stopped
-    part way never reports the sheets it skipped, and no pass reports a sheet
-    it missed or fed twice.
-
-    Args:
-        fronts: How many ``(fronts)`` pages were kept.
-        backs: How many ``(backs)`` pages were kept.
-        unreadable: How many sheets the finished passes could not read.
-
-    Returns:
-        The caution, or None when there are no backs to pair or the counts
-        match with no sheet known to be skipped.
-
+    Pairing by page number holds only while every sheet was fed exactly once.
+    An unreadable sheet breaks it for certain, so no page is named then; the
+    fewer backs of a stopped pass B are named only on condition, since no
+    pass reports a sheet it missed or fed twice.
     """
     if not backs:
         return None
@@ -1006,32 +863,24 @@ def preserve_most_finished(artefacts: RunArtefacts) -> PreservationReport:
 
     1. ``DELIVERED``: nothing; the document reached paperless-ngx.
     2. ``DELIVERING`` with assembled PDFs: move them, owner-only.
-    3. ``ASSEMBLING``: straight to the page files. Assembly is what failed, or
-       the disk rule refused it, so building another PDF would fail the same
-       way.
+    3. ``ASSEMBLING``: straight to the page files, since building another PDF
+       would fail the same way.
     4. ``ACQUIRING`` with ``document`` set: the accepted document as one PDF,
        and then each non-empty pass in flight as its own ``(partial)`` PDF,
-       because those pages are not part of the document yet.  Only a run that
-       accepts passes into its document before acquisition ends reaches this;
-       simplex and manual duplex set ``document`` only once acquisition is
-       over.
+       because those pages are not part of the document yet.
     5. Otherwise, once acquisition has finished (``document`` is set): the
        unfiltered document, in document order, as one PDF.
     6. Otherwise each non-empty pass as its own PDF, the ``(backs)`` pass in
        sheet order.
 
-    Every PDF built here first passes ``ensure_room_to_assemble``. When a PDF
-    cannot be built or moved, or the disk rule refuses, the raw page files
-    are kept as well. A pass that did assemble is then kept twice over, as its
-    PDF and as its page files; that is deliberate on a double-failure path,
-    where sorting out one redundant copy is a minute's work and deciding which
-    half of a broken job to throw away is not.
+    When a PDF cannot be built or moved, or the disk rule refuses, the raw
+    page files are kept as well, even if that keeps a pass twice: a redundant
+    copy is cheap, and guessing which half of a broken job to drop is not.
 
     **This never raises an ``Exception``.** It runs while the run's own
-    failure is in flight, so every failure here -- an ``OSError``, a
-    ``PdfError``, a bug -- is logged with its traceback and folded into the
-    report instead. ``KeyboardInterrupt`` and ``ScanInterrupted`` are not
-    ``Exception``s and pass straight through.
+    failure is in flight, so every failure here is logged with its traceback
+    and folded into the report.  ``KeyboardInterrupt`` and ``ScanInterrupted``
+    are not ``Exception``s and pass straight through.
 
     Args:
         artefacts: What the run produced and how far it got.

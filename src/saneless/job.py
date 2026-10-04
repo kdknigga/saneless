@@ -5,10 +5,9 @@ Each job carries a persisted ``state`` column that the worker drives through
 the lifecycle, from PENDING through scanning, assembling and uploading to a
 terminal state such as DONE or ERROR.  The store records each transition it is
 given and does not check that it is a legal one; the order lives in the
-worker.  The rows are also the
-history.  A job survives the process that ran it only as a row: on startup the
-web app fails every job still in an active state through ``fail_active_jobs``
-before the worker starts.
+worker.  The rows are also the history.  A job survives the process that ran it
+only as a row: on startup the web app fails every job still in an active state
+through ``fail_active_jobs`` before the worker starts.
 """
 
 from __future__ import annotations
@@ -59,26 +58,19 @@ logger = logging.getLogger(__name__)
 _LOCKED_MARKER = "__saneless_locked__"
 """The attribute name that marks a callable as serialised on the store's lock.
 
-Spelled in exactly one place.  The decorator that sets it and the reflective
-test that looks for it both read this constant, so the marker name cannot drift
-between source and test, and ``setattr`` through a constant is also what keeps
-ruff's ``B010`` and both type checkers quiet -- a direct
-``wrapper.__saneless_locked__ = True`` makes the checkers complain that a
-function has no such attribute, and a string literal in ``setattr`` trips
-``B010``.
+The decorator that sets it and the reflective test that looks for it both read
+this constant, so the marker name cannot drift between source and test.
 """
 
-# How many jobs each history view shows.  The web page and ``saneless jobs``
-# show different amounts by design -- a page has room for a longer list than a
-# terminal -- so they are two constants, not one.  Neither is configurable.
+# How many jobs each history view shows.  A page has room for a longer list than
+# a terminal, so the web page and ``saneless jobs`` differ by design.
 WEB_HISTORY_LIMIT: Final = 50
 CLI_JOBS_DEFAULT_LIMIT: Final = 20
 
-# How many refused submits -- ERROR rows with ``ErrorCategory.REJECTED`` -- the
-# store keeps, newest first.  They sit under this cap of their own rather than
-# under ``history_max_rows``, so a flood of refusals can never evict a real scan.
-# Smaller than WEB_HISTORY_LIMIT, so such a flood can never fill the visible
-# history table on its own either.  Not configurable.
+# How many refused submits (``ErrorCategory.REJECTED`` rows) the store keeps.
+# Their own cap, outside ``history_max_rows``, means a flood of refusals never
+# evicts a real scan; keeping it below WEB_HISTORY_LIMIT means it never fills
+# the visible history table either.
 REJECTED_HISTORY_ROWS: Final = 20
 
 _COLUMNS: tuple[str, ...] = (
@@ -102,51 +94,31 @@ _COLUMNS: tuple[str, ...] = (
 )
 """Every column the jobs table carries at the head schema version.
 
-The one place the live column list is spelled.  Every ``SELECT`` and every
-``INSERT`` in this module derives its column list and its placeholders from
-this tuple, so a column cannot be added to one statement and forgotten in
-another -- which is exactly how the ``thumbnail`` column came to exist in
-``CREATE TABLE`` while no statement that needed it ever learned about it.
-
-The statements below interpolate identifiers only from this tuple; every value
-they carry is a bound ``?`` parameter.
+Every ``SELECT`` and ``INSERT`` in this module derives its column list and
+placeholders from this tuple, so a column cannot be added to one statement and
+forgotten in another.  The statements interpolate identifiers only from this
+tuple; every value they carry is a bound ``?`` parameter.
 """
 
 _COLUMN_LIST = ", ".join(_COLUMNS)
-"""The column list every statement in this module names, written out once.
-
-Derived from ``_COLUMNS`` so the two can never drift apart.
-"""
+"""The column list every statement in this module names, written out once."""
 
 _PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS)
-"""One bound ``?`` per column, for the ``INSERT``.
-
-Derived from ``_COLUMNS`` for the same reason ``_COLUMN_LIST`` is: a column
-added to the tuple brings its placeholder along with it, so the two lists
-cannot fall out of step.
-"""
+"""One bound ``?`` per column, for the ``INSERT``."""
 
 _ACTIVE_STATE_VALUES: tuple[str, ...] = tuple(sorted(s.value for s in ACTIVE_STATES))
 """The stored TEXT value of every job state that counts as still in flight.
 
-Derived from ``ACTIVE_STATES`` rather than written out, so a state added to that
-frozenset later is picked up by ``_FAIL_ACTIVE`` without anyone
-editing this module -- which is the whole point of the vocabulary owning the
-partition.  ``ACTIVE_STATES`` and ``TERMINAL_STATES`` partition ``JobState``, so
-what this tuple excludes is exactly the completed jobs.
-
-``sorted()`` because ``ACTIVE_STATES`` is a ``frozenset``: its iteration order
-varies per process with ``PYTHONHASHSEED``.  The *result* is correct either way;
-sorting makes a failing test's parameter dump reproducible across runs.
+Derived from ``ACTIVE_STATES``, so a state added there reaches ``_FAIL_ACTIVE``
+without an edit here.  Sorted only because a frozenset's iteration order varies
+with ``PYTHONHASHSEED``; sorting keeps a failing test's parameter dump stable.
 """
 
 _ACTIVE_MARKS = ", ".join("?" for _ in _ACTIVE_STATE_VALUES)
 """One bound ``?`` per active state, for ``_FAIL_ACTIVE``'s ``IN`` clause.
 
-Derived from ``_ACTIVE_STATE_VALUES`` for the same reason ``_PLACEHOLDERS`` is
-derived from ``_COLUMNS``: the run of placeholders and the tuple bound against it
-cannot fall out of step.  Only the *length* of the tuple reaches the SQL text;
-every value is a bound parameter.
+Only the length of ``_ACTIVE_STATE_VALUES`` reaches the SQL text; every value is
+a bound parameter.
 """
 
 _SELECT_ALL = f"SELECT {_COLUMN_LIST} FROM jobs"
@@ -163,24 +135,17 @@ _CREATE_CREATED_AT_INDEX = (
 )
 """Index the jobs by creation time, so history reads walk it instead of sorting.
 
-Without it every ``_SELECT_RECENT`` sorts the whole table in a temporary
-B-tree while the store lock is held.  It is run at every open rather than as a
-step of ``_MIGRATIONS``: an index changes no data shape, so it needs no schema
-version, and keeping it out of the ladder keeps it out of the downgrade guard
-that reads the ladder's length.  An earlier release therefore still opens the
-database -- SQLite maintains an index whether or not the code knows about it.
+Run at every open rather than as a step of ``_MIGRATIONS``: an index changes no
+data shape, and keeping it out of the ladder keeps it out of the downgrade
+guard, so an earlier release still opens the database.
 """
 
 _LIST_PENDING = f"{_SELECT_ALL} WHERE state = ? ORDER BY created_at ASC"
-"""Read the queued jobs oldest-first -- the order they will be worked in.
+"""Read the queued jobs oldest-first, the order they will be worked in.
 
-Ascending, the opposite of ``_SELECT_RECENT``: history reads newest-first, a
-queue reads oldest-first.  One bound parameter, the state value, which is
-``JobState.PENDING.value`` at the only call site -- the literal string is never
-written into the statement text.
-
-Like ``_PRUNE``'s, the ``ORDER BY`` is lexicographic over ``created_at``'s
-ISO-8601 strings and is correct only because every writer stamps UTC.
+One bound parameter, the state value.  Like ``_PRUNE``'s, the ``ORDER BY`` is
+lexicographic over ``created_at``'s ISO-8601 strings and is correct only because
+every writer stamps UTC.
 """
 
 _SELECT_LATEST_RUN = (
@@ -188,22 +153,14 @@ _SELECT_LATEST_RUN = (
 )
 """Read the newest jobs that were not rejected at submit, newest first.
 
-Two bound parameters: ``ErrorCategory.REJECTED.value`` and the row limit, an
-integer ``latest_run_job`` derives from how many ids it excludes.
-Neither is ever written into the statement text.
-``IS NOT`` rather than ``!=`` because it is NULL-safe in SQLite: ``NULL != 'X'``
-is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
-that has not failed, and every job ``fail_active_jobs`` failed on restart before
-its upload, has no category, so ``!=`` would silently hide exactly the jobs this
-query exists to return.
-
-Like ``_SELECT_RECENT``'s, the ``ORDER BY`` is lexicographic over
-``created_at``'s ISO-8601 strings and is correct only because every writer
-stamps UTC.
+Two bound parameters: ``ErrorCategory.REJECTED.value`` and the row limit.
+``IS NOT`` rather than ``!=`` because ``NULL != 'X'`` is NULL, and most jobs
+have no category, so ``!=`` would hide exactly the jobs this query exists to
+return.
 """
 
 _COUNT_JOBS = "SELECT COUNT(*) FROM jobs"
-"""Count every job -- the read half of ``JobStore.probe``.  No parameters."""
+"""Count every job, the read half of ``JobStore.probe``."""
 
 _INSERT = f"INSERT INTO jobs ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
 """Write one job, naming every column so physical column order never matters."""
@@ -212,11 +169,8 @@ _FAIL_ACTIVE = f"UPDATE jobs SET state = ?, error = ? WHERE state IN ({_ACTIVE_M
 """Move every still-in-flight job to a failed state with a given error text.
 
 Bound parameters, in this order: the target state value, the error text, then one
-per entry of ``_ACTIVE_STATE_VALUES``.
-
-``json_each(?)`` would make the statement fully static and was verified to work
-here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
-soft dependency on an extension this module otherwise does not need.
+per entry of ``_ACTIVE_STATE_VALUES``.  Not ``json_each(?)``: JSON1 was a
+compile-time option before SQLite 3.38.
 """
 
 _FAIL_UPLOADING = (
@@ -231,10 +185,7 @@ in this order: the target state value, the error text, the category value, then
 """
 
 _SELECT_STATE_BY_ID = "SELECT state FROM jobs WHERE id = ?"
-"""Read one job's state by its primary key, for ``fail_recovered_jobs``.
-
-One bound parameter, the job id.
-"""
+"""Read one job's state by its primary key, for ``fail_recovered_jobs``."""
 
 _FAIL_RECOVERED = (
     "UPDATE jobs SET state = ?, error = ?, error_category = ? "
@@ -242,12 +193,10 @@ _FAIL_RECOVERED = (
 )
 """Move one named job to a failed state with its own text and category.
 
-The sibling of ``_FAIL_UPLOADING`` for one named row.  Bound parameters, in
-this order: the target state value, the error text, the category value (or
-NULL), the job id, then the state the row was read in.  Matching that state
-means the write lands only on the row the text was composed for.  The id and
-the text -- which quotes a title read back from a workspace on disk -- are
-bound, never written into the statement.
+Bound parameters, in this order: the target state value, the error text, the
+category value (or NULL), the job id, then the state the row was read in.
+Matching that state means the write lands only on the row the text was composed
+for.
 """
 
 _NEWEST_RUN_IDS = (
@@ -256,10 +205,8 @@ _NEWEST_RUN_IDS = (
 """The ids of the newest jobs that were not refused at submit, up to a limit.
 
 ``_PRUNE``'s run-row subquery.  Two bound parameters, in this order:
-``ErrorCategory.REJECTED.value`` and the row cap.  ``IS NOT`` rather than
-``!=`` for the reason ``_SELECT_LATEST_RUN`` gives: ``NULL != 'X'`` is NULL, so
-``!=`` would leave out every job with no category -- nearly every run -- and
-those jobs would then never count toward the cap.
+``ErrorCategory.REJECTED.value`` and the row cap.  ``IS NOT`` for the
+NULL-safety reason ``_SELECT_LATEST_RUN`` gives.
 """
 
 _NEWEST_REJECTED_IDS = (
@@ -269,14 +216,10 @@ _NEWEST_REJECTED_IDS = (
 
 The subquery ``_PRUNE`` and ``_TRIM_REJECTED`` share.  Two bound parameters, in
 this order: ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS``.
-Plain ``=`` is right here, because it is meant to leave out every NULL
-category.
 
-Ordered by ``rowid``, which is insertion order, and not by ``created_at``.
-``_TRIM_REJECTED`` runs in the transaction that wrote a refused row, and the
-response names that row.  On an appliance whose clock is still behind at
-boot, before NTP, the new row's ``created_at`` sorts below the rows already
-kept, and an order by time would delete the row just written.
+Ordered by ``rowid`` (insertion order), not ``created_at``: on an appliance
+whose clock is still behind at boot, an order by time would delete the refused
+row just written, which the response names.
 """
 
 _TRIM_REJECTED = (
@@ -286,9 +229,8 @@ _TRIM_REJECTED = (
 
 Three bound parameters, in this order: ``ErrorCategory.REJECTED.value``, then
 ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS`` for the
-subquery.  It runs in the same transaction
-as the write that recorded a refusal, so once that write commits the table
-never holds more refused rows than the cap.
+subquery.  It runs in the same transaction as the write that recorded a
+refusal, so a committed table never holds more refused rows than the cap.
 """
 
 _PRUNE = (
@@ -298,37 +240,24 @@ _PRUNE = (
 )
 """Delete every job past the age cutoff or outside its partition's row cap.
 
-The table has two partitions.  Runs -- every job not refused at submit,
-including every job with no category -- are capped at the caller's
-``max_rows``.  Refused submits are capped at ``REJECTED_HISTORY_ROWS`` and do
-not count toward ``max_rows``, so a flood of refusals can never push a real
-scan out of history.  ``IS NOT`` and ``=`` split the table exactly in two, for
-the NULL-safety reason ``_NEWEST_RUN_IDS`` gives.
+Runs (every job not refused at submit, including those with no category) are
+capped at the caller's ``max_rows``; refused submits are capped at
+``REJECTED_HISTORY_ROWS`` and do not count toward it.  ``IS NOT`` and ``=``
+split the table exactly in two.
 
 Seven bound parameters, in this order: the ISO-8601 cutoff; for the run half,
 ``ErrorCategory.REJECTED.value`` twice and the run-row cap; for the refused
 half, ``ErrorCategory.REJECTED.value`` twice and ``REJECTED_HISTORY_ROWS``.
 
-**Every comparison is lexicographic over strings.**  ``created_at`` is written
-as ``datetime.now(tz=UTC).isoformat()``, so every value ends ``+00:00``, and the
-``<`` cutoff and the ``ORDER BY`` are correct *only* because of that uniformity.
-A single non-UTC timestamp reaching this column -- a ``-05:00`` offset, say --
-would make both the cutoff and the ordering silently wrong, and nothing here
-would raise.  Anyone adding a writer to this column meets this note first.
+**Every comparison is lexicographic over strings.**  The ``<`` cutoff and the
+``ORDER BY`` are correct only because every writer stamps
+``datetime.now(tz=UTC).isoformat()``; one non-UTC timestamp in this column makes
+both silently wrong.
 
-The predicates are a *union*, not a sequence, and within the run partition that
-is equivalent to deleting by age and then trimming to a row cap: both order by
-``created_at``, so the partition's age-expired rows are always a prefix of its
-oldest and the union of the two sets is exactly what the sequential form
-produced.  The refused partition keeps its newest rows by insertion order, for
-the reason ``_NEWEST_REJECTED_IDS`` gives, which matches ``created_at`` order
-unless the clock stepped back between two refusals.  The equivalence rests in turn on SQLite evaluating each
-``IN (SELECT ... ORDER BY ... LIMIT ?)`` right-hand side into a ``LIST
-SUBQUERY`` before the outer scan begins, so it never observes its own partial
-deletions.  SQLite does not document that as a guarantee, so it is pinned by the
-shuffled-insert-order tests in ``tests/test_job.py`` rather than by contract: if
-a future libsqlite changes the plan, those go red instead of this statement
-quietly under-deleting.
+SQLite evaluates each ``IN (SELECT ... LIMIT ?)`` into a list before the outer
+scan, so the delete never sees its own partial deletions.  SQLite does not
+document that, so the shuffled-insert-order tests in ``tests/test_job.py`` pin
+it.
 """
 
 _S3_COLUMNS: frozenset[str] = frozenset(
@@ -347,10 +276,9 @@ _S3_COLUMNS: frozenset[str] = frozenset(
 )
 """The ten columns of the schema this project shipped before ``user_version``.
 
-A frozen historical shape, not a description of the current table: it is what
-migration step 2 requires to be present before it upgrades a pre-existing
-database.  It must never grow when a later step adds a column, or step 2 would
-start rejecting the very databases it had already upgraded.
+A frozen shape that migration step 2 requires before it upgrades a database.  It
+must never grow when a later step adds a column, or step 2 would reject the
+databases it had already upgraded.
 """
 
 _V2_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -363,10 +291,9 @@ _V2_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 """The six ``(name, SQL type)`` pairs migration step 2 adds to the jobs table.
 
-Every one is nullable and carries no ``DEFAULT``.  ``NULL`` means "never
-recorded", which is true of every row written before this migration and of
-every job that fails before the scanner opens; ``NOT NULL DEFAULT 0`` would
-backfill history with a measured zero that never happened.
+Every one is nullable and carries no ``DEFAULT``: ``NULL`` means "never
+recorded", and ``NOT NULL DEFAULT 0`` would backfill history with a measured
+zero that never happened.
 """
 
 _V3_COLUMNS: tuple[tuple[str, str], ...] = (("pages_removed_at", "TEXT"),)
@@ -374,9 +301,8 @@ _V3_COLUMNS: tuple[tuple[str, str], ...] = (("pages_removed_at", "TEXT"),)
 
 ``pages_removed_at`` holds the positions of the pages blank-page detection
 removed, as a JSON array of 1-based scanned page numbers in document order.
-It is nullable and carries no ``DEFAULT``: ``NULL`` means "never recorded",
-which is true of every row written before this migration and of every job
-that recorded no result.  An empty array means "recorded, and none removed".
+``NULL`` means "never recorded"; an empty array means "recorded, and none
+removed".
 """
 
 
@@ -440,9 +366,6 @@ def _migrate_v3(conn: sqlite3.Connection, db_path: str) -> None:
     """
     Add the removed-page positions column to a jobs table at version 2.
 
-    Every existing row reads ``NULL`` afterwards, which is the truth: none of
-    them recorded which pages were removed.
-
     Args:
         conn: Open connection to the job database.
         db_path: Path the connection was opened on, for logging.
@@ -463,8 +386,6 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection, str], None], ...] = (
 )
 """The ordered migration ladder, where ``index + 1`` is the version it produces.
 
-Every step takes the database path as well as the connection so the tuple
-stays homogeneous, even though only step 2 has anything to name in a failure.
 The downgrade guard in ``_open_connection`` reads its length, so a database a
 newer step has touched is refused by any release that lacks that step.
 """
@@ -480,8 +401,7 @@ def _schema_version(conn: sqlite3.Connection, stamped: int) -> int:
 
     Returns:
         ``stamped``, except that an unstamped database already holding a jobs
-        table is at version 1: nothing ever stamped user_version, so an
-        existing jobs table is at version 1 rather than at nothing.
+        table is at version 1.
 
     """
     if stamped != 0:
@@ -516,9 +436,8 @@ def _refuse_unsupported_version(db_path: str, version: int) -> None:
             "restore a backup or run a newer saneless"
         )
         raise StorageError(msg)
-    # user_version is a signed 32-bit field, so a foreign tool can stamp a
-    # negative value. The ladder would index its migrations from the end
-    # for one, so it is refused here with the too-new case.
+    # user_version is signed, so a foreign tool can stamp a negative value, and
+    # the ladder would then index its migrations from the end.
     if version < 0:
         msg = (
             f"job database at {db_path} is at schema version {version}, "
@@ -541,17 +460,15 @@ def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
     version = _schema_version(conn, stamped)
     for index in range(version, len(_MIGRATIONS)):
         _MIGRATIONS[index](conn, db_path)
-        # A PRAGMA argument cannot be bound -- "PRAGMA user_version = ?" is a
-        # syntax error -- and index comes from range() over a module-level
-        # tuple, so no caller-supplied value reaches this string.
+        # A PRAGMA argument cannot be bound, and index comes from range() over
+        # a module-level tuple, so no caller-supplied value reaches this string.
         conn.execute(f"PRAGMA user_version = {index + 1}")
         # Commit per step: a ladder that fails at step N leaves a valid
         # database at version N - 1 rather than a half-applied one.
         conn.commit()
-    # The version read above opened a deferred read transaction, and on an
-    # up-to-date database no step committed it.  Committing here releases its
-    # WAL snapshot, so another connection's checkpoint is not held off for as
-    # long as this one sits idle.
+    # The version read opened a read transaction that no step committed on an
+    # up-to-date database.  Committing releases its WAL snapshot, so another
+    # connection's checkpoint is not held off while this one sits idle.
     conn.commit()
 
 
@@ -561,13 +478,10 @@ def _open_failure(db_path: str, exc: sqlite3.Error | OSError) -> StorageError:
 
     Args:
         db_path: Path the connection was opened on, named in the message.
-        exc: The sqlite3 error that stopped the open, or the OS error that
-            stopped the private pre-create of a new database file or the
-            read-only listing's lookup of an existing one.
+        exc: The sqlite3 or OS error that stopped the open.
 
     Returns:
-        A one-line StorageError naming the path and sqlite's reason.
-        The CLI guard maps StorageError to exit 2 by type.
+        A one-line StorageError naming the path and the reason.
 
     """
     return StorageError(
@@ -579,37 +493,20 @@ _AUTO_VACUUM_INCREMENTAL = 2
 """``PRAGMA auto_vacuum``'s answer for INCREMENTAL (0 is NONE, 1 is FULL)."""
 
 _MEMORY_DB = ":memory:"
-"""The path SQLite reads as a private in-memory database rather than a file.
-
-Such a database is always new, and there is no file for a mode to apply to.
-"""
+"""The path SQLite reads as a private in-memory database, always new."""
 
 
 def _create_private(db_path: str) -> bool:
     """
-    Create a new job database file readable by its owner alone.
+    Create a new job database file, mode 0600, and report whether this call did.
 
-    SQLite would create a missing file itself, with a mode the umask decides --
-    0644 under the usual 022 -- and the database holds every job title and
-    thumbnail.  Creating the empty file first, exclusively and with mode 0600,
-    closes that: SQLite accepts a zero-byte file as an empty database, and it
-    gives the ``-wal`` and ``-shm`` files it later creates the database file's
-    own mode.  A mode passed to ``open`` is only ever narrowed by the umask, so
-    0600 holds under any of them.
-
-    A file that already exists keeps the mode it has, including a 0644 one an
-    earlier release created: this is the create path only, never a chmod.  The
-    same answer covers another opener winning a race to create it.
-
-    Args:
-        db_path: Path of the database file to create.
-
-    Returns:
-        True if this call created the file, False if it already existed.
+    SQLite would otherwise create it with the umask's mode, and it holds every
+    job title and thumbnail.  Its ``-wal`` and ``-shm`` files take the same
+    mode; an existing file keeps its own, since this never chmods.
 
     Raises:
-        StorageError: If the file could not be created for any other reason,
-            such as a missing parent directory or a permission refusal.
+        StorageError: If the file could not be created for a reason other than
+            already existing.
 
     """
     try:
@@ -627,14 +524,11 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
 
     A missing database file is first created owner-only by
     :func:`_create_private`, and a database this call created gets
-    ``auto_vacuum = INCREMENTAL`` before anything is written to it.  A missing
-    parent fails at that pre-create; a directory fails at ``connect``; a file
-    that is not SQLite fails at the ``user_version`` read,
-    the first statement that reads it.  A database stamped with a schema
-    version newer than this release's migration ladder, or negative, is
-    refused before any statement that could write to it.  Only this open
-    path is translated: the runtime store methods keep their raw sqlite3
-    errors, which the web worker's degraded-health handling depends on.
+    ``auto_vacuum = INCREMENTAL`` before anything is written to it.  A database
+    stamped with a schema version newer than this release's migration ladder,
+    or negative, is refused before any statement that could write to it.  Only
+    this open path is translated: the runtime store methods keep their raw
+    sqlite3 errors, which the web worker's degraded-health handling depends on.
 
     Args:
         db_path: Path to the SQLite database file, or ":memory:".
@@ -661,16 +555,13 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
         # The version check has to come before the WAL pragma: switching a
         # rollback-journal file to WAL rewrites its header, so a refusal made
         # after it would no longer leave the file exactly as it was found.
-        # The except BaseException arm below closes the connection.
         version: int = conn.execute("PRAGMA user_version").fetchone()[0]
         _refuse_unsupported_version(db_path, version)
         if created:
             # auto_vacuum can only be switched on for free while the file
             # holds no table yet, so it runs before the WAL header rewrite and
-            # before any migration creates one.  INCREMENTAL lets a delete hand
-            # its freed pages back to the file system; an existing database is
-            # converted separately by enable_incremental_auto_vacuum, since
-            # that takes a VACUUM.
+            # any migration.  An existing database is converted separately by
+            # enable_incremental_auto_vacuum, since that takes a VACUUM.
             conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
         # WAL has to be enabled before the connection switches to explicit
         # transaction control: that switch opens a transaction immediately,
@@ -707,11 +598,9 @@ def _parse_positions(raw: str | None, job_id: str) -> tuple[int, ...] | None:
     """
     Decode the ``pages_removed_at`` column, refusing anything but page numbers.
 
-    The column is only ever written by :meth:`JobStore.finish_job`, but the
-    database is a file on disk, so it is read defensively: a value that is not
-    a JSON array of integers, each at least 1, is logged and treated as never
-    recorded rather than rendered or allowed to break every history read.  A
-    JSON ``true`` is refused too, although Python counts ``bool`` as ``int``.
+    The database is a file on disk, so a value that is not a JSON array of
+    integers of at least 1 (``true`` included) is logged and treated as never
+    recorded rather than allowed to break every history read.
 
     Args:
         raw: The stored text, or None for NULL.
@@ -803,13 +692,9 @@ class JobResult:
     """
     Everything a finished scan recorded, bundled into one argument.
 
-    :meth:`JobStore.finish_job` takes it.  The fields mirror :class:`saneless.pipeline.ScanResult` without importing
-    it: ``job.py`` does not import the pipeline and the pipeline does not
-    import ``job.py``.  The worker copies the fields across at its one call
-    site.
-
-    Every field is optional, because a caller that has no result to record
-    passes no ``JobResult`` at all rather than a zero-filled one.
+    :meth:`JobStore.finish_job` takes it.  The fields mirror
+    :class:`saneless.pipeline.ScanResult` without importing it, so neither
+    module imports the other; the worker copies the fields across.
 
     Attributes:
         outcome: How the scan resolved.
@@ -819,7 +704,6 @@ class JobResult:
         pages_uploaded: Pages sent to paperless-ngx.
         removed_positions: The 1-based scanned page numbers removed as blank,
             in document order, or None when the run did not record them.
-            Defaulted, so a caller with nothing to say about them need not.
 
     """
 
@@ -835,25 +719,12 @@ def _locked[**P, R](
     method: Callable[Concatenate[JobStore, P], R],
 ) -> Callable[Concatenate[JobStore, P], R]:
     """
-    Serialise a JobStore method on the store's re-entrant lock.
+    Serialise a JobStore method on the store's lock and mark it ``_LOCKED_MARKER``.
 
-    Takes ``self._lock`` and nothing else.  It deliberately does *not* also
-    open the connection's transaction context: ``Connection.__exit__`` runs
-    after the body and must commit or roll back, so ``with conn: conn.close()``
-    raises ``ProgrammingError: Cannot operate on a closed database`` and
-    ``close()`` could never be decorated.  Even a hand-rolled context manager
-    fails, because ``in_transaction`` itself raises on a closed connection.
-    Each method that executes SQL therefore opens its own ``with self._conn:``
-    in its body, where the transaction boundary is also more legible.
-
-    Args:
-        method: An unbound ``JobStore`` method to serialise.
-
-    Returns:
-        The method, wrapped to hold the store's lock for its whole duration and
-        carrying the ``_LOCKED_MARKER`` attribute the reflective coverage test
-        looks for.
-
+    It does not also open the connection's transaction context, because
+    ``Connection.__exit__`` raises on a closed database and ``close()`` could
+    then never be decorated.  Each method that executes SQL opens its own
+    ``with self._conn:``.
     """
 
     @functools.wraps(method)
@@ -869,17 +740,9 @@ def _job_from_row(row: sqlite3.Row) -> Job:
     """
     Convert one jobs row into a Job.
 
-    The only row-to-``Job`` conversion in this module.  It is a plain
-    function rather than a store method so the read-only history read, which
-    has no store, maps rows exactly as :meth:`JobStore.list_recent` does.  It
-    holds no lock and opens no transaction, which is what lets a store method
-    call it from inside its own ``with conn:``.
-
-    Every access is by name.  A database migrated from the pre-``thumbnail``
-    shape by the old bare ``ALTER`` carries ``error_category`` last while a
-    freshly created one carries it sixth, so physical column order is not a
-    contract and no ordinal may be used here.  (``sqlite3.Row`` keys are
-    case-insensitive; nothing here relies on that, and nothing should.)
+    A plain function, holding no lock, so the read-only history read maps rows
+    exactly as :meth:`JobStore.list_recent` does.  Every access is by name:
+    physical column order differs between migrated and fresh databases.
 
     Args:
         row: A jobs row, fetched with ``sqlite3.Row`` as the row factory.
@@ -914,9 +777,6 @@ def _job_from_row(row: sqlite3.Row) -> Job:
 def _open_uri(uri: str) -> tuple[sqlite3.Connection, int]:
     """
     Connect to a ``file:`` URI and read the database's schema version.
-
-    The version read is the first statement, and so the point where a
-    read-only open that cannot work fails.
 
     Args:
         uri: The ``file:`` URI to connect to.
@@ -982,17 +842,11 @@ def _connect_read_only(db_path: Path, owner: int) -> tuple[sqlite3.Connection, i
     # as_uri() percent-encodes the path, so a '?', '#' or space in it stays
     # part of the file name rather than starting the URI's query or fragment.
     uri = db_path.resolve().as_uri() + "?mode=ro"
-    # A read-only connection to a WAL database creates the -wal and -shm files
-    # beside it, and being read-only it cannot remove them when it closes.
-    # Left by another user -- root, for a sudo saneless jobs -- they belong to
-    # that user, and the server that owns the folder can then no longer write
-    # its own database.  So a reader who does not own the file, finding no
-    # side files, reads it immutable and creates none.  No side files means no
-    # connection holds the database and no committed page lives outside the
-    # file.  A server that opens it during the read writes to a new -wal, not
-    # to this file, until it checkpoints; a checkpoint landing mid-read can at
-    # worst spoil this one read, and never the file, which an immutable
-    # connection does not write.
+    # A read-only connection to a WAL database leaves -wal and -shm files it
+    # cannot remove, and if root left them the server could no longer write its
+    # own database.  So a reader who does not own the file, finding no side
+    # files, reads it immutable and creates none; a checkpoint landing mid-read
+    # can at worst spoil this one read, never the file.
     if owner != os.geteuid() and not _has_side_files(db_path):
         return _open_uri(uri + "&immutable=1")
     try:
@@ -1000,12 +854,9 @@ def _connect_read_only(db_path: Path, owner: int) -> tuple[sqlite3.Connection, i
     except sqlite3.OperationalError:
         if not _immutable_read_is_safe(db_path):
             raise
-    # A read-only connection to a WAL database still creates the -shm file
-    # beside it, so in a directory nobody can write to it fails.  There, and
-    # with no -wal or -shm present, immutable=1 is safe: no writer can be
-    # active in a directory where none could create its -wal, and no -wal
-    # means no committed page lives outside the database file, so nothing can
-    # change under the read and nothing is missed by skipping the WAL.
+    # A read-only connection still creates -shm, so in an unwritable directory
+    # it fails.  There, with no side files, immutable=1 is safe: no writer can
+    # create a -wal, and without one no committed page lives outside the file.
     return _open_uri(uri + "&immutable=1")
 
 
@@ -1045,9 +896,7 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
     """
     name = str(db_path)
     # Only a file that is not there is an empty history.  Path.exists() also
-    # answers False for a lookup that failed -- a folder this user may not
-    # enter, a symlink loop -- and a listing that took that for "no jobs"
-    # would print an empty table, and [] on the JSON contract.
+    # answers False for a lookup that failed, which would print an empty table.
     try:
         owner = db_path.stat().st_uid
     except FileNotFoundError:
@@ -1109,11 +958,10 @@ class JobStore:
             self._conn.execute(_CREATE_CREATED_AT_INDEX)
             self._conn.commit()
         except Exception as exc:
-            # Release the BEGIN DEFERRED the failed ladder or index still
-            # holds, and the file handle with it, before the caller sees the
-            # failure.  A rollback that fails too -- a disk I/O error on the
-            # same broken file -- must not replace the open's own error with a raw
-            # sqlite3 one, which would exit 5 instead of 2.
+            # Release the transaction and file handle before the caller sees
+            # the failure.  A rollback that fails too must not replace the
+            # open's StorageError with a raw sqlite3 error, which the CLI maps
+            # to ExitCode.UNEXPECTED rather than ExitCode.CONFIG.
             with contextlib.suppress(sqlite3.Error):
                 self._conn.rollback()
             self._conn.close()
@@ -1124,11 +972,6 @@ class JobStore:
     def _row_to_job(self, row: sqlite3.Row) -> Job:
         """
         Convert one jobs row into a Job through the module's one row mapper.
-
-        Private and undecorated deliberately: ``sqlite3`` connection context
-        managers do not nest, so an inner ``with conn:`` commits the outer
-        transaction.  Shared logic therefore has to live in a helper a public
-        method can call without going through another public method.
 
         Args:
             row: A jobs row fetched over this store's own connection.
@@ -1181,40 +1024,26 @@ class JobStore:
                     correspondent,
                     None,  # thumbnail -- update_thumbnail writes it later
                     datetime.now(tz=UTC).isoformat(),
-                    # A new job has recorded nothing yet, so every result
-                    # column starts NULL -- deliberately, because NULL means
-                    # "never recorded" rather than a measured zero.  finish_job
-                    # is the writer of these, and of pages_removed_at, once the
-                    # run ends.
+                    # NULL means "never recorded", not a measured zero;
+                    # finish_job writes these once the run ends.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
                     None,  # pages_uploaded
                     None,  # warning
-                    # owner_token's first and only writer.  The value is an
-                    # opaque session token minted by the web layer and kept for
-                    # exactly one purpose: rendering the flip prompt to the
-                    # browser that submitted this job rather than to every
-                    # browser watching it.  NULL means the row is unowned and
-                    # the prompt is rendered for everyone -- which is every row
-                    # written before the column had a writer, including a
-                    # manual-duplex job still in flight across an upgrade, so
-                    # no migration backfills it and none is needed.  It is a
-                    # footgun guard, not an authentication mechanism: the
-                    # column already existed unused, and guessing a token
-                    # grants nothing a LAN neighbour cannot already do.
+                    # owner_token's only writer.  NULL means unowned: the flip
+                    # prompt renders for every browser.  A footgun guard, not
+                    # a login.  See
+                    # docs/explanation/decisions/0014-owner-token-not-a-login.md.
                     owner_token,
                     None,  # pages_removed_at -- finish_job's to write
                 ),
             )
-            # Read the row back inside the same transaction, before the commit:
-            # the caller then gets the job the database holds rather than a
-            # second, hand-built copy of it, which is what keeps the row
-            # mapping in exactly one place.
+            # Read back inside the same transaction, so the row mapping stays
+            # in _row_to_job alone.
             row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         job = self._row_to_job(row)
-        # %r, not %s: the title is untrusted text, and a newline in it would
-        # otherwise start what reads as a second log line.
+        # %r: a newline in the untrusted title would forge a second log line.
         logger.debug("Created job %s: %r", job.id, job.title)
         return job
 
@@ -1231,24 +1060,14 @@ class JobStore:
         """
         Record a submit that was refused before any job row existed.
 
-        The refused attempt still gets a row, so history shows the user that
-        their scan was not started and why.  The row is written already
-        terminal -- ``ERROR`` with ``ErrorCategory.REJECTED`` -- and that marker
-        is what :meth:`latest_run_job` skips, so the rejection never replaces
-        the job that just ended in the status area.
+        The row is written already terminal, ``ERROR`` with
+        ``ErrorCategory.REJECTED``, which :meth:`latest_run_job` skips so the
+        rejection never replaces the job that just ended in the status area.
 
-        One ``INSERT``, not :meth:`create_job` followed by :meth:`finish_job`.
-        Those are two transactions: if the second one raised, the first would
-        already have committed a ``PENDING`` row with no marker.  No worker ever
-        saw that id and restart recovery never runs again, so the row would stay
-        active for good, showing "Starting scan..." and disabling the Scan
-        button.  With a single statement a failure leaves no row at all.
-
-        The same transaction then trims refused rows to the newest
-        ``REJECTED_HISTORY_ROWS``, so a flood of refused submits holds the
-        table at a fixed size instead of growing it.  That trim deletes only
-        refused rows, so it cannot strand a ``PENDING`` one either.  The row
-        stays unowned: ``owner_token`` is NULL.
+        One ``INSERT``, not :meth:`create_job` then :meth:`finish_job`: if the
+        second transaction raised, the first would leave a ``PENDING`` row no
+        worker ever runs, disabling the Scan button for good.  The same
+        transaction trims refused rows to ``REJECTED_HISTORY_ROWS``.
 
         Args:
             profile: Scan profile name the refused submit named.
@@ -1276,8 +1095,6 @@ class JobStore:
                     correspondent,
                     None,  # thumbnail -- a refused submit never scanned
                     datetime.now(tz=UTC).isoformat(),
-                    # Nothing ran, so nothing was recorded: every result column
-                    # is NULL ("never recorded"), never a measured zero.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
@@ -1287,13 +1104,12 @@ class JobStore:
                     None,  # pages_removed_at
                 ),
             )
-            # Read back inside the same transaction, as create_job does, so the
-            # row mapping stays in _row_to_job alone.  Before the trim, so the
-            # read can never miss the row it just wrote.
+            # Read back before the trim, so the read can never miss the row it
+            # just wrote.
             row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
             self._trim_rejected()
         job = self._row_to_job(row)
-        # %r for the same reason as create_job's: the title is untrusted text.
+        # %r for the same reason as create_job's.
         logger.debug("Created rejected job %s: %r", job.id, job.title)
         return job
 
@@ -1355,24 +1171,18 @@ class JobStore:
         """
         Record a job's terminal state together with everything the run produced.
 
-        The only writer of the six result columns, and the reason
-        :meth:`update_state` is not.  ``update_state``'s SQL is an
-        unconditional ``SET state, error, error_category``; naming the result
-        columns there would blank them on every in-flight SCANNING /
-        ASSEMBLING / UPLOADING transition, so the terminal write is a separate
-        method rather than an extra argument.
+        The only writer of the result columns: naming them in
+        :meth:`update_state`'s unconditional ``SET`` would blank them on every
+        in-flight transition.
 
-        State, outcome, warning, the three counts, the removed-page positions
-        and the error all land in one ``UPDATE``.  Recording ``ErrorCategory.REJECTED`` also trims the refused
-        rows to their cap, in the same transaction.  The web request thread reads this row while the worker
-        thread writes it, and a two-statement version would let it observe a
-        job that had finished but had not yet recorded how.
+        Everything lands in one ``UPDATE``, because the web request thread
+        reads this row while the worker writes it and must never see a job
+        that finished without recording how.  Recording
+        ``ErrorCategory.REJECTED`` also trims the refused rows to their cap, in
+        the same transaction.
 
-        Omitting ``result`` leaves ``outcome``, ``warning``, all three page
-        counts and the positions NULL rather than zero.  NULL means "never recorded"; ``0`` means
-        "counted, and there were none".  A job that failed before the scanner
-        opened has not measured zero pages, and writing ``0`` would make those
-        two states indistinguishable for the life of the row.
+        Omitting ``result`` leaves the result columns NULL ("never recorded")
+        rather than zero ("counted, and there were none").
 
         Args:
             job_id: The UUID string of the job.
@@ -1401,10 +1211,8 @@ class JobStore:
                 ),
             )
             if error_category is ErrorCategory.REJECTED:
-                # A job refused after its row existed -- the queue was full, or
-                # the worker replays a rejection it owed -- joins the refused
-                # rows, so it is trimmed under their cap in this transaction
-                # just as create_rejected_job's rows are.
+                # A job refused after its row existed joins the refused rows
+                # and their cap.
                 self._trim_rejected()
         logger.debug("Job %s finished as %s", job_id, state.value)
 
@@ -1444,12 +1252,9 @@ class JobStore:
         """
         Delete refused rows past ``REJECTED_HISTORY_ROWS``, in the open transaction.
 
-        Private, unlocked and without a ``with self._conn:`` of its own for the
-        reason :meth:`_pending_jobs` gives: its callers, ``create_rejected_job``
-        and ``finish_job``, already hold the lock and a transaction, and the
-        trim must commit with the write that recorded the refusal.  It deletes
-        only rows marked ``ErrorCategory.REJECTED``, so a flood of refused
-        submits can never remove a run.
+        Unlocked and without a ``with self._conn:`` of its own: its callers
+        already hold the lock and a transaction, and the trim must commit with
+        the write that recorded the refusal.
         """
         rejected = ErrorCategory.REJECTED.value
         trimmed = self._conn.execute(
@@ -1463,19 +1268,10 @@ class JobStore:
         """
         Read the queue oldest-first, without taking the lock.
 
-        The shared body of :meth:`list_pending` and :meth:`queue_position`.
-        Private and unlocked deliberately: both public callers already carry
-        ``@_locked``, and a public method may not call another public one --
-        ``sqlite3`` connection context managers do not nest, so an inner ``with
-        self._conn:`` commits the outer method's transaction early.  Factoring
-        the query here, rather than letting ``queue_position`` write a second
-        ``ORDER BY``, is what makes it impossible for a job's position and the
-        list it is a position into to disagree.
-
-        Returns:
-            List of Job instances awaiting a scanner, ordered by creation time
-            ascending.
-
+        The shared body of :meth:`list_pending` and :meth:`queue_position`, so
+        a job's position and the list it is a position into cannot disagree.
+        A public method may not call another public one: ``sqlite3`` connection
+        context managers do not nest, so an inner ``with`` commits early.
         """
         with self._conn:
             rows = self._conn.execute(
@@ -1488,16 +1284,8 @@ class JobStore:
         """
         Fetch the queued jobs oldest-first.
 
-        Ascending ``created_at``, the opposite of ``list_recent``'s newest-first
-        history ordering: this is a queue, and the oldest entry is the next one
-        to be worked.  ``PENDING`` is the only state a job that has not started
-        can be in, so the predicate is a single bound scalar rather than the
-        variable-length ``IN`` ``fail_active_jobs`` needs -- but the state value
-        is still bound rather than written into the statement text.
-
-        The web layer reads it to find the viewer's own queued job.
-        :meth:`queue_position` reads the same ordering, through
-        ``_pending_jobs``, for the status area's "N ahead of you" line.
+        The oldest entry is the next one to be worked.  :meth:`queue_position`
+        reads the same ordering.
 
         Returns:
             List of Job instances awaiting a scanner, ordered by creation time
@@ -1511,29 +1299,15 @@ class JobStore:
         """
         Count the queued jobs ahead of one job.
 
-        Zero-based: the job at the head of the queue has nothing ahead of it
-        and answers ``0``.  The UI adds nothing to the number -- it renders
-        ``(next in line)`` for ``0`` rather than ``(0 ahead of you)``, which is
-        technically true and reads like a bug -- and ``(N ahead of you)`` for
-        anything higher.
+        Zero-based: the job at the head of the queue answers ``0``.  A job that
+        has left ``PENDING`` and an id no row carries both answer ``None``.
 
-        ``None`` means the job is not waiting.  A job that has left ``PENDING``
-        and an id no row carries both answer ``None``, because both mean the
-        same thing to the status area: there is no queue line to render.
+        Walks :meth:`list_pending`'s ordering rather than asking the database
+        for a rank, so there is one definition of "ahead".
 
-        Walks :meth:`list_pending`'s ordering through the shared
-        ``_pending_jobs`` query rather than asking the database for a rank.  A
-        second ``ORDER BY`` -- or a ``COUNT(*)`` over a hand-written predicate
-        -- would be a second definition of "ahead", and two definitions that
-        agree today drift tomorrow.  The queue is bounded by the submission
-        cap, so reading it is cheaper than keeping the two in step by hand.
-
-        The job the worker has taken is not in the queue, although its row
-        can still read ``PENDING``: the worker persists ``SCANNING`` only once
-        it holds the scanner gate, and a running check can hold that gate for
-        up to the listing deadline.  The caller names that job in
-        ``running``, and it is never counted ahead of anyone; asked about
-        itself, it answers ``None``.
+        The job the worker has taken can still read ``PENDING`` until it holds
+        the scanner gate.  The caller names it in ``running``; it is never
+        counted ahead of anyone, and asked about itself it answers ``None``.
 
         Args:
             job_id: The job to locate in the queue.
@@ -1555,26 +1329,20 @@ class JobStore:
         """
         Fetch the newest job that was not rejected at submit.
 
-        This is what the status area falls back to once no job is active, to
-        report the job that just ended.  ``list_recent(1)`` is the wrong
-        answer there: a submit refused while a job runs -- queue full, worker
-        down or degraded -- still writes a row marked
-        ``ErrorCategory.REJECTED``, and that row is newer than the running job.
-        Reading the newest row would let the rejection replace the job in the
-        status area the moment the job ends.  History keeps using
-        ``list_recent``, so the rejected row is still listed there.
+        The status area falls back to this once no job is active.  Not
+        ``list_recent(1)``: a submit refused while a job runs writes a newer
+        ``ErrorCategory.REJECTED`` row, which would replace the job that just
+        ended.
 
         Excluded ids are filtered in Python, never interpolated into the SQL.
         Reading ``len(exclude_ids) + 1`` rows is enough: at most that many
-        newer rows can be skipped, so the row after them is the answer.
+        newer rows can be skipped.
 
         Args:
-            exclude_ids: Ids to treat as never run.  The web layer passes the
-                refused submits whose REJECTED write is still owed to the
-                worker, so their PENDING rows do not stand in for the job that
-                just ended.  A set rather than any collection: a bare id
-                string is itself a collection of strings, and would silently
-                exclude its single characters instead.
+            exclude_ids: Ids to treat as never run, such as refused submits
+                whose REJECTED write is still owed to the worker.  A set, not
+                any collection, because a bare id string would exclude its
+                single characters.
 
         Returns:
             The newest job whose error category is not REJECTED and whose id is
@@ -1595,14 +1363,9 @@ class JobStore:
         Prove the database can be read and written, in one transaction.
 
         A count of the jobs table, then a same-value ``user_version`` write.
-        The write is what makes this a real probe: a read-only transaction can
-        succeed against a store whose disk is full or whose file has gone
-        read-only, but setting ``user_version`` -- even to the value it already
-        holds -- appends a WAL frame and so exercises the write path.
-        Nothing observable changes on a healthy store.
-
-        The worker's idle loop calls this while it is degraded; a clean return
-        is what clears degraded health, and a raise means "still degraded".
+        The write appends a WAL frame, so a full disk or a file gone read-only
+        fails the probe; nothing observable changes on a healthy store.  A
+        clean return clears the worker's degraded health.
 
         Raises:
             sqlite3.Error: Whatever sqlite raises when the store cannot be read
@@ -1613,10 +1376,8 @@ class JobStore:
         with self._conn:
             self._conn.execute(_COUNT_JOBS).fetchone()
             version: int = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            # A PRAGMA argument cannot be bound -- "PRAGMA user_version = ?" is
-            # a syntax error.  version is an int read back from this database
-            # in this same transaction, never request input, so no
-            # caller-supplied value reaches this string.
+            # A PRAGMA argument cannot be bound; version is an int read back
+            # from this database, never request input.
             self._conn.execute(f"PRAGMA user_version = {version}")
 
     @_locked
@@ -1624,38 +1385,16 @@ class JobStore:
         """
         Fail every job still in flight, for recovery after an unclean restart.
 
-        A job left mid-scan by a killed process has no worker behind it any
-        more, so it would otherwise sit in an active state for ever and the UI
-        would poll it for ever.  Every row whose state is in ``ACTIVE_STATES``
-        moves to ``JobState.ERROR``, worded by the state it was left in:
-        ``restart_error`` and ``restart_category`` choose the text and the
-        category.  The UPLOADING rows are written first, by ``_FAIL_UPLOADING``,
-        and every other active row then gets ``RESTART_REASON``, all in one
-        transaction.
+        A job left mid-scan by a killed process has no worker behind it, so the
+        UI would otherwise poll it for ever.  Every row whose state is in
+        ``ACTIVE_STATES`` moves to ``JobState.ERROR`` in one transaction,
+        worded by ``restart_error`` and ``restart_category`` for the state it
+        was left in.  Because ``ACTIVE_STATES`` and ``TERMINAL_STATES``
+        partition ``JobState``, a completed job's history is never touched.
 
-        The ``_FAIL_ACTIVE`` predicate is derived from ``ACTIVE_STATES`` rather than listed by
-        hand, which buys two things: ``ACTIVE_STATES`` and ``TERMINAL_STATES``
-        partition ``JobState``, so it provably cannot reach a completed job's
-        recorded history; and a state added to that frozenset later is covered
-        here with no edit to this method.
-
-        A job failed here is recorded as ``JobState.ERROR``.  There is no
-        ``JobState.FAILED``, and none is added: the value is persisted as
-        SQLite TEXT and read back through the enum constructor, so adding or
-        renaming a member is a data migration.
-
-        ``error_category`` is written only for the UPLOADING rows.  A row with
-        no category shows its text itself in the status area rather than a
-        category's generic sentence, which is right for a job that had not
-        started its upload: an interrupted restart is a precisely known
-        failure, and ``UNKNOWN`` would be the wrong value.  An UPLOADING row
-        may already be in paperless-ngx, so it needs the amber category and its
-        advice to check the document list before scanning again.
-
-        Its caller is the web lifespan at startup, before the worker thread
-        begins; when that call raises, the worker's recovery makes the same
-        call once the store accepts writes again.  The returned count is what
-        lets the lifespan log how many jobs it failed without a second query.
+        ``error_category`` is written only for the UPLOADING rows: such a job
+        may already be in paperless-ngx and needs the amber category's advice,
+        while any other row shows its own precise text.
 
         Returns:
             How many jobs were moved to ERROR.
@@ -1686,20 +1425,12 @@ class JobStore:
         """
         Fail each named job still in flight, each naming where its pages went.
 
-        Startup's workspace recovery calls this before ``fail_active_jobs``:
-        a job whose workspace a killed process left behind has had its pages
-        kept in ``failed/``, and its row should say where rather than carry
-        the bare restart text.  Only a row whose id is in ``kept`` *and*
-        whose state is in ``ACTIVE_STATES`` moves, to ``JobState.ERROR``, so a
-        finished job's recorded history is never rewritten and an id with no
-        row is ignored.  Each row's state is read inside the one transaction
-        every row is written in, and its text and category are composed from
-        that state by ``restart_error`` and ``restart_category``: the restart
-        text for the state, then the kept sentence.
-
-        ``error_category`` is written only for an UPLOADING row, for the
-        reason ``fail_active_jobs`` gives: a row with no category shows its
-        text, and an UPLOADING row needs the amber category's advice.
+        Startup's workspace recovery calls this before ``fail_active_jobs``, so
+        a job whose pages were kept in ``failed/`` says where.  Only a row whose
+        id is in ``kept`` *and* whose state is in ``ACTIVE_STATES`` moves to
+        ``JobState.ERROR``; an id with no row is ignored.  Each state is read in
+        the same transaction it is written in, and the category follows
+        ``fail_active_jobs``.
 
         Args:
             kept: The sentence naming the kept file, by job id.
@@ -1738,25 +1469,14 @@ class JobStore:
 
         One ``DELETE`` removes every job older than ``max_age_days`` together
         with every run outside the newest ``max_rows`` and every refused submit
-        outside the newest ``REJECTED_HISTORY_ROWS``, and reports how many rows
-        it removed.  Refused submits do not count toward ``max_rows``, so they
-        can never push a real scan out of history.  The predicates are a union
-        rather than a sequence; ``_PRUNE`` carries the argument for why that is
-        the same set the old delete-by-age-then-trim composition produced, and
-        the UTC assumption every half rests on.
-
-        The count comes from the statement itself.  The two ``SELECT COUNT(*)``
-        reads this used to subtract straddled the deletes, so an insert landing
-        between them made the answer wrong -- a scratch test drove it to ``-1``.
-        A single statement leaves no gap for an insert to land in, which is a
-        stronger guarantee than serialising the method behind the store's lock:
-        it holds against writers on other connections too.
+        outside the newest ``REJECTED_HISTORY_ROWS``; ``_PRUNE`` states the UTC
+        assumption it rests on.  The count comes from that one statement, so
+        no insert, even on another connection, can land between a count and
+        the delete.
 
         When rows went, an incremental vacuum in the same transaction returns
-        their pages to the file system, so the file shrinks back.  That only
-        happens on a database with ``auto_vacuum = INCREMENTAL``; on an older
-        one the pragma is a no-op until
-        :meth:`enable_incremental_auto_vacuum` has converted it.
+        their pages to the file system.  On a database not yet converted by
+        :meth:`enable_incremental_auto_vacuum` the pragma is a no-op.
 
         Args:
             max_age_days: Maximum age in days before a job is pruned.
@@ -1783,10 +1503,8 @@ class JobStore:
                 ),
             ).rowcount
             if deleted > 0:
-                # The fetchall() is load-bearing.  incremental_vacuum frees one
-                # page per step of the statement, and execute() alone takes
-                # only the first step, so without it a prune of thousands of
-                # pages would hand back exactly one.
+                # The fetchall() is load-bearing: incremental_vacuum frees one
+                # page per step, and execute() alone takes only the first step.
                 self._conn.execute("PRAGMA incremental_vacuum").fetchall()
 
         if deleted > 0:
@@ -1798,25 +1516,15 @@ class JobStore:
         """
         Convert an older job database to ``auto_vacuum = INCREMENTAL``, once.
 
-        A database this release creates already has it, set before its first
-        table.  One an earlier release created has ``NONE``, so the pages its
-        deletes free stay inside the file for good; switching an existing file
-        over takes a full ``VACUUM``, which rewrites it.  After that, the
-        incremental vacuums :meth:`prune` and the refused-row trim run can
-        shrink it.
+        A database with ``auto_vacuum = NONE`` keeps the pages its deletes
+        free; switching it over takes a full ``VACUUM``, which rewrites it.
 
-        ``VACUUM`` cannot run inside a transaction, and this connection always
-        has one open, so the method commits it and runs both statements with
-        ``autocommit`` on, restoring explicit transaction control afterwards
-        whatever happens.  ``VACUUM`` also needs free disk space of roughly the
-        database's size for its copy -- and a database bloated by a flood may
-        sit on a nearly full disk -- so callers on the server path catch
-        ``sqlite3.Error``, log it and carry on with the database as it is.
-
-        This is not a migration step and bumps no schema version:
-        ``auto_vacuum`` is a header setting that older releases open without
-        complaint, so a version bump would only make them refuse the file.
-        No ``with self._conn:`` here, for the ``VACUUM`` reason above.
+        ``VACUUM`` cannot run inside a transaction, so the method commits and
+        runs both statements with ``autocommit`` on, restoring explicit
+        transaction control afterwards whatever happens.  ``VACUUM`` needs free
+        space roughly the database's size, so server callers catch
+        ``sqlite3.Error`` and carry on.  This bumps no schema version, so
+        older releases still open the file.
 
         Returns:
             True if the database was converted, False if it already was
@@ -1826,9 +1534,8 @@ class JobStore:
         mode: int = self._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
         if mode == _AUTO_VACUUM_INCREMENTAL:
             return False
-        # Announced before it starts: the rewrite runs before the server
-        # binds, and on an SD card it can outlast a container health check's
-        # start period, so the log must say what the pause is.
+        # Announced before it starts: on an SD card the rewrite can outlast a
+        # container health check's start period.
         pages: int = self._conn.execute("PRAGMA page_count").fetchone()[0]
         page_size: int = self._conn.execute("PRAGMA page_size").fetchone()[0]
         logger.info(
@@ -1849,7 +1556,6 @@ class JobStore:
     @_locked
     def close(self) -> None:
         """Close the database connection."""
-        # No `with self._conn:` here, deliberately.  Connection.__exit__ runs
-        # after the body and must commit or roll back a connection the body has
-        # already closed, which raises "Cannot operate on a closed database".
+        # No `with self._conn:`: Connection.__exit__ would then raise on the
+        # connection the body has already closed.
         self._conn.close()
