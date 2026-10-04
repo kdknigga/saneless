@@ -27,6 +27,7 @@ import saneless.scanner as scanner_pkg
 import saneless.scanner.base as scanner_base
 import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.web.app as app_module
+import saneless.web.server as server_module
 from saneless import checks
 from saneless.exceptions import (
     ConfigError,
@@ -1089,8 +1090,8 @@ class TestSaneShutdown:
 
     @pytest.mark.parametrize(
         "module",
-        [sane_backend_mod, cli_module, app_module],
-        ids=["sane_backend", "cli", "web.app"],
+        [saneless, sane_backend_mod, cli_module, app_module, server_module],
+        ids=["saneless", "sane_backend", "cli", "web.app", "web.server"],
     )
     def test_no_entry_point_installs_an_interpreter_exit_hook(
         self, module: ModuleType
