@@ -57,7 +57,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import errors
 from saneless.web.app import create_app
-from saneless.web.routes import OWNER_COOKIE
+from saneless.web.owner import OWNER_COOKIE
 from saneless.worker import ScanOptions, ScanWorker
 from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
 from tests.template_support import markup_start_tags, template_start_tags

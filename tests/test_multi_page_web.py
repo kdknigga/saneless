@@ -59,7 +59,7 @@ from saneless.vocabulary import (
     rejection_status_code,
 )
 from saneless.web.app import create_app
-from saneless.web.routes import OWNER_COOKIE
+from saneless.web.owner import OWNER_COOKIE
 from saneless.worker import ScanOptions, WorkerPassCoordinator
 from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
 

@@ -923,10 +923,10 @@ def test_the_refreshers_scan_fact_is_the_workers_own_job_id(
     """
     The strip's words and its colour read the same fact.
 
-    ``_checks_context`` renders ``scan_active`` from ``worker.current_job_id``,
-    and the refresher's scanner skip comes from there too.  Deriving it from a
-    failed lock acquisition would let "not checked while a scan is running"
-    appear on an idle appliance.
+    ``strip_view.checks_context`` renders ``scan_active`` from
+    ``worker.current_job_id``, and the refresher's scanner skip comes from
+    there too.  Deriving it from a failed lock acquisition would let "not
+    checked while a scan is running" appear on an idle appliance.
 
     Args:
         settings: The test's own configuration.

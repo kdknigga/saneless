@@ -112,7 +112,7 @@ def test_an_outage_keeps_the_last_good_tag_list(
     assert len(records) == 1
     assert _CAUSE in records[0].getMessage()
     assert "Token" not in records[0].getMessage()
-    assert _warnings(caplog, "saneless.web.routes") == []
+    assert _warnings(caplog, "saneless.web.metadata_view") == []
 
 
 def test_tags_never_fetched_say_so_and_log_the_cause(
@@ -128,7 +128,7 @@ def test_tags_never_fetched_say_so_and_log_the_cause(
     assert "receipt" not in response.text
     assert html.escape(TAGS_UNAVAILABLE) in response.text
     assert "No tags in paperless-ngx yet." not in response.text
-    records = _warnings(caplog, "saneless.web.routes")
+    records = _warnings(caplog, "saneless.web.metadata_view")
     assert len(records) == 1
     message = records[0].getMessage()
     assert "answering unavailable" in message

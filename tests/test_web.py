@@ -84,11 +84,14 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web import cache as cache_module
+from saneless.web import metadata_view, strip_view
+from saneless.web import owner as owner_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
+from saneless.web.owner import OWNER_COOKIE
 from saneless.web.refresher import CheckRefresher
-from saneless.web.routes import OWNER_COOKIE, _profile_options, _ProfileOption
+from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
@@ -99,6 +102,7 @@ from tests.conftest import (
     services_of,
     stand_in,
 )
+from tests.handler_source_support import handler_family_tree
 from tests.template_support import template_start_tags
 
 
@@ -201,7 +205,7 @@ def _as_owner(client: TestClient) -> str:
         The token, for ``create_job(owner_token=...)``.
 
     """
-    client.cookies.set(routes_module.OWNER_COOKIE, _VIEWER_TOKEN)
+    client.cookies.set(OWNER_COOKIE, _VIEWER_TOKEN)
     return _VIEWER_TOKEN
 
 
@@ -652,7 +656,7 @@ def test_metadata_fetch_failure_says_the_list_is_unavailable(
         raise ConnectionError(msg)
 
     stand_in(services_of(app).paperless, "get_tags", failing_get_tags)
-    with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
+    with caplog.at_level(logging.WARNING, logger="saneless.web.metadata_view"):
         response = client.get("/api/tags")
 
     assert response.status_code == 200
@@ -664,6 +668,7 @@ def test_metadata_fetch_failure_says_the_list_is_unavailable(
         if r.levelno == logging.WARNING and "answering unavailable" in r.getMessage()
     ]
     assert len(records) == 1
+    assert records[0].name == "saneless.web.metadata_view"
     assert records[0].getMessage().endswith("answering unavailable: ConnectionError")
     assert "paperless unreachable" not in caplog.text
     assert records[0].exc_info is None
@@ -1866,7 +1871,7 @@ class TestOwnerCookie:
             requested.append(nbytes)
             return _SPIED_OWNER_TOKEN
 
-        monkeypatch.setattr(routes_module.secrets, "token_urlsafe", spy_token_urlsafe)
+        monkeypatch.setattr(owner_module.secrets, "token_urlsafe", spy_token_urlsafe)
         accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "Entropy"}
         )
@@ -2147,7 +2152,7 @@ class TestPostSubmitRender:
         monkeypatch.setattr(
             services_of(accepting_client.app).worker, "submit", _record_submit
         )
-        monkeypatch.setattr(routes_module, "_checks_context", _fail_render)
+        monkeypatch.setattr(strip_view, "checks_context", _fail_render)
         before = _job_count(accepting_client)
 
         response = browser.post(
@@ -3990,8 +3995,8 @@ def _render_correspondent_options(client: TestClient, selected: int | None) -> s
 
     """
     app = _app(client)
-    context = routes_module._correspondent_options_context(
-        services_of(app), selected, timeout=routes_module._REQUEST_FETCH_TIMEOUT
+    context = metadata_view.correspondent_options_context(
+        services_of(app), selected, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
     )
     template = services_of(app).templates.get_template("partials/correspondents.html")
     return template.render(context)
@@ -5886,7 +5891,7 @@ _CREDENTIALLED_URL = "https://user:pass@paperless.example/api/tags/"
 
 class TestRouteLogsNameExceptionsOnly:
     """
-    No handler in ``web/routes.py`` hands an exception object to a logger.
+    No handler, nor any module the handlers call, hands an exception to a logger.
 
     Third-party exception text can quote a URL, a header or a token, so an
     exception interpolated with ``%s`` can put a credential in the log file.
@@ -5918,7 +5923,7 @@ class TestRouteLogsNameExceptionsOnly:
             assert "paperless.example" not in message
         assert "ConnectError" in caplog.records[-1].getMessage()
 
-    def test_no_logger_call_in_routes_takes_a_bare_exception(self) -> None:
+    def test_no_logger_call_in_the_handlers_takes_a_bare_exception(self) -> None:
         """
         Read the source: no ``logger`` call is handed the exception itself.
 
@@ -5926,15 +5931,18 @@ class TestRouteLogsNameExceptionsOnly:
         caught too -- the shape this forbids is easiest to reintroduce when
         the arguments have been wrapped.
         """
-        source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        offenders = [
-            node.lineno
-            for node in ast.walk(ast.parse(source))
+        logger_calls = [
+            node
+            for node in ast.walk(handler_family_tree())
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "logger"
-            and any(
+        ]
+        offenders = [
+            node.lineno
+            for node in logger_calls
+            if any(
                 isinstance(argument, ast.Name) and argument.id == "exc"
                 for argument in [
                     *node.args,
@@ -5943,6 +5951,14 @@ class TestRouteLogsNameExceptionsOnly:
             )
         ]
 
+        # The client-exception warnings in the metadata lists are among the
+        # calls read, so the walk reaches the modules the handlers call.
+        assert any(
+            isinstance(argument, ast.Constant)
+            and "answering unavailable" in str(argument.value)
+            for node in logger_calls
+            for argument in node.args
+        )
         assert offenders == []
 
 

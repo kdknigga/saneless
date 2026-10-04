@@ -42,7 +42,7 @@ from saneless.vocabulary import (
 )
 from saneless.web.app import create_app
 from saneless.web.job_view import JobView
-from saneless.web.routes import OWNER_COOKIE
+from saneless.web.owner import OWNER_COOKIE
 from tests.conftest import StubScannerBackend, leaf_routes, services_of, stand_in
 
 if TYPE_CHECKING:

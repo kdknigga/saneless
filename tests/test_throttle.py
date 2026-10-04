@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from saneless.web import checks_cache as checks_cache_module
 from saneless.web.app import create_app
 from saneless.web.errors import RETRY_AFTER_SECONDS
-from saneless.web.routes import MetadataResource
+from saneless.web.metadata_view import MetadataResource
 from saneless.web.services import PaperlessTestAnswer
 from saneless.web.throttle import (
     MIN_MANUAL_REFRESH_SECONDS,

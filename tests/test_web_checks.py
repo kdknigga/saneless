@@ -74,10 +74,12 @@ from saneless.vocabulary import (
 from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
+from saneless.web import strip_view
 from saneless.web.app import create_app
 from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
 from saneless.web.refresher import CheckRefresher
 from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
+from tests.handler_source_support import HANDLER_FAMILY, handler_family_tree
 from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
@@ -620,7 +622,7 @@ def _raise_inside_the_checks_route(
     Args:
         client: The client whose application is patched.
         monkeypatch: The patcher, so the injected failure is undone after.
-        target: ``_checks_context`` for the context build, ``note_watcher``
+        target: ``checks_context`` for the context build, ``note_watcher``
             for the watcher stamp that precedes it inside the same guard.
 
     """
@@ -629,8 +631,8 @@ def _raise_inside_the_checks_route(
         """Fail the way an unexpected bug in this route would."""
         raise RuntimeError(_CHECKS_BOOM_MARKER)
 
-    if target == "_checks_context":
-        monkeypatch.setattr(routes_module, "_checks_context", boom)
+    if target == "checks_context":
+        monkeypatch.setattr(strip_view, "checks_context", boom)
     else:
         monkeypatch.setattr(services_of(client.app).refresher, target, boom)
 
@@ -1143,14 +1145,14 @@ class TestBoundedPoll:
         """
         cap = checks_module.POLL_PROBE_ATTEMPT_CAP
         seen: list[int] = []
-        real = routes_module._checks_context
+        real = strip_view.checks_context
 
         def recording(svc: Services, *, attempt: int = 0) -> dict[str, object]:
             """Record the attempt the handler passed on, then build normally."""
             seen.append(attempt)
             return real(svc, attempt=attempt)
 
-        monkeypatch.setattr(routes_module, "_checks_context", recording)
+        monkeypatch.setattr(strip_view, "checks_context", recording)
         for crafted in ("999999", "-5", str(cap + 1)):
             body = client.get(f"/api/checks?attempt={crafted}").text
             assert crafted not in unescape(_body_attrs(body)), (crafted, body)
@@ -1237,7 +1239,7 @@ class TestTheStripSurvivesItsOwnFailure:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The button's render falls back to the body its sibling does."""
-        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+        _raise_inside_the_checks_route(client, monkeypatch, "checks_context")
 
         response = client.post("/api/checks/refresh")
         assert response.status_code == 200
@@ -1260,7 +1262,7 @@ class TestTheStripSurvivesItsOwnFailure:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The refresh guard swallows nothing either: the log keeps the detail."""
-        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+        _raise_inside_the_checks_route(client, monkeypatch, "checks_context")
 
         with caplog.at_level(logging.ERROR, logger=routes_module.__name__):
             assert client.post("/api/checks/refresh").status_code == 200
@@ -1340,7 +1342,7 @@ class TestTheStripSurvivesItsOwnFailure:
         assert _CHECK_ROW.findall(response.text) == []
         assert _CHECKS_BOOM_MARKER not in response.text
 
-    @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
+    @pytest.mark.parametrize("target", ["checks_context", "note_watcher"])
     def test_a_failure_inside_the_render_is_a_cold_strip_at_200(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
     ) -> None:
@@ -1359,7 +1361,7 @@ class TestTheStripSurvivesItsOwnFailure:
         assert "Check again" in response.text
         assert "hx-trigger" not in _body_attrs(response.text)
 
-    @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
+    @pytest.mark.parametrize("target", ["checks_context", "note_watcher"])
     def test_no_part_of_the_exception_reaches_the_page(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
     ) -> None:
@@ -1377,7 +1379,7 @@ class TestTheStripSurvivesItsOwnFailure:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Nothing is swallowed: the page loses the detail, the log keeps it."""
-        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+        _raise_inside_the_checks_route(client, monkeypatch, "checks_context")
 
         with caplog.at_level(logging.ERROR, logger=routes_module.__name__):
             assert client.get("/api/checks").status_code == 200
@@ -1985,7 +1987,7 @@ class TestCollapsedRefreshStillDelivers:
             services_of(app), checks=_AProbeLandsDuringTheRead(real, lock, landed)
         )
         try:
-            context = routes_module._checks_context(services_of(app), attempt=1)
+            context = strip_view.checks_context(services_of(app), attempt=1)
         finally:
             if lock.locked():
                 lock.release()
@@ -2232,38 +2234,61 @@ class TestRouteShape:
         )
         assert response.status_code == 403
 
-    def test_routes_py_probes_in_exactly_one_place(self) -> None:
+    def test_the_handlers_probe_in_exactly_one_place(self) -> None:
         """
         The refresh handler reaches the one probe path, and nothing else does.
 
-        A second call in this module would be a second way for a render to
-        probe.  Calls are counted in the parsed module, so a comment or
-        docstring may name the method freely.
+        A second call in the handlers or the modules they call would be a
+        second way for a render to probe.  Calls are counted in the parsed
+        modules, so a comment or docstring may name the method freely.
         """
         calls = [
             node.lineno
-            for node in ast.walk(_routes_tree())
+            for node in ast.walk(handler_family_tree())
             if isinstance(node, ast.Call) and _called_name(node) == "request_probe"
         ]
         assert len(calls) == 1, calls
 
-    def test_routes_py_runs_no_registry_of_its_own(self) -> None:
+    def test_the_handlers_run_no_registry_of_their_own(self) -> None:
         """
         The handler owns no probe implementation, so none can drift from the other.
 
         Two copies of the acquire/run/store block would be two probe paths to
         keep in step; code that names ``run_checks`` is what this counts.
         """
-        assert _references(_routes_tree(), "run_checks") == []
+        assert _references(handler_family_tree(), "run_checks") == []
 
-    def test_routes_py_touches_no_scanner_gate(self) -> None:
+    def test_the_handlers_touch_no_scanner_gate(self) -> None:
         """
         A request handler has no business holding the lock a live scan wants.
 
         The gate lives in exactly one probe path, and that path is the
         refresher's.
         """
-        assert _references(_routes_tree(), "scanner_gate") == []
+        assert _references(handler_family_tree(), "scanner_gate") == []
+
+    def test_the_family_tree_holds_every_family_module(self) -> None:
+        """
+        The tree the checks above walk defines a function from every module.
+
+        A module dropped from the family would leave its calls unseen and the
+        checks passing on less than they claim, so one function each module
+        defines is looked for by name.
+        """
+        defined = {
+            node.name
+            for node in handler_family_tree().body
+            if isinstance(node, ast.FunctionDef)
+        }
+        expected = {
+            "saneless.web.routes": "start_scan",
+            "saneless.web.owner": "is_owner",
+            "saneless.web.strip_view": "checks_context",
+            "saneless.web.metadata_view": "tag_list_context",
+        }
+        assert {module.__name__ for module in HANDLER_FAMILY} == set(expected)
+        missing = set(expected.values()) - defined
+        assert not missing, missing
 
 
 # The stylesheet and the templates, located the way the app locates them so a
@@ -2290,17 +2315,6 @@ def _css() -> str:
 
     """
     return _APP_CSS.read_text(encoding="utf-8")
-
-
-def _routes_tree() -> ast.Module:
-    """
-    Parse the routes module.
-
-    Returns:
-        The module's syntax tree, so comments and docstrings never count.
-
-    """
-    return ast.parse(Path(routes_module.__file__).read_text(encoding="utf-8"))
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -2905,7 +2919,9 @@ class TestTerminalReloadPartial:
         scan's history row and the strip's paused note on screen until the
         next page load, so the two are counted against each other.
         """
-        renders = _template_renders(_routes_tree(), "partials/status_response.html")
+        renders = _template_renders(
+            handler_family_tree(), "partials/status_response.html"
+        )
         assert renders
         unflagged = [
             lineno
@@ -3086,7 +3102,7 @@ class TestWhichResponsesCarryWhat:
         It is a context-dict key rather than a keyword argument because
         ``TemplateResponse`` takes its context as a mapping.
         """
-        tree = _routes_tree()
+        tree = handler_family_tree()
         assert _context_values(tree, "refresh_checks").count(True) == 1
         # Defaulted off once in ``_status_context``, and forced off once more
         # in the canonical poll rendering ``_status_token`` hashes.  That

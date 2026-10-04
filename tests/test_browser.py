@@ -130,7 +130,7 @@ from saneless.vocabulary import (
     scan_hold_reason,
 )
 from saneless.web import cache as cache_module
-from saneless.web import routes as routes_module
+from saneless.web import metadata_view
 from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
 from tests.conftest import (
@@ -4189,7 +4189,7 @@ def _fail_a_list(
 
     """
     monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
-    monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
+    monkeypatch.setattr(metadata_view, "METADATA_RETRY_FLOOR_SECONDS", 1)
     answering = threading.Event()
     if resource == "tags":
         fetch = _flagged_list(answering, _DEFAULTS_TAGS)
@@ -4312,9 +4312,7 @@ class TestLazyListsInTheBrowser:
         within the test: a failed list releases Scan exactly as an arrived
         one does.
         """
-        monkeypatch.setattr(
-            routes_module, "_REQUEST_FETCH_TIMEOUT", _SHORT_FETCH_BUDGET
-        )
+        monkeypatch.setattr(metadata_view, "REQUEST_FETCH_TIMEOUT", _SHORT_FETCH_BUDGET)
         with _serve_black_holed(
             black_holed_paperless, tmp_path, egress_allowlist
         ) as server:
@@ -4371,7 +4369,7 @@ class TestLazyListsInTheBrowser:
         correspondent they chose stays chosen.
         """
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
-        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
+        monkeypatch.setattr(metadata_view, "METADATA_RETRY_FLOOR_SECONDS", 1)
         answering = threading.Event()
         paperless = services_of(defaults_server.app).paperless
         monkeypatch.setattr(
@@ -4505,10 +4503,10 @@ class TestLazyListsInTheBrowser:
         memory, and every other ask would be answered without asking.
         """
         monkeypatch.setattr(
-            routes_module, "_REQUEST_FETCH_TIMEOUT", _BLACK_HOLE_FETCH_BUDGET
+            metadata_view, "REQUEST_FETCH_TIMEOUT", _BLACK_HOLE_FETCH_BUDGET
         )
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.5)
-        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 2)
+        monkeypatch.setattr(metadata_view, "METADATA_RETRY_FLOOR_SECONDS", 2)
         page.add_init_script(_COUNT_REQUESTS)
         with _serve_black_holed(
             black_holed_paperless, tmp_path, egress_allowlist
