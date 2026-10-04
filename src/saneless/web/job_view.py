@@ -1,24 +1,17 @@
 """
 What one browser may see of one job: the only job shape templates receive.
 
-Any device on the LAN can load the web page, and a job carries more than it
-should show to all of them: the document's title, a picture of its first
-page, and error and warning text that names host paths, the kept PDF (whose
-file name carries the title) and the paperless-ngx address.  Templates are
-therefore handed a :class:`JobView`, never a :class:`~saneless.job.Job`, and
-:func:`build_job_view` decides once, on the server, what goes into it.
+Any device on the LAN can load the web page, and a job's title, first-page
+picture and error and warning text, which can name host paths, the kept PDF and
+the paperless-ngx address, are not for all of them.  Templates are handed a
+:class:`JobView`, never a :class:`~saneless.job.Job`, and :func:`build_job_view`
+decides once, on the server, what goes into it.
 
-The browser that submitted the job -- the one presenting the owner token the
-job recorded -- sees its title and thumbnail, and its error and warning text
-with every host path and web address replaced by the name of the setting that
-holds it, or by ``<path>`` when no setting does.  Every other browser sees that a scan happened and how it ended:
-profile, state, time, error category and page counts, a generic title, no
-thumbnail, and fixed sentences from ``vocabulary.py`` in place of the stored
-text.  The gated fields are absent from such a view, not hidden with CSS, so
-no template can render what the view does not carry.
-
-Nothing is lost: the full text, paths and address included, stays in the log
-and in ``saneless jobs``.
+The owner sees the title, the thumbnail and the text with every host path and
+web address replaced by the setting that holds it, or by ``<path>``.  Every
+other browser sees that a scan happened and how it ended, with a generic title,
+no thumbnail and fixed sentences; the gated fields are absent from the view, not
+hidden with CSS.  The full text stays in the log and in ``saneless jobs``.
 """
 
 from __future__ import annotations
@@ -47,19 +40,15 @@ if TYPE_CHECKING:
 
 __all__ = ["JobView", "build_job_view", "owns_detail", "scrub_for_owner"]
 
-# Any web address.  Stored text names paperless-ngx by its configured URL, and
-# a URL from an earlier configuration, or from a library's own message, would
-# slip past a match on the current one; the owner never needs the address, so
-# every one is replaced.  The scheme is matched in any case: it is
-# case-insensitive, and ``paperless.url`` is kept as it was typed, so
-# ``HTTPS://`` is a working setting that reaches the stored text as written.
+# Any web address: one from an earlier configuration or a library's message
+# would slip past a match on the current URL, and the owner never needs it.  The
+# scheme is case-insensitive, and ``paperless.url`` is kept as typed, so
+# ``HTTPS://`` reaches the stored text as written.
 _URL = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Punctuation that ends the sentence around a URL or a path rather than the
-# URL or path itself, and the quotes and brackets that close around one.
-# ``\S+`` swallows them, and they are put back after the replacement so
-# "Paperless at <url>: refused" keeps its colon and "see '<url>' now" its
-# closing quote.
+# Punctuation, quotes and brackets that end the sentence around a URL or a path
+# rather than belonging to it.  ``\S+`` swallows them, so they are put back
+# after the replacement.
 _URL_TRAILING = ").,:;'\"]>"
 
 # A host path counts only where it starts and ends as a whole path, so the
@@ -69,20 +58,15 @@ _URL_TRAILING = ").,:;'\"]>"
 _PATH_BEFORE = r"(?<![\w.-])"
 _PATH_AFTER = r"(?![\w-]|\.\w)"
 
-# Any absolute path still in the text once the configured directories and web
-# addresses are named: a device node, a path under an earlier configuration,
-# one a library put in its own message.  It starts at a "/" that does not
-# directly follow a name character, dot, "<", ">" or "-", so "failed/x.pdf",
-# "<output.tmp_dir>/x", "3/4" and "and/or" are left alone; the punctuation
-# after it is kept, as for a web address.
+# Any absolute path left once the configured directories and web addresses are
+# named: a device node, a path under an earlier configuration, one a library
+# named.  It starts at a "/" not directly after a name character, dot, "<", ">"
+# or "-", so "failed/x.pdf", "<output.tmp_dir>/x" and "and/or" are left alone.
 _OTHER_PATH = re.compile(r"(?<![\w.<>-])/[^\s'\"<>]+")
 
-# What the pipeline writes directly before the path of something it kept in
-# the failed folder.  Every sentence ``preservation.KeptGroup`` composes puts
-# it before its first path: "The scan was preserved at <path>", "The 3 scanned
-# page(s) were preserved at <path>", "2 of the 5 spooled page file(s) were
-# preserved at <path>, <path>".  A preservation that kept nothing says "could
-# NOT be preserved to" instead, so the phrase never appears in its message.
+# What the pipeline writes directly before the path of something it kept in the
+# failed folder; every sentence ``preservation.KeptGroup`` composes puts it
+# before its first path.  A preservation that kept nothing never writes it.
 _KEPT_BEFORE = ("preserved at ",)
 
 
@@ -145,18 +129,13 @@ def owns_detail(presented: str | None, recorded: str | None) -> bool:
     """
     Report whether a presented token may see a job's title, preview and text.
 
-    This is deliberately not the flip prompt's ownership rule
-    (``owner.is_owner``).  There a NULL recorded token means anyone may answer, so
-    a manual-duplex job in flight across an upgrade stays answerable.  Here a
-    NULL recorded token means nobody may see the detail: such a row was
-    written before owner tokens existed, or records a refused submit, and no
-    browser can prove it made it.  A browser presenting no token owns nothing.
+    Deliberately not ``owner.is_owner``: there a job with no recorded token may
+    be answered by anyone, while here nobody may see its detail, because no
+    browser can prove it made the job.  A browser presenting no token owns
+    nothing.
 
-    The comparison goes through ``secrets.compare_digest`` so no timing
-    difference can be read off it.  Both sides are encoded first: the
-    presented value arrives as text out of a header and ``compare_digest``
-    refuses a non-ASCII ``str``, while it compares bytes of any two lengths
-    safely.
+    Both sides are encoded before ``secrets.compare_digest``, which refuses a
+    non-ASCII ``str`` but compares bytes of any two lengths in constant time.
 
     Args:
         presented: The token this request carries, or None.
@@ -220,20 +199,10 @@ def _spellings(path: Path) -> set[str]:
     """
     Return the ways stored text may spell a configured directory.
 
-    Text written by the pipeline may carry the path as configured or as the
-    file system resolved it, which differ when the configured path runs
-    through a symlink.  Only absolute spellings are returned: a directory
-    configured as ``data`` or ``tmp`` would otherwise match those words in
-    an ordinary sentence, and a relative path names no place on the host
-    anyway.  Text that spells a relative directory as configured is left
-    as it is.  The file system root is never returned: replacing ``/`` would
-    rewrite every separator in the text.
-
-    Args:
-        path: The configured directory.
-
-    Returns:
-        The absolute spelling and the resolved one, without the root.
+    The configured and the resolved spelling differ when the path runs through
+    a symlink.  Only absolute spellings are returned, so a directory configured
+    as ``data`` does not match the word in a sentence, and never the root,
+    which would rewrite every separator.
 
     """
     absolute = path.absolute()
@@ -248,24 +217,12 @@ def _relativise(text: str, settings: Settings) -> str:
     """
     Replace every host path and web address in the owner's text.
 
-    In one pass, with the longest spelling tried first so a directory nested
-    inside another is named by the inner one:
-
-    * ``data_dir`` followed by a separator is removed, so a kept file reads
-      ``failed/<file>.pdf``, and ``data_dir`` on its own becomes
-      ``<output.data_dir>``;
-    * ``tmp_dir`` becomes ``<output.tmp_dir>``;
-    * ``consume_dir``, when one is set, becomes ``<paperless.consume_dir>``.
-
-    Each is matched in its absolute and its resolved spelling.  Then every
-    ``http://`` or ``https://`` address becomes ``<paperless.url>``, and last
-    every other absolute path becomes ``<path>``, each with the punctuation
-    after it kept.  That covers a path from a row written under an older
-    configuration, a device node and a path a library named.
-
-    Args:
-        text: The stored error or warning text.
-        settings: The running configuration.
+    In one pass, longest spelling first so a nested directory is named by the
+    inner one: ``data_dir`` plus a separator is removed, so a kept file reads
+    ``failed/<file>.pdf``, and otherwise ``data_dir``, ``tmp_dir`` and
+    ``consume_dir`` become their setting names.  Then every web address becomes
+    ``<paperless.url>`` and every other absolute path ``<path>``, each keeping
+    the punctuation after it.
 
     Returns:
         The text with no configured host path and no web address in it.
@@ -296,12 +253,10 @@ def scrub_for_owner(text: str, settings: Settings) -> str:
     """
     Replace every host path and web address in text shown to a job's owner.
 
-    This is the one host-path rule for owner-visible text that does not come
-    out of a job view: the failed-pass prompt shows the scanner's error while
-    the job is still waiting, before any row stores it.  It applies exactly the
-    rule a job view applies to its error and warning text, so the two cannot
-    drift.  Whether the viewer is the owner at all is the caller's decision;
-    anyone else must not be shown the text in any form.
+    For owner-visible text that does not come from a job view, such as the
+    failed-pass prompt's scanner error, with exactly the rule a job view
+    applies.  Whether the viewer is the owner is the caller's decision; anyone
+    else must not see the text in any form.
 
     Args:
         text: The text to show, as the scanner or the pipeline wrote it.
@@ -335,22 +290,10 @@ def _hidden_error(text: str, settings: Settings) -> str:
     """
     Choose the fixed sentence a non-owner sees in place of an error.
 
-    An error that says part of the scan was kept is worth knowing on any
-    device; the kept file's name is not, because it carries the document's
-    title.  Every other error gets the pointer to the full text.
-
-    Only the pipeline's own statement that something was kept counts: a path
-    inside the failed folder straight after one of ``_KEPT_BEFORE``'s
-    phrases.  Merely naming that folder is not enough, because the message
-    for a preservation that kept nothing names it too, as the destination it
-    could not reach and often again in the file system's own error.
-
-    Args:
-        text: The stored error text.
-        settings: The running configuration, for the failed folder's path.
-
-    Returns:
-        ``HIDDEN_PRESERVED_ERROR`` or ``HIDDEN_ERROR_DETAIL``.
+    An error saying part of the scan was kept is worth knowing on any device;
+    the kept file's name, which carries the title, is not.  Only one of
+    ``_KEPT_BEFORE``'s phrases followed by a failed-folder path counts, because
+    a preservation that kept nothing names that folder too.
 
     """
     folders = "|".join(
