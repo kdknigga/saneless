@@ -1279,9 +1279,9 @@ class TestTheStripSurvivesItsOwnFailure:
         previous results stay in the cache and on the page, settled, and
         nothing about the exception reaches the body.
         """
-        state = _app(client).state
-        state.checks.store(_synthetic_results())
-        before = state.checks.current()
+        svc = services_of(client.app)
+        svc.checks.store(_synthetic_results())
+        before = svc.checks.current()
         threads: list[str] = []
 
         def boom(_context: CheckContext, **_kwargs: object) -> NoReturn:
@@ -1293,7 +1293,7 @@ class TestTheStripSurvivesItsOwnFailure:
 
         assert response.status_code == 200
         assert threads == [_refresher(client).thread_name]
-        after = state.checks.current()
+        after = svc.checks.current()
         assert after.results == before.results
         assert after.checked_at == before.checked_at
         for key in CheckKey:

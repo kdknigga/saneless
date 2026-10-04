@@ -746,20 +746,6 @@ def _assemble_app(
         lifecycle=lifecycle,
     )
     app.state.services = services
-    # The same objects under their own names, only for tests that do not read
-    # ``services`` yet; no code in the app reads these.
-    app.state.worker = services.worker
-    app.state.job_store = services.job_store
-    app.state.settings = services.settings
-    app.state.paperless = services.paperless
-    app.state.cache = services.cache
-    app.state.checks = services.checks
-    app.state.refresher = services.refresher
-    app.state.templates = services.templates
-    app.state.invalidate_floors = services.invalidate_floors
-    app.state.paperless_test_result = services.paperless_test_result
-    app.state.status_token_key = services.status_token_key
-    app.state.scan_blocked = services.scan_blocked
 
     app.mount(STATIC_PATH, StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
