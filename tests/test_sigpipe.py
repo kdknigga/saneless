@@ -377,6 +377,21 @@ def _plain_config(tmp_path: Path) -> Path:
     return config
 
 
+def _slow_good_read_config(tmp_path: Path) -> Path:
+    """
+    Write a SANE configuration whose reads take a second and then succeed.
+
+    Returns:
+        The configuration directory, for ``SANE_CONFIG_DIR``.
+
+    """
+    config = _plain_config(tmp_path)
+    (config / "test.conf").write_text(
+        "read-delay true\nread-delay-duration 1000000\n", encoding="ascii"
+    )
+    return config
+
+
 def _close_during_the_read(proc: subprocess.Popen[bytes], reply_fd: int) -> None:
     """Close saneless's end of the reply pipe once the first read is under way."""
     assert proc.stdout is not None
@@ -403,9 +418,10 @@ def _close_after_the_first_page(proc: subprocess.Popen[bytes], reply_fd: int) ->
     ("source", "configure", "close"),
     [
         ("Flatbed", _slow_failing_read_config, _close_during_the_read),
+        ("Automatic Document Feeder", _slow_good_read_config, _close_during_the_read),
         ("Automatic Document Feeder", _plain_config, _close_after_the_first_page),
     ],
-    ids=["failed-read", "after-a-page"],
+    ids=["failed-read", "good-read", "after-a-page"],
 )
 def test_a_scan_child_survives_its_reply_pipe_closing_mid_pass(
     source: str,
@@ -418,9 +434,12 @@ def test_a_scan_child_survives_its_reply_pipe_closing_mid_pass(
     A reply pipe closed during a pass ends the child cleanly, not by SIGPIPE.
 
     libsane puts SIGPIPE back to its default action inside a pass, after a
-    read that fails and after one that succeeds, and the pass writes again
-    before it ends: the next sheet's stages, and the cancel and close of its
-    cleanup.  Each such write to a saneless that has gone must fail, so the
+    read that succeeds and in the cancel after one that fails, and the pass
+    writes again before it ends.  Closed during a read that fails, the first
+    write to meet the closed pipe is the cleanup's close report; closed
+    during a read that succeeds, it is the page's header, right after the
+    reset; closed after page 1 is answered, it is the next sheet's start
+    report.  Each such write to a saneless that has gone must fail, so the
     child cancels and closes the device and ends with the status for a closed
     reply channel.  Its stdin stays open, so the end of commands cannot be
     what ends it.
