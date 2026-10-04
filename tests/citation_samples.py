@@ -16,25 +16,30 @@ import re
 
 # The identifier shapes the planning records use: decision, finding, research
 # and requirement IDs, threat IDs, the code review's report and nit IDs, phase
-# and plan numbers, numbered research pitfalls and the planning file names. An
-# ID is matched only when the pattern names its prefix, so a requirement or
-# audit family the records start using is added here, with a sample, or it gets
-# through. Those families need two digits or more, because some of their
-# prefixes open ordinary text with one, such as a PDF version or TEST-NET-1. The
-# architecture, enumeration and multi-page requirement IDs are covered with one
-# digit too, because their prefixes appear in no other identifier shape. It also
-# rejects a Python, HTML, CSS or JavaScript file named with a line number after
-# a colon, the name of the assistant instructions file, and a phase referred
-# to without its number: line numbers drift, and the other two cannot be
-# looked up by a reader of the shipped tree either. It also rejects some
-# domain prose ("phase 2", "the next phase"); reword it ("the second pass",
-# "the following step"). It is a net for the common shapes, not a proof;
-# review catches what it misses. The
+# and plan numbers, numbered research pitfalls, the context, research and UI
+# spec record names, and the plan, summary, verification and review file names
+# with their .md suffix. Other planning file names, such as the roadmap's, are
+# not matched. An ID is matched only when the pattern names its prefix, so a
+# requirement or audit family the records start using is added here, with a
+# sample, or it gets through; an ID may end in one lowercase letter. The
+# single-letter families need two digits or more, so a one-digit ID such as a
+# research file's first contradiction gets through. That trade is deliberate:
+# N-1 is ordinary arithmetic. The requirement and audit families need two
+# digits too, because some of their prefixes open ordinary text with one, such
+# as a PDF version or TEST-NET-1. The architecture, enumeration and multi-page
+# requirement IDs are covered with one digit, because their prefixes appear in
+# no other identifier shape. It also rejects a Python, HTML, CSS or JavaScript
+# file named with a line number after a colon, the name of the assistant
+# instructions file, and a phase referred to without its number: line numbers
+# drift, and the other two cannot be looked up by a reader of the shipped tree
+# either. It also rejects some domain prose ("phase 2", "the next phase");
+# reword it ("the second pass", "the following step"). It is a net for the
+# common shapes, not a proof; review catches what it misses. The
 # no-planning-citations hook in .pre-commit-config.yaml carries the same
 # pattern, and a test in tests/test_deployment_config.py keeps the two
 # identical.
 PLANNING_CITATION = re.compile(
-    r"\b(R[0-9]+-)?(C|D|M|N|R|S|U|W|CR|IN|WR)-[0-9]{2,}[a-z]?\b|\b(A|"
+    r"\b(R[0-9]+-)?(C|D|F|M|N|R|S|U|W|CR|IN|WR)-[0-9]{2,}[a-z]?\b|\b(A|"
     r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
     r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+[a-z]?\b|\b(ARC|CLI|DOC|JOB|OPS|PIP|PPL|SCN|"
     r"SEC|UI|WEB)-[0-9]{2,}[a-z]?\b|\b(AP|AR|AUDIT|CF|CI|CONF|CORE|DEP|DPI|FW|GAP|"
@@ -139,6 +144,7 @@ CITATION_SAMPLES = (
     "MPG-4b",
     "WEB-16a",
     "T-14a",
+    "F-10",
 )
 
 # Ordinary text the pattern must leave alone: encodings, standards and hash
