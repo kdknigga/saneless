@@ -34,12 +34,13 @@ import re
 # pattern, and a test in tests/test_deployment_config.py keeps the two
 # identical.
 PLANNING_CITATION = re.compile(
-    r"\b(R[0-9]+-)?(C|D|M|N|R|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
+    r"\b(R[0-9]+-)?(C|D|M|N|R|S|U|W|CR|IN|WR)-[0-9]{2,}[a-z]?\b|\b(A|"
     r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
-    r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\b(ARC|CLI|DOC|JOB|OPS|PIP|PPL|SCN|"
-    r"SEC|UI|WEB)-[0-9]{2,}\b|\b(AP|AR|AUDIT|CF|CI|CONF|CORE|DEP|DPI|FW|GAP|"
+    r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+[a-z]?\b|\b(ARC|CLI|DOC|JOB|OPS|PIP|PPL|SCN|"
+    r"SEC|UI|WEB)-[0-9]{2,}[a-z]?\b|\b(AP|AR|AUDIT|CF|CI|CONF|CORE|DEP|DPI|FW|GAP|"
     r"GATE|GS|HLTH|HTTP|LOG|NET|OBS|PDF|PIN|PIPE|PKG|PLSS|PROF|PS|RH|TOOL|"
-    r"TQUAL|UIX|XC|P[0-9]+)-[0-9]{2,}\b|\bT-[0-9]+-[0-9]+\b|\bT-[0-9]{2,}\b|"
+    r"TQUAL|UIX|XC|P[0-9]+)-[0-9]{2,}[a-z]?\b|\bT-[0-9]+-[0-9]+[a-z]?\b|"
+    r"\bT-[0-9]{2,}[a-z]?\b|"
     r"\b([Pp]hases?|PHASES?)[ -]?[0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
     r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
     r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
@@ -50,7 +51,7 @@ PLANNING_CITATION = re.compile(
 
 # Text the pattern must match: one of each identifier family a reader is
 # likely to paste, including the multi-page IDs with and without a leading
-# zero.
+# zero, and IDs with a letter suffix.
 CITATION_SAMPLES = (
     "ENUM-03",
     "ARCH-03",
@@ -131,6 +132,13 @@ CITATION_SAMPLES = (
     "prior phases",
     "these phases",
     "those phases",
+    "D-12a",
+    "N-42c",
+    "WR-04b",
+    "DEP-03a",
+    "MPG-4b",
+    "WEB-16a",
+    "T-14a",
 )
 
 # Ordinary text the pattern must leave alone: encodings, standards and hash
