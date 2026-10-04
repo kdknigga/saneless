@@ -632,6 +632,7 @@ class TestScanSession:
         SaneBackend().scan_pages("test:0", _flatbed_settings(), page_sink)
         child = scan_child_seam.children[0]
 
+        assert _child_ended(child)
         assert child.poll() == 0
         assert child.kill_and_reap() == 0
 
