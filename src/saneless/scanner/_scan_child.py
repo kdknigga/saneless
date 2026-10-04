@@ -27,10 +27,10 @@ SANE call is loaded or run, the child moves the parent's stdout pipe to a
 descriptor of its own and points fd 1 at stderr, so a backend's C stdio
 cannot write into a frame.  The modules this file imports at load time
 (saneless's own, and Pillow) run first, while fd 1 is still the pipe; none of
-them writes to stdout or opens a descriptor when imported.  One lock serialises every
-write to it.  A page whose pixels fail part way leaves the channel mid-page,
-where any later frame would be read as pixels, so nothing more is written to
-it.
+them writes to stdout or opens a descriptor when imported.  One lock
+serialises every write to it.  A page whose pixels fail part way leaves the
+channel mid-page, where any later frame would be read as pixels, so nothing
+more is written to it.
 
 The C library's thread unwinder is loaded next, after the channel is private
 and before python-sane is imported, so no backend thread is ever the first to

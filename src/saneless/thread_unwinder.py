@@ -11,9 +11,10 @@ next time anything loads a library, or at exit.
 Each child process that loads python-sane calls this at its start, before
 python-sane is imported.  Ending one thread of our own before any backend runs
 makes glibc load and keep the unwinder there and then.  The thread is made
-through the C library directly, because a Python thread returns from its start routine instead of
-calling ``pthread_exit`` and would load nothing.  Other C libraries load no
-unwinder at thread exit, so this is a no-op anywhere but glibc on Linux.
+through the C library directly, because a Python thread returns from its start
+routine instead of calling ``pthread_exit`` and would load nothing.  Other C
+libraries load no unwinder at thread exit, so this is a no-op anywhere but
+glibc on Linux.
 """
 
 from __future__ import annotations

@@ -11,9 +11,9 @@ device id travels in the ``scan`` command on its stdin, never in argv.  This
 side owns every deadline, read at call time so tests can shorten them: the
 start-up gets ``STARTUP_DEADLINE_SECONDS``, the open, configure, close,
 restart and exit stages get ``STAGE_DEADLINE_SECONDS`` each, both 30 s, the
-start and read of one page share the
-page budget worked out from the parameters the child reports, and no
-deadline runs while the session is idle between passes.
+start and read of one page share the page budget worked out from the
+parameters the child reports, and no deadline runs while the session is idle
+between passes.
 
 A page that overruns its budget, an abort, a Ctrl-C and a sink that refuses a
 page all stop the child the same way: saneless asks it to cancel (or stop),
