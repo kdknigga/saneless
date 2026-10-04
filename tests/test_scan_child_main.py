@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 import pytest
-import saneless.scanner._scan_child as scan_child_main
 from PIL import Image, ImageDraw
 
 import saneless
+import saneless.scanner._scan_child as scan_child_main
 import saneless.scanner.scan_session as scan_session_mod
 from saneless.exceptions import ScanError
 from saneless.scanner import page_budget, scan_child
@@ -765,6 +765,7 @@ def test_loading_the_child_imports_no_sane_and_no_ctypes() -> None:
             "scan_child_probe", os.environ["SANELESS_TEST_MODULE"]
         )
         module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         print(sorted(name for name in ("sane", "_sane", "ctypes") if name in sys.modules))
         """
@@ -862,14 +863,18 @@ def test_a_cap_reached_travels_in_pass_done(
         pytest.param({"source": "ADF"}, id="missing-keys"),
         pytest.param(
             {
-                **dataclasses.asdict(ScanSettings("ADF", 300, "Color")),
+                **dataclasses.asdict(
+                    ScanSettings(source="ADF", resolution=300, mode="Color")
+                ),
                 "paper_size": "b5",
             },
             id="unknown-paper-size",
         ),
         pytest.param(
             {
-                **dataclasses.asdict(ScanSettings("ADF", 300, "Color")),
+                **dataclasses.asdict(
+                    ScanSettings(source="ADF", resolution=300, mode="Color")
+                ),
                 "resolution": "x",
             },
             id="text-resolution",
