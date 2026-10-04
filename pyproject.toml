@@ -47,47 +47,25 @@ Issues = "https://github.com/kdknigga/saneless/issues"
 requires = ["uv_build>=0.12.18,<0.13.0"]
 build-backend = "uv_build"
 
-# anyio 4.15.0 turned `anyio.abc.BlockingPortal` into a deprecated alias, and
-# starlette's `testclient` module evaluates that name at module scope.  This
-# project runs pytest under `filterwarnings = ["error"]`, so the deprecation
-# is raised instead of printed, and every module importing `TestClient` fails
-# to collect -- seven of them here.  Nothing in this repository can fix that:
-# the deprecated name is starlette's own, reached before any saneless code
-# runs.  Declaring the ceiling makes resolution refuse the broken combination
-# outright, rather than leaving it to be discovered as collection errors once
-# a lock has already been written.  `constraint-dependencies` is its right
-# home because it bounds what resolution may select without installing anyio
-# and without entering `[project].dependencies`, so a ceiling on a package
-# saneless never imports stays out of the built wheel's metadata and out of
-# every downstream installer.  Remove it once starlette stops using the
-# deprecated alias.
+# anyio 4.15 deprecates `anyio.abc.BlockingPortal`, which starlette's
+# `testclient` reads at import, so under `filterwarnings = ["error"]` every
+# module importing `TestClient` fails to collect. A constraint, not a
+# dependency, keeps the ceiling out of the wheel's metadata. Remove it once
+# starlette stops using the alias.
 [tool.uv]
 constraint-dependencies = ["anyio<4.15"]
-# The one place this project declares its uv version.  setup-uv reads it on
-# every runner, because no workflow step names a version of its own, and local
-# uv refuses to run `uv sync`, `uv run` or `uv lock` outside it, so the commit
-# hooks, CI and a developer's machine cannot drift apart.  It is a range and
-# not an exact pin by choice: a uv patch release reaches CI without review,
-# which is accepted in exchange for one declaration instead of eleven, and the
-# ceiling still stops a new minor series at review.  Two surfaces cannot read
-# it -- the Dockerfile's uv tool stage and the `uv_build` build-system
-# requirement -- so they stay pinned, and a test holds both inside this range.
+# The one declaration of the uv version: setup-uv reads it on every runner and
+# local uv refuses to run outside it. The Dockerfile's uv stage and the
+# `uv_build` requirement cannot read it, so a test holds both inside this range.
 required-version = ">=0.12.18,<0.13"
-# python-sane publishes an sdist and no wheel, so every install compiles it,
-# and the build backend that does the compiling is code run with the
-# installer's privileges.  `uv.lock` does not lock build dependencies, and a
-# build constraint pins a version without checking any hash, so left to build
-# isolation that backend is resolved fresh at build time and never verified.
-# Instead the backend is declared as the locked `build` group, installed from
-# the lock with its sha256 checked like any other package, and python-sane is
-# built against that installed copy with isolation off.  `build` is a default
-# group so a plain `uv sync` works; a sync that leaves the group out fails with
-# uv's own hint rather than falling back to an unhashed build.
+# python-sane ships only an sdist, and an isolated build would fetch its build
+# backend unhashed. The backend is the locked `build` group instead, installed
+# with its sha256 checked, and python-sane builds against it with isolation
+# off. `build` is a default group so a plain `uv sync` works.
 no-build-isolation-package = ["python-sane"]
 default-groups = ["dev", "build"]
 
 [tool.ruff]
-# Exclude a variety of commonly ignored directories.
 exclude = [
     ".bzr",
     ".direnv",
@@ -117,35 +95,25 @@ exclude = [
     "venv",
 ]
 
-# Same as Black.
 line-length = 88
 indent-width = 4
 
-# Assume Python 3.14
 target-version = "py314"
 
 [tool.ruff.lint]
-# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
-# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
-# McCabe complexity (`C901`) by default.
 select = ["E", "F", "B", "G", "W", "YTT", "ANN", "ASYNC", "S", "FBT", "A", "COM", "C4", "EM", "ICN", "LOG", "PIE", "Q", "RSE", "RET", "SIM", "TID", "TC", "ARG", "PTH", "FLY", "PERF", "FURB", "RUF", "UP", "D", "I", "PL", "PT", "DTZ", "T20", "FAST"]
 ignore = ["E501", "D203", "D212", "W505", "PLR2004", "COM812"]
 
-# Allow fix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]
 unfixable = []
 
-# Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.flake8-type-checking]
-# FastAPI evaluates a route's annotations at runtime, when the decorator runs,
-# so ruff must not move the names they use under TYPE_CHECKING.  Every route
-# decorator on both APIRouter and FastAPI is listed, so a route added through
-# any of them is covered.  Ruff resolves the receiver (`router`, `app`) only
-# through an assignment in the same module, so the APIRouter or FastAPI must be
-# constructed in the module that decorates with it; one imported from another
-# module is not recognised, and the exemption silently stops applying.
+# FastAPI evaluates route annotations at runtime, so ruff must not move their
+# names under TYPE_CHECKING. Ruff recognises the receiver only through an
+# assignment in the same module: construct the APIRouter or FastAPI where it
+# decorates, or the exemption silently stops applying.
 runtime-evaluated-decorators = [
     "fastapi.APIRouter.get",
     "fastapi.APIRouter.post",
@@ -170,43 +138,16 @@ runtime-evaluated-decorators = [
 ]
 
 [tool.ruff.format]
-# Like Black, use double quotes for strings.
 quote-style = "double"
-
-# Like Black, indent with spaces, rather than tabs.
 indent-style = "space"
-
-# Like Black, respect magic trailing commas.
 skip-magic-trailing-comma = false
-
-# Like Black, automatically detect the appropriate line ending.
 line-ending = "auto"
-
-# Enable auto-formatting of code examples in docstrings. Markdown,
-# reStructuredText code/literal blocks and doctests are all supported.
-#
-# This is currently disabled by default, but it is planned for this
-# to be opt-out in the future.
 docstring-code-format = false
-
-# Set the line length limit used when formatting code snippets in
-# docstrings.
-#
-# This only has an effect when the `docstring-code-format` setting is
-# enabled.
 docstring-code-line-length = "dynamic"
 
-# Keep the formatter out of the planning archive.  That directory is a
-# historical record of decisions already made, not source this formatter
-# owns, and ruff formats fenced Python blocks inside Markdown, so leaving it
-# in scope would rewrite a finished audit trail.  The scope is deliberately
-# Markdown under that one directory: `docs/` and `README.md` keep being
-# formatted, and so does the one Python file that lives under `.planning/`.
-# The glob has to reach the files themselves -- this is the formatter's own
-# `exclude`, which matches files rather than directories, so a bare
-# directory name here would exclude nothing.  Linting is unaffected: the
-# top-level `[tool.ruff] exclude` is not touched, so `.planning/` stays
-# linted.
+# Ruff formats fenced Python in Markdown, and the planning archive is a record,
+# not source. The formatter's `exclude` matches files, so the glob must reach
+# them; a bare directory name would exclude nothing.
 exclude = [".planning/**/*.md"]
 
 [tool.ruff.lint.per-file-ignores]
@@ -223,29 +164,18 @@ exclude = [".planning/**/*.md"]
 # identifiers come from the module's column tuple; every value is a bound parameter
 "src/saneless/job.py" = ["S608"]
 
-# Deliberately empty: its presence is the setting.  ty skips any
-# pyproject.toml without a `[tool.ty]` table and keeps searching parent
-# directories, so without it a git worktree nested inside another checkout
-# anchors ty on the outer checkout's pyproject.toml.  `ty check` then reports
-# on the outer tree's source and passes, whatever this tree contains.
+# Deliberately empty: its presence is the setting. Without it ty keeps
+# searching parent directories, so in a worktree nested inside another checkout
+# it checks the outer tree and passes whatever this tree contains.
 [tool.ty]
 
 [tool.pyrefly]
-# "src" must come first. Pyrefly infers a single import root from the project
-# layout ("src"), which leaves `tests` unresolvable -- `tests/test_scanner.py`
-# imports the shared fake as `tests.fake_sane`: `tests/` is a package, so
-# pytest's default prepend mode imports it as `tests.*`. Adding "." alone is
-# not the fix: it lets `src/saneless` resolve as both `saneless.*` and
-# `src.saneless.*`, and the two identities are not assignable to each other
-# (measured: 14 bad-argument-type errors). Listing "src" first pins each
-# source file to one module name and leaves "." to resolve `tests` only.
+# "." resolves `tests.*` imports; "src" must come first, or each source file
+# also resolves as `src.saneless.*`, a second identity not assignable to the
+# first.
 search-path = ["src", "."]
 
-# A deprecated API reported as a warning scrolls past unread: pyrefly hides
-# warnings by default, and the `@contextmanager -> Iterator[T]` annotations
-# sat there until someone went looking.  Making this kind an error fails the
-# hook and CI instead, so a new deprecation gets fixed when it lands rather
-# than accumulating.
+# pyrefly hides warnings by default, so a deprecation is an error instead.
 [tool.pyrefly.errors]
 deprecated = "error"
 
@@ -266,30 +196,27 @@ xfail_strict = true
 filterwarnings = ["error"]
 timeout = 60
 timeout_method = "signal"
-# Two tests measure rather than assert -- how many requests an abandoned status
-# strip really issues, and how long its poll chain gets -- and report the number
-# through `record_property`. pytest's default junit_family, "xunit2", has no
-# place to put a per-test property and raises a PytestWarning when one is
-# recorded; `filterwarnings = ["error"]` above turns that into a collection
-# error, so a `--junitxml` run would fail on the very tests whose output it was
-# asked to capture. "legacy" is the family that carries them.
+# Some tests report a measurement through `record_property`. Under the default
+# "xunit2" family, a `--junitxml` run turns each recorded property into a
+# PytestWarning, and `filterwarnings = ["error"]` makes that a test setup
+# error. "legacy" carries the properties.
 junit_family = "legacy"
 
-# Generated mutants for the delivery path: the pipeline, the worker, the
-# Paperless client and the job store.  mutmut never mutates a function that
-# carries a decorator other than staticmethod or classmethod, so the store's
-# locked public methods get no generated mutants at all; the hand-written
-# mutants under tests/mutants cover them instead.  mutmut runs the tests
-# against a rewritten copy of each module, so a test that reads a module's own
-# source sees the rewrite rather than the real code and fails the clean run;
-# those tests carry the source_structure marker and are deselected here.  Each
-# mutant runs in a forkserver child, which is safe with the threads the worker
-# tests start.
+# Generated mutants for the delivery path: the pipeline and worker with their
+# flip, duplex and start-up profile modules, the Paperless client and the job
+# store. mutmut skips functions with a decorator other than staticmethod or
+# classmethod, so the hand-written mutants cover the store's locked methods.
+# Tests that read a module's own source would see mutmut's rewrite, so the
+# source_structure marker deselects them. forkserver is safe with the threads
+# the worker tests start.
 [tool.mutmut]
 source_paths = ["src"]
 only_mutate = [
     "src/saneless/pipeline.py",
     "src/saneless/worker.py",
+    "src/saneless/flip.py",
+    "src/saneless/duplex.py",
+    "src/saneless/startup_profiles.py",
     "src/saneless/paperless.py",
     "src/saneless/job.py",
 ]
@@ -328,8 +255,7 @@ dev = [
 release = [
     "packaging>=26.0",
 ]
-# The build backend python-sane compiles against; see `no-build-isolation-package`
-# under [tool.uv] for why it is a locked group rather than a build requirement.
+# The build backend python-sane compiles against; see [tool.uv].
 build = [
     "setuptools>=84.0.0",
 ]

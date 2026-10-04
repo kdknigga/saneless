@@ -1,37 +1,16 @@
-# Update schedule for the four ecosystems this repository pins: the SHA-pinned
-# actions in .github/workflows/, the digest-pinned base images in the Dockerfile,
-# the Python dependencies that pyproject.toml declares and uv.lock resolves, and
-# the frozen hook repositories in .pre-commit-config.yaml. Each of those is a
-# commit SHA with a `# frozen: vX.Y.Z` comment naming the release it came from,
-# and Dependabot rewrites the comment together with the SHA, so the pin and the
-# version it claims move as one.
+# Moves the four kinds of pin this repository holds: SHA-pinned actions,
+# digest-pinned base images, uv.lock, and the frozen hook repositories in
+# .pre-commit-config.yaml, whose `# frozen: vX.Y.Z` comment Dependabot rewrites
+# together with the SHA.
 #
-# Pinning to an immutable SHA, digest or locked version is what makes a
-# supply-chain audit pass, and it is also what stops those pins moving on their
-# own -- so something has to move them deliberately, and this is it.
+# Every entry needs a seven-day cooldown. zizmor enforces that a cooldown is
+# present; a test in tests/test_deployment_config.py enforces the seven-day
+# floor for every ecosystem, so a new entry needs its own block.
+# See docs/explanation/decisions/0015-dependabot-cooldown.md.
 #
-# All four entries below carry the seven-day settling period. It is not
-# decoration: it is the gap between an upstream release and a pull request
-# proposing it, and so the only thing standing between an account compromised
-# today and a merge-ready bump today. What enforces it is a test --
-# test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr, in
-# tests/test_deployment_config.py -- and not the workflow audit. zizmor's own
-# cooldown check is ecosystem-gated: measured on 1.30.1, it reports a
-# `github-actions` entry that omits the block, and an explicit value below
-# seven days, but it passes a `uv` entry carrying no block at all. Any fifth
-# entry added here needs its own copy of the block, and the test is what will
-# say so.
-#
-# Watch item for the docker entry: the ecosystem also parses `image:` keys out
-# of YAML manifests, so it may open pull requests against docker-compose.yml's
-# reference to this project's own published image. If that happens, the fix is
-# an `ignore:` entry for that one dependency -- not dropping the ecosystem,
-# which is here for the base-image digests.
-#
-# Also note: the docker file parser matches `FROM` lines only and explicitly
-# skips `COPY --from=`, so a digest written directly on a `COPY --from=` line
-# would never be updated. Tool images have to enter via a named `FROM ... AS`
-# stage to be seen.
+# The docker ecosystem may also propose bumps to docker-compose.yml's
+# reference to this project's own image; answer that with an `ignore:` entry,
+# not by dropping the ecosystem.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
