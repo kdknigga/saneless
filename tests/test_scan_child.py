@@ -683,6 +683,54 @@ def test_close_after_an_interrupted_kill_counts_it_and_reports_no_crash(
     assert [record.getMessage() for record in caplog.records] == []
 
 
+@pytest.mark.parametrize("first", ["scan", "restart"])
+def test_a_session_used_again_after_an_interrupted_kill_starts_a_new_child(
+    first: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child saneless killed is ended, not reported as crashed, when used again.
+
+    A Ctrl-C lands between the kill and the reap, and the session is then
+    asked to restart or to scan.  The killed child is reaped and counted
+    once, and the scan runs in a new child, with no death from ``SIGKILL``
+    reported: that kill was saneless's own.
+
+    Args:
+        first: What the session is asked for first: a scan, or a restart
+            and then a scan.
+        monkeypatch: Points the session at the stand-in.
+        tmp_path: Holds the stand-in and the spooled pages.
+        caplog: Captures the session's warnings.
+
+    """
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _shorten_deadlines(monkeypatch)
+    _stand_in(monkeypatch, tmp_path)
+    children: list[ChildProcess] = []
+
+    def start() -> ChildProcess:
+        child = _ReapInterruptedOnce(_start_stand_in())
+        children.append(child)
+        return child
+
+    with ScanChildSession(start) as session:
+        session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+        with pytest.raises(KeyboardInterrupt):
+            session._end_child()
+        if first == "restart":
+            session.restart()
+        batch = session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+
+    assert batch.pages
+    assert len(children) == 2
+    _assert_reaped(children[0].pid)
+    assert session.children_killed == 1
+    assert _warnings(caplog) == []
+
+
 def test_a_crash_names_the_signal_stage_and_page(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
