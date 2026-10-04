@@ -44,12 +44,9 @@ class DuplexMismatch:
     nothing: when each pass loses a different sheet, the counts match and the
     interleave pairs fronts with the wrong backs. A cap is the same kind of
     evidence: the backs pass fed a sheet it threw away, and the fronts pass
-    never fed that sheet, so the stack was not the one pass A saw.
-
-    A named record rather than the bare ``(fronts, backs)`` tuple this used to
-    be. The recovery path also needs the sheets the device could not read, and
-    a tuple would make every call site remember an order. The resolution is
-    not here: each record carries the dpi its page was read back at.
+    never fed that sheet, so the stack was not the one pass A saw. The
+    resolution is not here: each record carries the dpi its page was read
+    back at.
 
     Attributes:
         fronts: Page records produced by pass A, in pass order.
@@ -62,9 +59,7 @@ class DuplexMismatch:
             scanned after it.
         substituted_source: The flatbed source the profile asked for when the
             scanner's Auto source took pass A through the feeder instead, or
-            None. The SANE backend never substitutes on manual duplex, so it
-            is None from that backend; it is carried so that a backend that
-            did would still be reported.
+            None. The SANE backend never substitutes on manual duplex.
 
     """
 
@@ -79,18 +74,9 @@ def duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
     """
     Reconcile the resolution the two manual-duplex passes reported.
 
-    Both passes run with identical settings against one device, so the two
-    values should be identical in practice. If they are not, the device changed
-    its mind mid-job, and that is a fact worth saying out loud rather than
-    resolving silently.
-
-    Nothing has to be chosen for the PDF any more: each page's record carries
-    the dpi its own pass read back, and assembly lays every page out at its
-    own, so a disagreement costs no page its real size. Failing the run
-    instead would throw away a scan that completed, over a disagreement the
-    crop fallback already tolerates. The one place a single value is still
-    needed is the interleaved batch's ``actual_resolution``, and pass A's is
-    used there.
+    A disagreement is logged, not fatal: each page's record carries the dpi
+    its own pass read back and assembly lays every page out at its own, so
+    no page loses its real size.
 
     Args:
         front: The batch pass A produced.
@@ -185,10 +171,9 @@ def interleave_duplex(
     Backs are reversed because the user flips the stack face-down,
     so the last front's back is scanned first in pass B.
 
-    Records are reordered, never files. Nothing is renamed, moved or rewritten
-    on the spool: after this runs, the ``a-`` and ``b-`` file names no longer
-    sort into document order at all, and that is precisely why document order
-    is the order of this list and never the directory's.
+    Records are reordered, never files: the ``a-`` and ``b-`` spool names do
+    not sort into document order, so document order is this list's, never the
+    directory's.
 
     Args:
         fronts: Front-side records from pass A.

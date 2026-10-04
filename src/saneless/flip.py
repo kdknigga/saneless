@@ -30,12 +30,8 @@ class FlipCoordinator(ABC):
     total ``FlipOutcome``.  The web worker answers it from the Continue and
     Abort routes, and the CLI answers it from a terminal prompt.
 
-    This is an ``ABC`` and not a ``typing.Protocol`` on purpose, and the rule is
-    observable in the tree: ``Protocol`` describes shapes this project does not
-    own (``SaneDevice`` for python-sane's handle, ``_SettingsFactory`` for
-    pydantic's constructor), while ``ABC`` defines seams the project implements
-    itself (``ScannerBackend``).  Where this seam is called a "protocol" in
-    lower case, the word means "contract", not ``typing.Protocol``.
+    An ``ABC``, not a ``typing.Protocol``, by the convention CONTRIBUTING.md
+    states for seams this project implements itself.
     """
 
     @abstractmethod
@@ -63,17 +59,10 @@ class FlipCoordinator(ABC):
         """
         Why the wait answered ``ABORTED``, when it was not the operator's choice.
 
-        An ``ABORTED`` answer usually means someone gave up at the prompt, and
-        the pipeline reports that as a cancellation.  But a coordinator can
-        also answer ``ABORTED`` because its prompt broke -- a read error such as
-        an I/O error or undecodable input -- and nobody chose to stop.  End of
-        input, a closed terminal included, is not such a break: it is the
-        operator's cancel.  Such a coordinator returns the exception here, so
-        the pipeline records a failure rather than a cancellation without a
-        fourth ``FlipOutcome`` member.
-
-        Concrete rather than abstract, so a coordinator whose aborts are always
-        an operator's needs no change.
+        A coordinator whose prompt broke (an I/O error, undecodable input)
+        answers ``ABORTED`` and returns the exception here, so the pipeline
+        records a failure rather than a cancellation.  End of input, a closed
+        terminal included, is the operator's cancel, not a break.
 
         Returns:
             The exception that forced the abort, or ``None`` when there was
@@ -92,15 +81,8 @@ class PassCoordinator(ABC):
     pass failed -- and gets back a single ``PassAnswer``.  The web worker
     answers it from the multi-page routes, and the CLI from a terminal prompt.
 
-    It is a sibling of ``FlipCoordinator`` and deliberately not a widening of
-    it: the manual-duplex flip wait keeps its own seam and its own outcomes, so
-    a multi-page answer can never reach a manual-duplex run.
-
-    This is an ``ABC`` and not a ``typing.Protocol`` on purpose, and the rule is
-    observable in the tree: ``Protocol`` describes shapes this project does not
-    own (``SaneDevice`` for python-sane's handle, ``_SettingsFactory`` for
-    pydantic's constructor), while ``ABC`` defines seams the project implements
-    itself (``ScannerBackend``, ``FlipCoordinator``).
+    It is a sibling of ``FlipCoordinator``, not a widening of it, so a
+    multi-page answer can never reach a manual-duplex run.
     """
 
     @abstractmethod
@@ -132,17 +114,10 @@ class PassCoordinator(ABC):
         """
         Why the wait answered ``ABORT``, when it was not the operator's choice.
 
-        An ``ABORT`` answer usually means someone gave up at the prompt, and
-        the pipeline reports that as a cancellation.  But a coordinator can
-        also answer ``ABORT`` because its prompt broke -- a read error such as
-        an I/O error or undecodable input -- and nobody chose to stop.  End of
-        input, a closed terminal included, is not such a break: it is the
-        operator's cancel.  Such a coordinator returns the exception here, so
-        the pipeline records a failure rather than a cancellation without a
-        further ``PassAnswer`` member.
-
-        Concrete rather than abstract, so a coordinator whose aborts are always
-        an operator's needs no change.
+        A coordinator whose prompt broke (an I/O error, undecodable input)
+        answers ``ABORT`` and returns the exception here, so the pipeline
+        records a failure rather than a cancellation.  End of input, a closed
+        terminal included, is the operator's cancel, not a break.
 
         Returns:
             The exception that forced the abort, or ``None`` when there was
@@ -156,15 +131,9 @@ class PassCoordinator(ABC):
         """
         Whether saneless is stopping, so no further pass may start.
 
-        An answer claimed just before a stop keeps its meaning at the prompt,
-        but the pass it asks for must not begin: a pass outlasts the bounded
-        stop, and a run killed inside one never reaches the guard that keeps
-        its accepted pages.  The run checks this before every pass after the
-        first and ends as interrupted instead.
-
-        Concrete rather than abstract, so a coordinator that is never stopped
-        this way -- the CLI's, where a signal interrupts the run directly --
-        needs no change.
+        A pass outlasts the bounded stop, and a run killed inside one never
+        reaches the guard that keeps its accepted pages.  So the run checks
+        this before every pass after the first and ends as interrupted instead.
 
         Returns:
             True once stopping has begun; False otherwise.
@@ -177,20 +146,9 @@ class AnswerSlot[T: StrEnum]:
     """
     One answer, claimed once, and final: the claim every coordinator shares.
 
-    The web worker's and the CLI's coordinators differ in where an answer comes
-    from -- the web routes, or a terminal prompt -- but not in how it is
-    claimed.  That claim lives here, once, so a fix to it reaches both.  It is
-    generic over the answer's enum, so the flip wait (``FlipOutcome``) and the
-    multi-page waits (``PassAnswer``) share the claim without sharing anything
-    else.  This is a concrete helper the coordinators compose, not a seam:
-    ``FlipCoordinator`` and ``PassCoordinator`` stay the only contracts the
-    pipeline waits on, and anything a coordinator adds on top -- the web one's
-    arming, for instance -- stays in that coordinator.
-
-    The answer is written under the lock *before* the event is set, so a waiter
-    that wakes always finds an answer to read -- there is no window in which the
-    event says "resolved" and the slot still says nothing.  That ordering is
-    what makes it race-free by construction rather than by timing.
+    A concrete helper the coordinators compose, not a seam.  The answer is
+    written under the lock *before* the event is set, so a waiter that wakes
+    always finds an answer to read.
     """
 
     def __init__(self) -> None:
@@ -230,9 +188,6 @@ class AnswerSlot[T: StrEnum]:
         Claim the answer with ``outcome`` unless one is claimed, and return it.
 
         This is the path that ends a wait: a timeout, or a CLI answer.
-        Returning the answer in effect, rather than asserting one exists, is
-        what narrows ``T | None`` to ``T`` without an
-        ``assert`` -- which ``S101`` bans in ``src/``.
 
         Args:
             outcome: The answer this caller is offering.
@@ -253,9 +208,8 @@ class AnswerSlot[T: StrEnum]:
         """
         Block until the slot is answered, for at most ``timeout`` seconds.
 
-        It reports nothing: the caller reads the result through ``settle``, which
-        is right whether the wait was answered or expired.  A
-        ``KeyboardInterrupt`` raised while waiting propagates to the caller.
+        The caller reads the result through ``settle``, which is right whether
+        the wait was answered or expired.
 
         Args:
             timeout: The longest to wait, in seconds.
@@ -265,4 +219,4 @@ class AnswerSlot[T: StrEnum]:
 
 
 class FlipAnswerSlot(AnswerSlot[FlipOutcome]):
-    """The flip wait's slot, by the name every caller and test already uses."""
+    """The flip wait's answer slot."""
