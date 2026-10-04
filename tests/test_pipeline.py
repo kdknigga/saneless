@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import dataclasses
 import errno
 import io
@@ -18,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Final, NoReturn, override
 from unittest.mock import MagicMock, patch
 
 import httpx2
@@ -92,6 +93,7 @@ from saneless.vocabulary import (
     ExitCode,
     FlipOutcome,
     JobState,
+    PassAnswer,
     ScanOutcome,
     backs_not_scanned_warning,
     backs_pass_cap_note,
@@ -129,10 +131,14 @@ from tests.golden_support import (
     embedded_streams,
     png_idat,
 )
-from tests.multi_page_support import ScriptedPassCoordinator
+from tests.multi_page_support import (
+    DUPLEX_PROFILE,
+    ScriptedPassCoordinator,
+    multi_page_settings,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from types import ModuleType
     from typing import BinaryIO
 
@@ -8556,3 +8562,303 @@ class TestStaleIdsAreDroppedBeforeScanning:
         tags = [value for name, value in recorder.upload_fields(0) if name == "tags"]
         assert tags == ["3", "9"]
         assert lookup.calls == [("tags", False)]
+
+
+class _SessionSpanScanner(DistinctPageScanner):
+    """A distinct-page scanner that logs its session, passes and restarts, in order."""
+
+    def __init__(
+        self,
+        log: list[str],
+        *,
+        passes: Sequence[Sequence[int]],
+        fail_on: Mapping[int, BaseException] | None = None,
+    ) -> None:
+        """
+        Prepare the passes, the shared log and an empty session record.
+
+        Args:
+            log: Where every session entry and exit, pass and restart is
+                appended, beside whatever else the test logs.
+            passes: The page indices each successive pass feeds.
+            fail_on: The exception a pass raises, keyed by its 1-based number.
+
+        """
+        super().__init__(passes=passes, fail_on=fail_on if fail_on is not None else {})
+        self.log = log
+        self.sessions: list[tuple[threading.Event | None, threading.Event | None]] = []
+
+    @override
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """
+        Record the session's Events, and log its entry and exit.
+
+        Args:
+            abort: Recorded.
+            live: Recorded.
+
+        Returns:
+            A context manager that logs ``enter`` and ``exit``.
+
+        """
+        self.sessions.append((abort, live))
+        return self._logged_session()
+
+    @contextlib.contextmanager
+    def _logged_session(self) -> Iterator[None]:
+        """
+        Log the session's entry, then its exit however the block ends.
+
+        Yields:
+            Nothing.
+
+        """
+        self.log.append("enter")
+        try:
+            yield
+        finally:
+            self.log.append("exit")
+
+    @override
+    def reinitialise(self) -> None:
+        """Log a restart."""
+        self.log.append("reinitialise")
+
+    @override
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Log a pass, then feed it.
+
+        Args:
+            device_id: Passed through.
+            settings: Passed through.
+            sink: Passed through.
+
+        Returns:
+            The pass's batch.
+
+        """
+        self.log.append("scan")
+        return super().scan_pages(device_id, settings, sink)
+
+
+class _LoggedFlip(AlwaysContinueFlipCoordinator):
+    """A flip coordinator that logs the flip wait before answering it at once."""
+
+    def __init__(self, log: list[str]) -> None:
+        """
+        Keep the shared log.
+
+        Args:
+            log: Where ``flip`` is appended at each wait.
+
+        """
+        super().__init__()
+        self.log = log
+
+    @override
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Log the wait, then report the stack flipped.
+
+        Args:
+            timeout: Passed through.
+
+        Returns:
+            ``FlipOutcome.CONTINUED``.
+
+        """
+        self.log.append("flip")
+        return super().wait_for_flip(timeout)
+
+
+def _logged[**P, R](log: list[str], name: str, real: Callable[P, R]) -> Callable[P, R]:
+    """
+    Wrap a pipeline step so each call logs its name before it runs.
+
+    Args:
+        log: Where ``name`` is appended at each call.
+        name: What to log.
+        real: The step to run.
+
+    Returns:
+        The wrapped step.
+
+    """
+
+    def _step(*args: P.args, **kwargs: P.kwargs) -> R:
+        log.append(name)
+        return real(*args, **kwargs)
+
+    return _step
+
+
+def _log_the_finish(monkeypatch: pytest.MonkeyPatch, log: list[str]) -> None:
+    """
+    Log each blank filter and each assembly the run makes, then make it.
+
+    Args:
+        monkeypatch: Replaces the pipeline's own references.
+        log: Where ``filter`` and ``assemble`` are appended.
+
+    """
+    monkeypatch.setattr(
+        pipeline_module,
+        "filter_blank_pages",
+        _logged(log, "filter", pipeline_module.filter_blank_pages),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "assemble_pdf",
+        _logged(log, "assemble", pipeline_module.assemble_pdf),
+    )
+
+
+_SPAN_RUNS: Final = {
+    "simplex": ("adf", ((0, 1),), False, []),
+    "manual-duplex": (DUPLEX_PROFILE, ((0, 1), (3, 2)), False, []),
+    "multi-page": (
+        "default",
+        ((0,), (1,), (2,)),
+        True,
+        [PassAnswer.NEXT, PassAnswer.NEXT, PassAnswer.FINISH],
+    ),
+}
+
+_SPAN_LOGS: Final = {
+    "simplex": ["enter", "scan", "exit", "filter", "assemble"],
+    "manual-duplex": ["enter", "scan", "flip", "scan", "exit", "filter", "assemble"],
+    "multi-page": [
+        "enter",
+        "scan",
+        "prompt",
+        "reinitialise",
+        "scan",
+        "prompt",
+        "reinitialise",
+        "scan",
+        "prompt",
+        "exit",
+        "assemble",
+    ],
+}
+
+
+def _run_logged(
+    tmp_path: Path,
+    paperless: MagicMock,
+    scanner: _SessionSpanScanner,
+    mode: str,
+    events: tuple[threading.Event | None, threading.Event | None] = (None, None),
+) -> ScanResult:
+    """
+    Run one pipeline in the named mode, logging its flip waits and prompts.
+
+    Both are logged to the scanner's own log, between its passes.
+
+    Args:
+        tmp_path: The test's own temporary directory.
+        paperless: The client stand-in.
+        scanner: The scanner the run feeds from.
+        mode: A key of ``_SPAN_RUNS``.
+        events: The request's abort and live-child Events.
+
+    Returns:
+        How the run resolved.
+
+    """
+    profile, _passes, multi_page, answers = _SPAN_RUNS[mode]
+    log = scanner.log
+    abort, scan_child_live = events
+    return run_pipeline(
+        scanner=scanner,
+        paperless=paperless,
+        settings=multi_page_settings(tmp_path),
+        request=PipelineRequest(
+            profile_name=profile,
+            title="Session Span",
+            job_id=FIXED_JOB_ID,
+            flip_coordinator=_LoggedFlip(log),
+            multi_page=multi_page,
+            pass_coordinator=ScriptedPassCoordinator(
+                answers, on_ask=lambda _prompt: log.append("prompt")
+            )
+            if multi_page
+            else None,
+            abort=abort,
+            scan_child_live=scan_child_live,
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", list(_SPAN_RUNS))
+def test_one_scan_session_spans_the_whole_acquisition(
+    mode: str,
+    tmp_path: Path,
+    mock_paperless: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One session opens before the first pass and ends before the pages are judged.
+
+    Every pass, the flip wait and every prompt fall inside it, so a backend
+    that scans through a helper process keeps one for the job; and it has ended
+    before the blank filter or the assembly, so that process is gone before the
+    run's slow tail.  Only multi-page passes after the first restart the library.
+    """
+    log: list[str] = []
+    _log_the_finish(monkeypatch, log)
+    scanner = _SessionSpanScanner(log, passes=_SPAN_RUNS[mode][1])
+
+    result = _run_logged(tmp_path, mock_paperless, scanner, mode)
+
+    assert result.outcome is ScanOutcome.SUCCESS
+    assert log == _SPAN_LOGS[mode]
+
+
+@pytest.mark.parametrize("surface", ["worker", "cli"])
+def test_the_request_events_reach_the_scan_session(
+    surface: str,
+    tmp_path: Path,
+    mock_paperless: MagicMock,
+) -> None:
+    """
+    The request's abort and live-child Events are the session's, unchanged.
+
+    The worker passes its own; ``saneless scan`` passes neither, so its
+    session gets ``None`` for both.
+    """
+    log: list[str] = []
+    given = surface == "worker"
+    abort = threading.Event() if given else None
+    live = threading.Event() if given else None
+    scanner = _SessionSpanScanner(log, passes=((0,),))
+
+    _run_logged(tmp_path, mock_paperless, scanner, "simplex", (abort, live))
+
+    assert len(scanner.sessions) == 1
+    ((session_abort, session_live),) = scanner.sessions
+    assert session_abort is abort
+    assert session_live is live
+
+
+def test_a_failed_pass_ends_the_session_before_the_error_leaves_the_run(
+    tmp_path: Path, mock_paperless: MagicMock
+) -> None:
+    """A pass that raises still ends the session, and the error is the pass's own."""
+    log: list[str] = []
+    jam = ScanError("Document feeder jammed")
+    scanner = _SessionSpanScanner(log, passes=((0,),), fail_on={1: jam})
+
+    with pytest.raises(ScanError) as raised:
+        _run_logged(tmp_path, mock_paperless, scanner, "simplex")
+
+    assert raised.value is jam
+    assert log == ["enter", "scan", "exit"]
