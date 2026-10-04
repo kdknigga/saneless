@@ -58,6 +58,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import importlib
+import json
 import logging
 import os
 import queue
@@ -147,6 +148,15 @@ The longest log message sent, in characters.
 
 Escaped as JSON, even an all non-ASCII message stays under the protocol's
 64 KiB header limit.
+"""
+
+_MAX_FAILURE_TEXT_BYTES: Final = 16_000
+"""
+The longest an error frame's message or next step may escape to, as JSON.
+
+Two of them, with the type name and the rest of the frame, stay well under
+the protocol's 64 KiB header limit, so a long or device-supplied text never
+stops the error itself from being sent.
 """
 
 _CONTROL_THREAD_NAME: Final = "saneless-scan-control"
@@ -672,11 +682,32 @@ def _settings(raw: Mapping[str, str | int]) -> ScanSettings:
     )
 
 
+def _fit(text: str, limit: int) -> str:
+    """
+    Cut ``text`` short until it escapes, as JSON, to at most ``limit`` bytes.
+
+    Returns:
+        ``text`` itself when it fits, otherwise its longest start that does.
+
+    """
+    size = len(json.dumps(text, ensure_ascii=True))
+    while size > limit:
+        # Each pass keeps a share of the characters in proportion to the
+        # bytes allowed, and always at least one fewer, so it soon fits.
+        keep = min(len(text) - 1, len(text) * limit // size)
+        text = text[:keep]
+        size = len(json.dumps(text, ensure_ascii=True))
+    return text
+
+
 def _failure(
     exc: Exception, stage: ScanStage, page: int | None, *, fatal: bool
 ) -> ChildFailure:
     """
     Describe an exception as the error frame saneless reads.
+
+    The message and the next step are cut short to fit the frame, so a long
+    text, such as a device's list of its sources, cannot stop it being sent.
 
     Returns:
         The frame: saneless's own errors with their text and next step,
@@ -689,8 +720,10 @@ def _failure(
         message, next_step = describe(exc), None
     return ChildFailure(
         type_name=type(exc).__name__,
-        message=message,
-        next_step=next_step,
+        message=_fit(message, _MAX_FAILURE_TEXT_BYTES),
+        next_step=None
+        if next_step is None
+        else _fit(next_step, _MAX_FAILURE_TEXT_BYTES),
         stage=stage.value,
         page=page,
         fatal=fatal,
@@ -861,8 +894,9 @@ def main(
 
     Returns:
         0 after ``bye``, or when saneless has gone; 1 after a fatal error
-        frame; 2 after a command off the schema; 3 when a reply could not
-        be written because saneless had gone or a page was cut short.
+        frame, or an exception no error frame could carry; 2 after a command
+        off the schema; 3 when a reply could not be written because saneless
+        had gone or a page was cut short.
 
     """
     reply = _ReplyChannel(reply_fd, forward_logs=forward_logs)
@@ -871,25 +905,42 @@ def main(
         return _serve(reply, control, runtime)
     except _ReplyClosedError:
         return _PARENT_GONE_STATUS
+    except Exception as exc:
+        # Raised outside any pass, or while its error frame was sent: saneless
+        # sees the child end with this status, and stderr names the type.
+        _note_unexpected(exc)
+        return _FAILED_STATUS
     finally:
         control.main_done.set()
 
 
+def _note_unexpected(exc: BaseException) -> None:
+    """Tell stderr, by type only, what ended the child unexpectedly."""
+    line = f"saneless scan child: ended by {type(exc).__name__}\n"
+    with contextlib.suppress(OSError):
+        os.write(_STDERR_FD, line.encode("ascii", "replace"))
+
+
 if __name__ == "__main__":
-    reply_channel_fd = take_reply_fd()
-    prepare_process()
-    status = main(
-        sys.stdin.buffer,
-        reply_channel_fd,
-        ChildRuntime(
-            arm_alarm=signal.alarm,
-            exit_process=os._exit,
-            grace_seconds=_PARENT_GONE_GRACE_SECONDS,
-        ),
-        forward_logs=True,
-    )
-    # Every frame is written, so skip teardown, whose crash or hang would
-    # turn a good session into a failed one.  The kernel closes the sockets
-    # and USB handles.
-    flush_standard_streams()
-    os._exit(status)
+    exit_status = _FAILED_STATUS
+    try:
+        reply_channel_fd = take_reply_fd()
+        prepare_process()
+        exit_status = main(
+            sys.stdin.buffer,
+            reply_channel_fd,
+            ChildRuntime(
+                arm_alarm=signal.alarm,
+                exit_process=os._exit,
+                grace_seconds=_PARENT_GONE_GRACE_SECONDS,
+            ),
+            forward_logs=True,
+        )
+    except BaseException as exc:
+        _note_unexpected(exc)
+    finally:
+        # Every frame is written, so skip teardown, whose crash or hang would
+        # turn a good session into a failed one.  The kernel closes the
+        # sockets and USB handles.
+        flush_standard_streams()
+        os._exit(exit_status)

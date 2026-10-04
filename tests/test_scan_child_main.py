@@ -858,6 +858,77 @@ def test_a_scan_error_keeps_its_next_step(
     assert child.join() == 0
 
 
+def test_a_scan_error_too_long_for_a_frame_is_sent_cut_short(
+    fake: FakeSaneModule,
+    child: _ChildHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An error whose text would not fit a frame is still sent, cut short.
+
+    Device-supplied text, such as a list of sources, can make a message of
+    any length; escaped as JSON, these characters take twelve bytes each.
+    """
+    message = "\N{GRINNING FACE}" * 100_000
+    next_step = "\N{GRINNING FACE}" * 100_000
+
+    def failing_pass(
+        device_id: str, settings: ScanSettings, outlet: PageOutlet
+    ) -> object:
+        outlet.stage(ScanStage.CONFIGURE, None)
+        del device_id, settings
+        raise ScanError(message, next_step=next_step)
+
+    monkeypatch.setattr(scan_session_mod, "run_pass", failing_pass)
+    _ready(child)
+    assert fake.init_call_count == 1
+
+    child.send(_scan())
+    failure = child.frames_until(ChildFailure)[-1]
+    child.send(ControlOp.EXIT)
+
+    assert isinstance(failure, ChildFailure)
+    assert (failure.type_name, failure.stage, failure.fatal) == (
+        "ScanError",
+        "configure",
+        False,
+    )
+    assert failure.message
+    assert message.startswith(failure.message)
+    assert failure.next_step
+    assert next_step.startswith(failure.next_step)
+    assert child.frame() == Bye()
+    assert child.join() == 0
+
+
+def test_an_exception_outside_any_pass_ends_main_with_the_failed_status(
+    fake: FakeSaneModule,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An exception no error frame carries ends ``main`` with status 1.
+
+    It never escapes ``main``, where the process would end through the
+    teardown the child skips; stderr names its type.
+    """
+
+    def no_thread(control: scan_child_main._Control) -> None:
+        del control
+        msg = "can't start new thread"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(scan_child_main._Control, "start", no_thread)
+
+    with _ChildHarness() as child:
+        _ready(child)
+        status = child.join()
+
+    assert fake.init_call_count == 1
+    assert status == scan_child_main._FAILED_STATUS
+    assert "ended by RuntimeError" in capfd.readouterr().err
+
+
 def test_a_cap_reached_travels_in_pass_done(
     fake: FakeSaneModule,
     child: _ChildHarness,
