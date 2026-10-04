@@ -74,9 +74,12 @@ def test_a_command_that_does_not_serve_loads_no_web_stack(
     ``jobs`` and ``doctor`` run to the end without FastAPI, Starlette or uvicorn.
 
     The command bodies run, not only their ``--help``, so an import made inside
-    a body is seen.  The child reads an empty config file named on the command
-    line, and libsane an empty backend list, so neither reaches past the test's
-    own directories.
+    a body is seen.  Each invocation is held to its own exit code and to output
+    only its body (or its help) prints, so one that stops being valid usage
+    fails here instead of passing without running.  ``doctor`` exits with the
+    config code because the empty config sets no paperless-ngx token.  The
+    child reads an empty config file named on the command line, and libsane an
+    empty backend list, so neither reaches past the test's own directories.
 
     Args:
         tmp_path: Holds the config file and the empty SANE configuration.
@@ -94,14 +97,18 @@ def test_a_command_that_does_not_serve_loads_no_web_stack(
         from click.testing import CliRunner
 
         from saneless.cli import cli
+        from saneless.vocabulary import ExitCode
 
         runner = CliRunner()
-        for args in (["jobs"], ["jobs", "--json"], ["doctor"], ["doctor", "--help"]):
+        for args, code, marker in (
+            (["jobs"], ExitCode.SUCCESS, "Timestamp"),
+            (["jobs", "--json"], ExitCode.SUCCESS, "[]"),
+            (["doctor"], ExitCode.CONFIG, "Config files searched"),
+            (["doctor", "--help"], ExitCode.SUCCESS, "Show this message and exit."),
+        ):
             result = runner.invoke(cli, ["--config", {str(config)!r}, *args])
-            assert result.exception is None or isinstance(
-                result.exception, SystemExit
-            ), (args, result.output, result.exception)
-            assert result.exit_code in (0, 2), (args, result.output)
+            assert result.exit_code == code, (args, result.output, result.exception)
+            assert marker in result.output, (args, result.output)
         """
     )
 
