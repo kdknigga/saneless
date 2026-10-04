@@ -1,6 +1,7 @@
 {# poll_url and poll_interval come from status_view.with_poll, which builds
-   the URL with status_view.poll_url; this template composes no URL.  The poll carries the token of what this rendering shows,
-   so an unchanged poll is answered 204 and focus inside the area stays put.
+   the URL with status_view.poll_url; this template composes no URL.  The
+   poll carries the token of what this rendering shows, so an unchanged poll
+   is answered 204 and focus inside the area stays put.
 
    tabindex="-1" is on every rendering because htmx restores focus by id only
    to a focusable element.  autofocus is only on an action's response: on a
