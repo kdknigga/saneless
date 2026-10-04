@@ -254,7 +254,7 @@ See docs/explanation/decisions/NNNN-slug.md.
 A test in `tests/test_deployment_config.py` fails on a pointer to a record that does
 not exist and on a record the index does not list.
 
-Two conventions that the code used to argue for in its own comments:
+Two conventions the code follows without restating them at each site:
 
 - The coordinator seams and the scanner backend are `abc.ABC` classes, not
   `typing.Protocol`. A `Protocol` describes a shape this project does not own, such as
@@ -289,8 +289,9 @@ site.
   the rule. Where every interpolated fragment is a module constant and every value is
   a bound parameter, the module gets an `S608` entry under `per-file-ignores` that
   says so, as `src/saneless/job.py` does.
-- `S603` accepts a subprocess argv only when it is written out as a literal at the
-  call. Variable parts reach the child through its environment, not through the argv.
+- `S603` accepts a subprocess argv only when every element is a literal or
+  `sys.executable`. Variable parts reach the child through its environment, not
+  through the argv.
 - The `PTH` rules ask for the `pathlib` equivalent of an `os` or `open()` call; use it
   rather than suppress the rule. `PTH105` forbids `os.replace`: rename with
   `Path.replace`, which is the same atomic, overwriting `rename(2)`.
