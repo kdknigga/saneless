@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx2
 
+from saneless import paperless
 from saneless.config import (
     CONFIG_FILENAME,
     LEGACY_CONFIG_FILENAME,
@@ -43,7 +44,6 @@ from saneless.exceptions import (
     ListingNoAnswerError,
     ListingTimedOutError,
 )
-from saneless.paperless import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.private_dirs import check_private_dir
 from saneless.scanner import saned_probe
 from saneless.scanner.base import DeviceSurvey
@@ -1622,8 +1622,8 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     else:
         probe = client.probe_connection(
             timeout=httpx2.Timeout(
-                PROBE_READ_SECONDS,
-                connect=PROBE_CONNECT_SECONDS,
+                paperless.PROBE_READ_SECONDS,
+                connect=paperless.PROBE_CONNECT_SECONDS,
             )
         )
         status = probe.status
