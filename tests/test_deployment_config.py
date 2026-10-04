@@ -2757,11 +2757,46 @@ def test_the_citation_hook_excludes_only_the_samples_module() -> None:
 ADR_POINTER = re.compile(r"docs/explanation/decisions/[0-9]{4}-[a-z0-9-]+\.md")
 _ADR_FILE = re.compile(r"[0-9]{4}-[a-z0-9-]+\.md")
 _ADR_INDEX = "README.md"
+# Anything that starts like a pointer, so a mistyped one is checked rather than
+# passed over: a pointer that is not the record shape, or names no file, is
+# reported.  The directory itself, the index and the placeholder that
+# CONTRIBUTING.md shows the form with are the only other paths allowed.
+_POINTER_LIKE = re.compile(r"docs/explanation/decisions?/[^\s`'\"()\[\]<>]*")
+_POINTER_TRAILING = ".,;:"
+_NOT_A_POINTER = frozenset(
+    {
+        _DECISIONS_PREFIX,
+        _DECISIONS_PREFIX + _ADR_INDEX,
+        _DECISIONS_PREFIX + "NNNN-slug.md",
+    }
+)
+
+
+def _bad_pointers(line: str, root: Path) -> list[str]:
+    """
+    Return every pointer-like path in ``line`` that names no decision record.
+
+    Args:
+        line: One line of a checked file.
+        root: The directory the cited paths are relative to.
+
+    Returns:
+        Each offending path, with trailing sentence punctuation removed.
+
+    """
+    found: list[str] = []
+    for raw in _POINTER_LIKE.findall(line):
+        pointer = raw.rstrip(_POINTER_TRAILING)
+        if pointer in _NOT_A_POINTER:
+            continue
+        if not ADR_POINTER.fullmatch(pointer) or not (root / pointer).is_file():
+            found.append(pointer)
+    return found
 
 
 def _dangling_adr_pointers(names: list[str], root: Path) -> list[str]:
     """
-    Return every decision-record path cited in ``names`` that does not exist.
+    Return every decision-record path cited in ``names`` that is malformed or missing.
 
     A file that cannot be read is reported too, for the reason
     ``_citation_offenders`` gives: unchecked is not clean.
@@ -2790,8 +2825,7 @@ def _dangling_adr_pointers(names: list[str], root: Path) -> list[str]:
         offenders.extend(
             f"{name}:{number}: {pointer}"
             for number, line in enumerate(text.splitlines(), start=1)
-            for pointer in ADR_POINTER.findall(line)
-            if not (root / pointer).is_file()
+            for pointer in _bad_pointers(line, root)
         )
     return offenders
 
@@ -2867,6 +2901,59 @@ def test_the_adr_pointer_check_reports_a_missing_decision(tmp_path: Path) -> Non
     offenders = _dangling_adr_pointers(["src/a.py", "src/b.py"], tmp_path)
 
     assert offenders == ["src/a.py" + ":1: " + missing]
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    [
+        _DECISIONS_PREFIX + "0001-Real.md",
+        _DECISIONS_PREFIX + "001-real.md",
+        "docs/explanation/decision/0001-real.md",
+        _DECISIONS_PREFIX + "0001_real.md",
+        _DECISIONS_PREFIX + "0001-real.MD",
+    ],
+    ids=[
+        "uppercase-slug",
+        "three-digits",
+        "singular-dir",
+        "underscore",
+        "upper-suffix",
+    ],
+)
+def test_the_adr_pointer_check_reports_a_malformed_pointer(
+    tmp_path: Path, pointer: str
+) -> None:
+    """
+    A mistyped pointer is reported even when a file answers to it.
+
+    Each malformed path is also written as a file, so only the shape can be
+    what reports it.
+
+    Args:
+        tmp_path: The tree the pointer is resolved in.
+        pointer: A path that looks like a pointer but is not the record shape.
+
+    """
+    (tmp_path / pointer).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / pointer).write_text("# Mistyped\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text(f"# See `{pointer}`.\n", encoding="utf-8")
+
+    assert _dangling_adr_pointers(["a.py"], tmp_path) == ["a.py" + ":1: " + pointer]
+
+
+def test_the_adr_pointer_check_allows_the_directory_index_and_placeholder(
+    tmp_path: Path,
+) -> None:
+    """The decisions directory, its index and the documented placeholder pass."""
+    decisions = tmp_path / _DECISIONS_PREFIX
+    decisions.mkdir(parents=True)
+    (decisions / _ADR_INDEX).write_text("# Decisions\n", encoding="utf-8")
+    (tmp_path / "a.md").write_text(
+        "".join(f"Under `{path}`.\n" for path in sorted(_NOT_A_POINTER)),
+        encoding="utf-8",
+    )
+
+    assert _dangling_adr_pointers(["a.md"], tmp_path) == []
 
 
 def test_the_adr_pointer_check_reports_a_file_it_cannot_read(tmp_path: Path) -> None:
