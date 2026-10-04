@@ -2357,6 +2357,8 @@ class FakeSaneModule:
 
         """
         self.init_call_count = 0
+        # A listing child's start, kept apart from this process's own.
+        self.child_init_call_count = 0
         self.exit_call_count = 0
         # Counted for the same reason FakeSaneDev records its own calls: the
         # wedge refusal has to happen *before* any SANE traffic, and
@@ -2402,6 +2404,23 @@ class FakeSaneModule:
             raise self._init_error
         major, minor, build = _SANE_VERSION
         return (major << 24 | minor << 16 | build, major, minor, build)
+
+    def init_in_child(self) -> None:
+        """
+        Start SANE as a listing child does, apart from this process's SANE.
+
+        A child initialises its own copy of the library, so the call is
+        counted in ``child_init_call_count`` and never in ``init_call_count``,
+        which records this process's own starts.  It fails with the
+        configured ``init_error``, as ``init()`` does.
+
+        Raises:
+            BaseException: The configured ``init_error``.
+
+        """
+        self.child_init_call_count += 1
+        if self._init_error is not None:
+            raise self._init_error
 
     def get_devices(self) -> list[tuple[str, str, str, str]]:
         """

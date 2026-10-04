@@ -828,9 +828,11 @@ def listing_seam(
             "alarm": 0,
         }
         # The child initialises its own SANE and reports a failure to start as
-        # data, from the same boundary, so the seam does the same.
+        # data, from the same boundary, so the seam does the same.  The fake
+        # counts a child's start apart from this process's own.
+        start = getattr(module, "init_in_child", module.init)
         try:
-            module.init()
+            start()
         except Exception as exc:
             reply = _listing_child.start_failure_reply(child_request, exc)
         else:
