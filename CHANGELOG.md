@@ -39,6 +39,16 @@ The first release, 0.2.0.
 - This documentation site, at
   [kdknigga.github.io/saneless](https://kdknigga.github.io/saneless/).
 
+### Changed
+
+- Three groups of log lines carry a new logger name, so a log filter or alert
+  keyed on the name the release candidates used needs updating: the
+  `Auto-profiles:` lines now come from `saneless.startup_profiles` (was
+  `saneless.worker`), the manual-duplex warnings about mismatched resolutions
+  and a backs pass stopped at its page cap from `saneless.duplex` (was
+  `saneless.pipeline`), and the saned pre-probe lines from
+  `saneless.scanner.saned_probe` (was `saneless.checks`).
+
 ### Security
 
 - The web UI has no login, by design: it is an appliance for a trusted local
