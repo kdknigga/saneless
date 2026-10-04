@@ -48,9 +48,10 @@ option reads and writes) stops the control thread too, so an alarm is armed
 before every stage that calls into SANE and cleared while the child is idle;
 the default action for ``SIGALRM`` ends the process even inside a blocking C
 call.  The alarms outlast saneless's own deadlines, so they only ever fire
-for a child whose parent has died.  libsane can set SIGPIPE back to its
-default action, so the main thread ignores it again after starting SANE,
-after each pass and after each restart.
+for a child whose parent has died.  libsane sets SIGPIPE back to its
+default action inside SANE calls, so the main thread ignores it again before
+every frame it writes, and a write to a saneless that has gone fails instead
+of killing the child before it cancels and closes the device.
 
 Log records of saneless's own loggers travel to saneless as ``log`` frames,
 at the level saneless asked for.  The child ends with ``os._exit`` once its
@@ -228,8 +229,9 @@ class ChildRuntime:
         exit_process: Ends the process at once with a status: ``os._exit``.
         grace_seconds: How long the main thread has to end once stdin ends,
             before the process is ended.
-        ignore_sigpipe: Sets SIGPIPE to be ignored again, from the main
-            thread: ``_ignore_sigpipe`` in the real child.
+        ignore_sigpipe: Sets SIGPIPE to be ignored again, called before
+            every frame the thread running ``main`` writes:
+            ``_ignore_sigpipe`` in the real child.
 
     """
 
@@ -244,9 +246,22 @@ def _ignore_sigpipe() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
+def _keep_sigpipe() -> None:
+    """Leave SIGPIPE as it is: the default for a channel no test watches."""
+
+
 class _ReplyChannel:
     """
     The private pipe to saneless, written under one lock.
+
+    libsane sets SIGPIPE back to its default action inside SANE calls, after
+    a read that fails and after one that succeeds, so a write to a saneless
+    that has gone would kill the child before it could cancel and close the
+    device.  The channel therefore ignores SIGPIPE again before every frame
+    it writes from the thread that made it, the one that runs ``main`` and
+    makes every SANE call; only that thread may set a signal's action.  No
+    other thread writes: the control thread sends nothing, and the log
+    forwarder drops a record logged on any other thread.
 
     Attributes:
         forward_logs: Whether saneless's log records are sent as frames.
@@ -254,19 +269,39 @@ class _ReplyChannel:
 
     """
 
-    def __init__(self, fd: int, *, forward_logs: bool = False) -> None:
+    def __init__(
+        self,
+        fd: int,
+        *,
+        forward_logs: bool = False,
+        ignore_sigpipe: Callable[[], object] = _keep_sigpipe,
+    ) -> None:
         """
-        Wrap the reply descriptor.
+        Wrap the reply descriptor, for the calling thread to write.
 
         Args:
             fd: The descriptor; the caller keeps ownership.
             forward_logs: Whether log records are to be forwarded.
+            ignore_sigpipe: Sets SIGPIPE to be ignored again; called before
+                each frame the calling thread writes.
 
         """
         self._fd = fd
         self._lock = threading.Lock()
         self._torn = False
+        self._owner = threading.get_ident()
+        self._ignore_sigpipe = ignore_sigpipe
         self.forward_logs = forward_logs
+
+    def on_owner_thread(self) -> bool:
+        """
+        Report whether the calling thread is the one that made the channel.
+
+        Returns:
+            True on the thread that runs ``main``.
+
+        """
+        return threading.get_ident() == self._owner
 
     def send(self, frame: Frame) -> None:
         """
@@ -281,6 +316,7 @@ class _ReplyChannel:
         """
         header = encode_frame(frame)
         with self._lock:
+            self._before_frame()
             self._write(header)
 
     def send_page(self, header: PageHeader, strips: Iterable[bytes]) -> None:
@@ -301,6 +337,7 @@ class _ReplyChannel:
         """
         data = encode_frame(header)
         with self._lock:
+            self._before_frame()
             self._write(data)
             try:
                 for strip in strips:
@@ -311,6 +348,11 @@ class _ReplyChannel:
                 self._torn = True
                 _note_cut_short(exc)
                 raise
+
+    def _before_frame(self) -> None:
+        """Ignore SIGPIPE again, on the owner thread, before a frame."""
+        if self.on_owner_thread():
+            self._ignore_sigpipe()
 
     def _write(self, data: bytes) -> None:
         """
@@ -363,10 +405,15 @@ class _LogForwarder(logging.Handler):
         """
         Send one record, at the nearest standard level at or below its own.
 
+        A record logged on any thread but the one that runs ``main`` is
+        dropped: that thread could not ignore SIGPIPE before the write.
+
         Args:
             record: The record.
 
         """
+        if not self._reply.on_owner_thread():
+            return
         try:
             message = _fit(self.format(record), _MAX_LOG_BYTES)
             self._reply.send(
@@ -819,7 +866,7 @@ def _scan(
         install_log_forwarding(reply, command.log_level)
     outlet = _ChildOutlet(reply, control, runtime)
     try:
-        outcome = _run_pass(command.device, settings, outlet, runtime)
+        outcome = scan_session.run_pass(command.device, settings, outlet)
     except scan_session.PassStopped:
         runtime.arm_alarm(0)
         if outlet.bad_command:
@@ -851,32 +898,9 @@ def _scan(
     return None
 
 
-def _run_pass(
-    device: str,
-    settings: ScanSettings,
-    outlet: _ChildOutlet,
-    runtime: ChildRuntime,
-) -> scan_session.PassOutcome:
-    """
-    Run one pass, and ignore SIGPIPE again however it ends.
-
-    Returns:
-        What the pass returned.
-
-    """
-    try:
-        return scan_session.run_pass(device, settings, outlet)
-    finally:
-        # libsane sets SIGPIPE back to its default action after a failed
-        # read, which ends every feeder pass.  It is ignored again before the
-        # child's next write, so a write to a saneless that has gone fails
-        # and the child ends through its own cleanup instead of dying.
-        runtime.ignore_sigpipe()
-
-
 def _restart(reply: _ReplyChannel, runtime: ChildRuntime) -> int | None:
     """
-    Restart SANE between passes, and ignore SIGPIPE again after it.
+    Restart SANE between passes.
 
     Returns:
         None when the child stays ready, or ``_FAILED_STATUS``.
@@ -886,10 +910,8 @@ def _restart(reply: _ReplyChannel, runtime: ChildRuntime) -> int | None:
     try:
         scan_session.restart_library()
     except Exception as exc:
-        runtime.ignore_sigpipe()
         reply.send(_failure(exc, ScanStage.RESTART, None, fatal=True))
         return _FAILED_STATUS
-    runtime.ignore_sigpipe()
     reply.send(Restarted())
     runtime.arm_alarm(0)
     return None
@@ -905,7 +927,6 @@ def _serve(reply: _ReplyChannel, control: _Control, runtime: ChildRuntime) -> in
     """
     runtime.arm_alarm(_STAGE_ALARM_SECONDS)
     failure = _start_library()
-    runtime.ignore_sigpipe()
     if failure is not None:
         reply.send(_failure(failure, ScanStage.STARTUP, None, fatal=True))
         return _FAILED_STATUS
@@ -969,7 +990,9 @@ def main(
         had gone or a page was cut short.
 
     """
-    reply = _ReplyChannel(reply_fd, forward_logs=forward_logs)
+    reply = _ReplyChannel(
+        reply_fd, forward_logs=forward_logs, ignore_sigpipe=runtime.ignore_sigpipe
+    )
     control = _Control(commands, runtime)
     try:
         return _serve(reply, control, runtime)

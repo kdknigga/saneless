@@ -3,9 +3,9 @@ Keep SIGPIPE blocked, so a write to a vanished peer raises instead of killing.
 
 Python ignores SIGPIPE, but a C library can put it back to its default action
 at the C level while ``signal.getsignal`` still reports ``SIG_IGN``, as libsane
-does after a scan read that ends with an error status.  A write to a peer that
-has gone, such as a paperless upload or a web client that hung up, would then
-end the whole process silently.  A blocked SIGPIPE stays pending whatever the
+does when it ends a scan read, whether the read succeeded or failed.  A write to
+a peer that has gone, such as a paperless upload or a web client that hung up,
+would then end the whole process silently.  A blocked SIGPIPE stays pending whatever the
 disposition, and the write fails with EPIPE, raised as ``BrokenPipeError``.
 
 The blocked mask belongs to a thread and is copied to every thread it starts,

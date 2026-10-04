@@ -1,18 +1,22 @@
 """
-A dead peer never kills saneless with SIGPIPE.
+A dead peer never kills saneless, or a scan child, with SIGPIPE.
 
-libsane puts SIGPIPE back to its default action, behind Python's back, whenever
-a read ends with an error status, the end of every feeder batch included, and a
-write to a socket whose peer has gone would then end the process with no
-traceback.  saneless makes no libsane call itself: every scan runs in a scan
-child.  One libsane test confirms the reset still happens, in a real scan
-child whose read fails, so the hazard these tests guard against is real.
-Another runs a process that blocks SIGPIPE as saneless does, scans through a
-real scan child whose read fails, and then writes to a closed peer; it must
-get ``BrokenPipeError`` and must never have loaded python-sane.  A blocked
-mask is inherited across fork and exec, so the listing and scan child tests
-block SIGPIPE first, as a launching thread in saneless has it, and check that
-the child starts with it unblocked.
+libsane puts SIGPIPE back to its default action, behind Python's back, when it
+ends a scan read: after a read that succeeds, and in the cancel after one that
+fails, the end of every feeder batch included.  A write to a pipe or socket
+whose peer has gone would then end the process with no traceback.  saneless
+makes no libsane call itself: every scan runs in a scan child.  One libsane
+test confirms the reset still happens, in a real scan child, so the hazard
+these tests guard against is real.  Others close saneless's end of a real scan
+child's reply pipe, during a pass and after one whose read failed: the child
+ignores SIGPIPE again before every reply, so it must end with the status for
+a closed reply channel, not die from the signal.  Another runs a process that
+blocks SIGPIPE as saneless does, scans through a real scan child whose read
+fails, and then writes to a closed peer; it must get ``BrokenPipeError`` and
+must never have loaded python-sane.  A blocked mask is inherited across fork
+and exec, so the listing and scan child tests block SIGPIPE first, as a
+launching thread in saneless has it, and check that the child starts with it
+unblocked.
 """
 
 from __future__ import annotations
@@ -139,10 +143,11 @@ with open({record!r}, "w", encoding="ascii") as record:
 """
 
 
-# The real scan child, run as it is, except that each pass also records the
-# child's ignored-signal mask, as libsane leaves it at the pass's end, in the file
-# SCAN_TEST_SIGIGN names.  The variable has no SANELESS_ prefix, so the child
-# environment's strip keeps it.
+# The real scan child, run as it is, except that it records the child's
+# ignored-signal mask, as libsane leaves it, once a sheet's read has returned or
+# failed and once the device is cancelled at the pass's end, just before the
+# close is reported, in the file SCAN_TEST_SIGIGN names.  The variable has no
+# SANELESS_ prefix, so the child environment's strip keeps it.
 _SIGIGN_RECORDING_CHILD: Final = """\
 import os
 import signal
@@ -151,20 +156,33 @@ from pathlib import Path
 
 from saneless.scanner import _scan_child as child
 
-real_run_pass = child.scan_session.run_pass
+real_snap_sheet = child.scan_session._snap_sheet
+real_report_quietly = child.scan_session._report_quietly
 
 
-def recording_run_pass(*args):
+def record(point):
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            if line.startswith("SigIgn:"):
+                with Path(os.environ["SCAN_TEST_SIGIGN"]).open("a") as out:
+                    out.write(f"{point} {line.split()[1]}\\n")
+
+
+def recording_snap_sheet(*args):
     try:
-        return real_run_pass(*args)
+        return real_snap_sheet(*args)
     finally:
-        with open("/proc/self/status", encoding="ascii") as status:
-            for line in status:
-                if line.startswith("SigIgn:"):
-                    Path(os.environ["SCAN_TEST_SIGIGN"]).write_text(line.split()[1])
+        record("read")
 
 
-child.scan_session.run_pass = recording_run_pass
+def recording_report_quietly(outlet, stage):
+    if stage is child.ScanStage.CLOSE:
+        record("cancel")
+    return real_report_quietly(outlet, stage)
+
+
+child.scan_session._snap_sheet = recording_snap_sheet
+child.scan_session._report_quietly = recording_report_quietly
 reply_fd = child.take_reply_fd()
 child.prepare_process()
 code = child.main(
@@ -202,26 +220,43 @@ def _failing_read_config(tmp_path: Path, status: str) -> Path:
 
 @pytest.mark.sane_hardware
 @pytest.mark.parametrize(
-    "status",
-    ["SANE_STATUS_NO_DOCS", "SANE_STATUS_CANCELLED"],
-    ids=["NO_DOCS", "CANCELLED"],
+    ("status", "reset_at"),
+    [
+        ("SANE_STATUS_NO_DOCS", "cancel"),
+        ("SANE_STATUS_CANCELLED", "cancel"),
+        (None, "read"),
+    ],
+    ids=["NO_DOCS", "CANCELLED", "GOOD"],
 )
-def test_a_failed_libsane_read_resets_sigpipe_in_the_scan_child(
-    status: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_libsane_read_resets_sigpipe_in_the_scan_child(
+    status: str | None,
+    reset_at: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A read that fails in a real scan child leaves SIGPIPE no longer ignored.
+    A read in a real scan child leaves SIGPIPE no longer ignored.
 
-    This is the hazard itself: if libsane stopped resetting SIGPIPE, the
-    reason to keep it out of saneless would be gone, and this test says so.
+    This is the hazard itself.  A read that succeeds resets it as it returns;
+    one that fails resets it in the cancel that ends its reader, just before
+    the pass reports its close.  If libsane stopped resetting SIGPIPE, the
+    reason to keep it out of saneless, and to ignore it again before each of
+    the child's replies, would be gone, and this test says so.
 
     Args:
-        status: The status the test backend ends its read with.
+        status: The status the test backend ends its read with, or None for
+            a read that succeeds.
+        reset_at: Where the reset is first seen: once the read has returned,
+            or once the device is cancelled.
         tmp_path: Holds the SANE configuration, the stand-in and the mask.
         monkeypatch: Points the session at the recording child.
 
     """
-    config = _failing_read_config(tmp_path, status)
+    config = (
+        _plain_config(tmp_path)
+        if status is None
+        else _failing_read_config(tmp_path, status)
+    )
     record = tmp_path / "sigign"
     child_file = tmp_path / "sigign_recording_child.py"
     child_file.write_text(_SIGIGN_RECORDING_CHILD, encoding="utf-8")
@@ -232,13 +267,19 @@ def test_a_failed_libsane_read_resets_sigpipe_in_the_scan_child(
     sink = SpooledPageSink(tmp_path, _SPOOL_LABEL_A, 0)
 
     with ScanChildSession(lambda: scan_child.start_scan_child("")) as session:
-        with pytest.raises(ScanError):
+        if status is None:
             session.scan_pass("test:0", settings, sink)
+        else:
+            with pytest.raises(ScanError):
+                session.scan_pass("test:0", settings, sink)
         killed = session.children_killed
 
     assert killed == 0
-    ignored = int(record.read_text(encoding="ascii"), 16)
-    assert not ignored & _SIGPIPE_BIT, f"child SigIgn {ignored:#x}"
+    masks = dict(
+        line.split() for line in record.read_text(encoding="ascii").splitlines()
+    )
+    ignored = int(masks[reset_at], 16)
+    assert not ignored & _SIGPIPE_BIT, f"child SigIgn after the {reset_at} {ignored:#x}"
 
 
 def _wait_readable(fd: int) -> None:

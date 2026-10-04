@@ -13,6 +13,7 @@ hanging it.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import select
@@ -34,6 +35,7 @@ from saneless.scanner import page_budget, scan_child
 from saneless.scanner.base import PassCapReached, ScanSettings
 from saneless.scanner.scan_protocol import (
     CHILD_LOGGERS,
+    LENGTH_PREFIX,
     Bye,
     ChildFailure,
     Configured,
@@ -750,26 +752,54 @@ def test_the_alarm_is_armed_before_every_libsane_stage(
     ]
 
 
-def test_sigpipe_is_ignored_again_after_every_libsane_stage_before_a_reply(
+def _header_shape(data: bytes) -> str | None:
+    """
+    Name the frame whose header ``data`` is, if it is one.
+
+    Returns:
+        ``_shape``'s name for the frame, or None for page pixels.
+
+    """
+    if len(data) < LENGTH_PREFIX.size:
+        return None
+    (length,) = LENGTH_PREFIX.unpack_from(data)
+    if length != len(data) - LENGTH_PREFIX.size:
+        return None
+    payload = json.loads(data[LENGTH_PREFIX.size :])
+    stage, page = payload.get("stage"), payload.get("page")
+    if payload["kind"] == "stage":
+        return f"stage {stage}" if page is None else f"stage {stage} {page}"
+    if payload["kind"] == "page":
+        return f"page {payload['number']}"
+    if payload["kind"] == "error":
+        return f"error {payload['type_name']}"
+    return str(payload["kind"])
+
+
+def test_sigpipe_is_ignored_again_before_every_reply(
     fake: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    SIGPIPE is ignored again after start-up, every pass and a restart.
+    SIGPIPE is ignored again right before every frame the child writes.
 
-    libsane sets it back to its default action after a failed read, so each
-    ignore must come once the stage's last SANE call has returned and before
-    the child's next reply: a one-page pass, a pass that finds the feeder
-    empty, then a restart.  Stage reports are left out of the record.
+    libsane sets it back to its default action inside a SANE call, after a
+    read that succeeds and in the cancel after one that fails, and a pass
+    writes stages, pages and its cleanup's reports in between.  So each
+    frame, stage reports included, must follow an ignore with nothing in
+    between: a one-page pass, a pass that finds the feeder empty, then a
+    restart.  Page pixels follow their header with no ignore of their own:
+    no SANE call runs while they are written.
     """
     events: list[str] = []
-    real_send = scan_child_main._ReplyChannel.send
+    real_write = scan_child_main._ReplyChannel._write
 
-    def recording_send(reply: scan_child_main._ReplyChannel, frame: Frame) -> None:
-        if not isinstance(frame, LogLine | StageFrame | Configured):
-            events.append(f"send {_shape([frame])[0]}")
-        real_send(reply, frame)
+    def recording_write(reply: scan_child_main._ReplyChannel, data: bytes) -> None:
+        shape = _header_shape(data)
+        if shape is not None:
+            events.append(f"send {shape}")
+        real_write(reply, data)
 
-    monkeypatch.setattr(scan_child_main._ReplyChannel, "send", recording_send)
+    monkeypatch.setattr(scan_child_main._ReplyChannel, "_write", recording_write)
     fake.device.load_feeder([_content_image(0)])
     with _ChildHarness(events=events) as child:
         _ready(child)
@@ -783,37 +813,69 @@ def test_sigpipe_is_ignored_again_after_every_libsane_stage_before_a_reply(
         assert child.frame() == Bye()
         assert child.join() == 0
 
-    stage, read, ignore = f"alarm {_STAGE}", f"alarm {_READ}", "ignore sigpipe"
-    assert events == [
-        stage,  # start-up
-        ignore,
+    sends = [event for event in events if event.startswith("send ")]
+    assert sends == [
         "send ready",
-        "alarm 0",
-        stage,  # open
-        stage,  # configure
-        read,  # start 1
-        read,  # read 1
-        "alarm 0",  # waiting for page 1's answer
-        read,  # start 2: the end of the feed
-        stage,  # cancel
-        stage,  # close
-        ignore,
-        "alarm 0",
-        "send pass_done",
-        stage,  # open
-        stage,  # configure
-        read,  # start 1: the feeder is empty
-        stage,  # cancel
-        stage,  # close
-        ignore,
-        "alarm 0",
+        *(f"send {shape}" for shape in _feeder_pass_shape(1)),
+        "send stage open",
+        "send stage configure",
+        "send configured",
+        "send stage start 1",
+        "send stage cancel",
+        "send stage close",
         "send error FeederEmptyError",
-        stage,  # restart
-        ignore,
         "send restarted",
-        "alarm 0",
         "send bye",
     ]
+    unguarded = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.startswith("send ") and events[index - 1] != "ignore sigpipe"
+    ]
+    assert not unguarded, events
+    assert events.count("ignore sigpipe") == len(sends)
+
+
+def test_a_record_logged_off_the_main_thread_is_not_forwarded() -> None:
+    """
+    Only the thread that made the reply channel writes to it.
+
+    Another thread cannot ignore SIGPIPE again first, so a record it logs is
+    dropped instead of written.
+    """
+    read_fd, write_fd = os.pipe()
+    ignores: list[str] = []
+    try:
+        reply = scan_child_main._ReplyChannel(
+            write_fd, ignore_sigpipe=lambda: ignores.append("ignore")
+        )
+        handler = scan_child_main._LogForwarder(reply)
+        record = logging.LogRecord(
+            "saneless.scanner.scan_session",
+            logging.WARNING,
+            __file__,
+            1,
+            "from another thread",
+            None,
+            None,
+        )
+        other = threading.Thread(target=handler.emit, args=(record,))
+        other.start()
+        other.join(_JOIN_TIMEOUT_SECONDS)
+        readable, _, _ = select.select([read_fd], [], [], 0)
+        handler.emit(record)
+        mine = read_frame(read_fd, lambda: None, max_pixels=_MAX_PIXELS)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert not readable
+    assert mine == LogLine(
+        level=logging.WARNING,
+        logger="saneless.scanner.scan_session",
+        message="from another thread",
+    )
+    assert ignores == ["ignore"]
 
 
 def test_a_log_record_becomes_a_log_line() -> None:
