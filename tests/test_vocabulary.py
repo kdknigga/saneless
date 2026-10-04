@@ -149,8 +149,10 @@ from saneless.vocabulary import (
     sane_init_failure_message,
     scan_button_label,
     scan_child_crashed_error,
+    scan_child_ended_error,
     scan_child_no_answer_error,
     scan_child_not_started_error,
+    scan_child_out_of_time_error,
     scan_child_stopped_error,
     scan_child_unexpected_error,
     scan_hold_reason,
@@ -3638,6 +3640,20 @@ class TestScanChildSentences:
         """A crash names the signal and the stage."""
         assert scan_child_crashed_error(ScanStage.READ, 2, "SIGSEGV") == (
             "The scanning process died from SIGSEGV while reading page 2"
+        )
+
+    def test_scan_child_ended_error(self) -> None:
+        """A child that exited by itself names its status and the stage."""
+        assert scan_child_ended_error(ScanStage.OPEN, None, 1) == (
+            "The scanning process ended unexpectedly (exit status 1) while "
+            "opening the scanner"
+        )
+
+    def test_scan_child_out_of_time_error(self) -> None:
+        """A child its own time limit ended says so, not that it crashed."""
+        assert scan_child_out_of_time_error(ScanStage.READ, 2) == (
+            "The scanner stopped answering while reading page 2, and the "
+            "scanning process stopped at its own time limit"
         )
 
     def test_scan_child_unexpected_error(self) -> None:

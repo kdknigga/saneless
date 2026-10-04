@@ -149,6 +149,12 @@ What the common cases mean:
   if the scanner is still not answering. Check the link to the scanner first -- a network scanner
   that went away, a `saned` host that restarted or stopped, a USB cable -- then power-cycle the
   scanner if it keeps happening at the same step.
+- **The scanning process ended unexpectedly, or died.** The line reads `The scanning process
+  ended unexpectedly (exit status <n>)` or `The scanning process died from <signal>`, then the
+  step. saneless did not stop it: the process that talks to the scanner ended by itself, often
+  in the scanner library. Its own line on saneless's stderr names the cause by type. The pages
+  scanned before it are preserved, and the next scan starts a fresh process. If it keeps
+  happening at the same step, run the scan with `--verbose` and report it.
 
 To check that saneless can see the scanner at all, run:
 

@@ -178,8 +178,10 @@ __all__ = [
     "sane_init_failure_message",
     "scan_button_label",
     "scan_child_crashed_error",
+    "scan_child_ended_error",
     "scan_child_no_answer_error",
     "scan_child_not_started_error",
+    "scan_child_out_of_time_error",
     "scan_child_stopped_error",
     "scan_child_unexpected_error",
     "scan_hold_reason",
@@ -2919,6 +2921,44 @@ def scan_child_crashed_error(
     """
     phrase = _scan_stage_phrase(stage, page)
     return f"The scanning process died from {signal_name} {phrase}"
+
+
+def scan_child_ended_error(stage: ScanStage, page: int | None, status: int) -> str:
+    """
+    Return the error for a scan process that exited by itself, part way.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+        status: Its exit status.
+
+    Returns:
+        E.g. ``"The scanning process ended unexpectedly (exit status 1) while
+        opening the scanner"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return f"The scanning process ended unexpectedly (exit status {status}) {phrase}"
+
+
+def scan_child_out_of_time_error(stage: ScanStage, page: int | None) -> str:
+    """
+    Return the error for a scan process its own time limit ended.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+
+    Returns:
+        E.g. ``"The scanner stopped answering while reading page 2, and the
+        scanning process stopped at its own time limit"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return (
+        f"The scanner stopped answering {phrase}, and the scanning process "
+        "stopped at its own time limit"
+    )
 
 
 def scan_child_unexpected_error(

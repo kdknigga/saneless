@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -76,8 +77,10 @@ from saneless.vocabulary import (
     ScanStage,
     page_timeout_error,
     scan_child_crashed_error,
+    scan_child_ended_error,
     scan_child_no_answer_error,
     scan_child_not_started_error,
+    scan_child_out_of_time_error,
     scan_child_stopped_error,
     scan_child_unexpected_error,
 )
@@ -616,26 +619,40 @@ class ScanChildSession:
         return error
 
     def _gone(self, stage: ScanStage, page: int | None) -> ScanError:
-        """Reap a child that closed its channels, and build the error for it."""
+        """
+        Reap a child that closed its channels, and build the error for it.
+
+        Each outcome is told as it was: a child that had to be killed, one a
+        signal ended, and one that exited by itself with its status.
+        """
         status = self._finish_child(CANCEL_GRACE_SECONDS)
-        if status is not None and status < 0:
-            return self._crashed(-status, stage, page)
         if status is None:
             logger.warning(
                 "The scanning process closed its reply channel but did not exit, "
                 "so it was stopped"
             )
-        else:
-            logger.warning(
-                "The scanning process exited with status %d before it finished",
-                status,
-            )
-        return ScanError(scan_child_no_answer_error(stage, page))
+            return ScanError(scan_child_stopped_error(stage, page))
+        if status < 0:
+            return self._crashed(-status, stage, page)
+        logger.warning(
+            "The scanning process exited with status %d before it finished",
+            status,
+        )
+        return ScanError(scan_child_ended_error(stage, page, status))
 
     @staticmethod
     def _crashed(signum: int, stage: ScanStage, page: int | None) -> ScanError:
-        """Log a child a signal killed, by the signal's name only."""
+        """
+        Log a child a signal killed, by the signal's name only.
+
+        ``SIGALRM`` is the child's own time limit, not a crash, and is told so.
+        """
         name = child_launch.signal_name(signum)
+        if signum == signal.SIGALRM:
+            logger.warning(
+                "The scanning process stopped at its own time limit (%s)", stage.value
+            )
+            return ScanError(scan_child_out_of_time_error(stage, page))
         logger.warning("The scanning process died from %s (%s)", name, stage.value)
         return ScanError(scan_child_crashed_error(stage, page, name))
 

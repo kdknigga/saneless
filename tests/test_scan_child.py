@@ -51,8 +51,10 @@ from saneless.vocabulary import (
     ScanStage,
     page_timeout_error,
     scan_child_crashed_error,
+    scan_child_ended_error,
     scan_child_no_answer_error,
     scan_child_not_started_error,
+    scan_child_out_of_time_error,
     scan_child_stopped_error,
     scan_child_unexpected_error,
 )
@@ -111,6 +113,8 @@ Path(env["SCAN_TEST_PIDFILE"]).write_text(str(os.getpid()))
 Path(env["SCAN_TEST_ARGV"]).write_bytes(Path("/proc/self/cmdline").read_bytes())
 HANG = env.get("SCAN_TEST_HANG_AT", "")
 CRASH = env.get("SCAN_TEST_CRASH_AT", "")
+CRASH_SIGNAL = getattr(signal, env.get("SCAN_TEST_CRASH_SIGNAL", "SIGSEGV"))
+EXIT_AT = env.get("SCAN_TEST_EXIT_AT", "")
 GARBAGE = env.get("SCAN_TEST_GARBAGE", "")
 ERROR = env.get("SCAN_TEST_ERROR_TYPE", "")
 FATAL = env.get("SCAN_TEST_ERROR_FATAL", "") == "1"
@@ -143,7 +147,7 @@ def hang(where):
 
 def crash():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    os.kill(os.getpid(), signal.SIGSEGV)
+    os.kill(os.getpid(), CRASH_SIGNAL)
 
 
 def stage(name, page=None):
@@ -152,6 +156,8 @@ def stage(name, page=None):
     here = page is None or page == AT_PAGE
     if CRASH == name and here:
         crash()
+    if EXIT_AT == name and here:
+        os._exit(1)
     if HANG == name and here:
         hang(name)
 
@@ -524,6 +530,48 @@ def test_a_crash_names_the_signal_stage_and_page(
     assert session.children_killed == 0
     _assert_reaped(files.pid())
     assert any("SIGSEGV" in message for message in _warnings(caplog))
+
+
+def test_a_child_that_exits_by_itself_is_told_as_such(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A child that exits part way, with a status, sent nothing unreadable.
+
+    Nor did saneless stop it, so the error says the process ended, with its
+    status, and not that a reply could not be read.
+    """
+    _shorten_deadlines(monkeypatch)
+    files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_EXIT_AT="open")
+    session = ScanChildSession(_Starts())
+
+    with pytest.raises(ScanError) as failed:
+        session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+
+    assert str(failed.value) == scan_child_ended_error(ScanStage.OPEN, None, 1)
+    assert session.children_killed == 0
+    _assert_reaped(files.pid())
+
+
+def test_a_child_its_own_alarm_ended_is_told_it_ran_out_of_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``SIGALRM`` is the child's own time limit, not a crash."""
+    _shorten_deadlines(monkeypatch)
+    files = _stand_in(
+        monkeypatch,
+        tmp_path,
+        SCAN_TEST_CRASH_AT="read",
+        SCAN_TEST_CRASH_SIGNAL="SIGALRM",
+    )
+    session = ScanChildSession(_Starts())
+
+    with pytest.raises(ScanError) as failed:
+        session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+
+    assert str(failed.value) == scan_child_out_of_time_error(ScanStage.READ, 2)
+    assert session.children_killed == 0
+    _assert_reaped(files.pid())
 
 
 @pytest.mark.parametrize(
