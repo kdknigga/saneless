@@ -139,6 +139,8 @@ from tests.conftest import (
     poll_until,
     refusing_paperless_client,
     scan_batch,
+    services_of,
+    stand_in,
     wait_for_state,
 )
 from tests.fake_clock import FakeClock
@@ -319,7 +321,7 @@ def _remove_job_row(app: FastAPI, job_id: str) -> None:
     threads under its lock, and the database runs in WAL mode, so a second
     connection can write beside it without touching the store's internals.
     """
-    db_path = app.state.settings.output.db_path
+    db_path = services_of(app).settings.output.db_path
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
@@ -679,7 +681,7 @@ def delivering_paperless(
     """
     Make the live app's Paperless client deliver every upload at once.
 
-    The worker holds the same client instance as ``app.state.paperless``, so
+    The worker holds the same client instance as ``services_of(app).paperless``, so
     patching its methods affects real scans. Without this the refusing test
     transport fails the upload and the job ends ERROR, which is not the outcome
     under test. ``poll_task``
@@ -691,7 +693,7 @@ def delivering_paperless(
 
 def _make_paperless_deliver(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch ``app``'s started Paperless client so every upload is delivered at once."""
-    paperless = app.state.paperless
+    paperless = services_of(app).paperless
 
     def _upload_document(*_args: object, **_kwargs: object) -> UploadResult:
         return ApiDelivery(task_id="browser-test-task")
@@ -738,7 +740,7 @@ def scan_harness(
     ``fallback_page`` -- otherwise the most-recent-job fallback would show this
     test's job on every later test's supposedly idle page.
     """
-    job_store: JobStore = browser_server.app.state.job_store
+    job_store: JobStore = services_of(browser_server.app).job_store
     harness = _ScanHarness(
         server=browser_server,
         job_store=job_store,
@@ -757,7 +759,7 @@ def scan_harness(
         finally:
             for job_id in created:
                 _remove_job_row(browser_server.app, job_id)
-            browser_server.app.state.worker._current_job_id = None
+            services_of(browser_server.app).worker._current_job_id = None
         # Reached only when every job finished, so it cannot mask the failure
         # that stopped a wait. A row left behind here would follow every later
         # test onto its supposedly idle page.
@@ -1072,8 +1074,8 @@ class TestFlipPromptUI:
         stay unanswered.
         """
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
-        worker = app.state.worker
+        job_store: JobStore = services_of(app).job_store
+        worker = services_of(app).worker
         job = job_store.create_job(profile="duplex", title="Flip In Browser")
         job_store.update_state(job.id, JobState.AWAITING_FLIP)
         coordinator = WorkerFlipCoordinator(job.id)
@@ -1681,7 +1683,7 @@ class TestFallbackStatusRendering:
     ) -> Iterator[Page]:
         """Drive the live app's current job to FALLBACK, then clear it again."""
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
+        job_store: JobStore = services_of(app).job_store
         job = job_store.create_job(
             profile="default",
             title="Fallback Doc",
@@ -1701,7 +1703,7 @@ class TestFallbackStatusRendering:
                 pages_uploaded=0,
             ),
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
         try:
             yield page
         finally:
@@ -1711,7 +1713,7 @@ class TestFallbackStatusRendering:
             # list_recent(limit=1) when there is no current job, so a row left
             # here would follow every later test onto what should be the idle
             # page. Deleting the row is what restores the idle state.
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
 
     def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
@@ -1825,7 +1827,7 @@ class TestWarnedDoneStatusRendering:
     ) -> Iterator[Page]:
         """Drive the live app's current job to a warned DONE, then clear it again."""
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
+        job_store: JobStore = services_of(app).job_store
         job = job_store.create_job(
             profile="default",
             title="Warned Doc",
@@ -1845,14 +1847,14 @@ class TestWarnedDoneStatusRendering:
                 pages_uploaded=1,
             ),
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
         try:
             yield page
         finally:
             # The server and its store are session-scoped: clearing the pointer
             # alone leaves this row as the most recent job, which the idle page
             # of every later test would then render. Deleting it restores idle.
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
@@ -1911,7 +1913,7 @@ class TestCancelledStatusRendering:
     ) -> Iterator[Page]:
         """Drive the live app's current job to CANCELLED, then clear it again."""
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
+        job_store: JobStore = services_of(app).job_store
         job = job_store.create_job(
             profile="default",
             title="Cancelled Doc",
@@ -1922,14 +1924,14 @@ class TestCancelledStatusRendering:
             JobState.CANCELLED,
             error="Manual duplex scan cancelled at the flip prompt",
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
         try:
             yield page
         finally:
             # Both halves, for the reason fallback_page gives: clearing only
             # the pointer leaves this job as list_recent's most recent row, and
             # every later "idle" page would render it.
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
 
     def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
@@ -2482,7 +2484,7 @@ class TestRequestErrorSlot:
         healthy store.
         """
         server = scan_harness.server
-        worker = server.app.state.worker
+        worker = services_of(server.app).worker
         monkeypatch.setattr(
             type(worker), "health", property(lambda _self: WorkerHealth.DEGRADED)
         )
@@ -2990,8 +2992,8 @@ class TestOwnerCookieInABrowser:
         real browser rather than absence from a string.
         """
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
-        worker = app.state.worker
+        job_store: JobStore = services_of(app).job_store
+        worker = services_of(app).worker
         job = job_store.create_job(
             profile="duplex",
             title="Someone Elses Flip",
@@ -3299,9 +3301,13 @@ class TestPageLoadAsksForNoList:
 
         with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
             egress_allowlist.append(server.url)
-            paperless = server.app.state.paperless
-            paperless.get_tags = lambda *, timeout=None: list(tags)
-            paperless.get_correspondents = lambda *, timeout=None: list(correspondents)
+            paperless = services_of(server.app).paperless
+            stand_in(paperless, "get_tags", lambda *, timeout=None: list(tags))
+            stand_in(
+                paperless,
+                "get_correspondents",
+                lambda *, timeout=None: list(correspondents),
+            )
 
             page.on("request", _record)
             page.goto(server.url)
@@ -3352,18 +3358,18 @@ def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
     in and on the way out, so neither this test nor the next one reads the
     other's list.
     """
-    paperless = browser_server.app.state.paperless
+    paperless = services_of(browser_server.app).paperless
     original = paperless.get_tags
     # The keyword is the real client's: every list route, the page's lazy
     # list load among them, and the check a scan makes before it starts ask
     # with a timeout.
-    paperless.get_tags = lambda *, timeout=None: list(_BROWSER_TAGS)
-    browser_server.app.state.cache.invalidate("tags")
+    stand_in(paperless, "get_tags", lambda *, timeout=None: list(_BROWSER_TAGS))
+    services_of(browser_server.app).cache.invalidate("tags")
     try:
         yield browser_server
     finally:
-        paperless.get_tags = original
-        browser_server.app.state.cache.invalidate("tags")
+        stand_in(paperless, "get_tags", original)
+        services_of(browser_server.app).cache.invalidate("tags")
 
 
 @pytest.mark.browser
@@ -3574,13 +3580,13 @@ def defaults_server(
     settings = base.model_copy(update={"profiles": profiles})
     with _serve(settings, _BrowserTestScanner()) as server:
         egress_allowlist.append(server.url)
-        paperless = server.app.state.paperless
+        paperless = services_of(server.app).paperless
         monkeypatch.setattr(paperless, "get_tags", _answer_list(_DEFAULTS_TAGS))
         monkeypatch.setattr(
             paperless, "get_correspondents", _answer_list(_DEFAULTS_CORRESPONDENTS)
         )
-        server.app.state.cache.invalidate("tags")
-        server.app.state.cache.invalidate("correspondents")
+        services_of(server.app).cache.invalidate("tags")
+        services_of(server.app).cache.invalidate("correspondents")
         _make_paperless_deliver(server.app, monkeypatch)
         yield server
 
@@ -3846,7 +3852,7 @@ class TestProfileDefaultsInTheBrowser:
         assert fields["tags_profile"] == ["default"], fields
         status = page.locator("#status-area")
         expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
-        job_store: JobStore = defaults_server.app.state.job_store
+        job_store: JobStore = services_of(defaults_server.app).job_store
         job = next(
             job for job in job_store.list_recent(100) if job.title == "Swap Cut Off"
         )
@@ -4187,11 +4193,13 @@ def _fail_a_list(
     answering = threading.Event()
     if resource == "tags":
         fetch = _flagged_list(answering, _DEFAULTS_TAGS)
-        monkeypatch.setattr(server.app.state.paperless, "get_tags", fetch)
+        monkeypatch.setattr(services_of(server.app).paperless, "get_tags", fetch)
     else:
         fetch = _flagged_list(answering, _DEFAULTS_CORRESPONDENTS)
-        monkeypatch.setattr(server.app.state.paperless, "get_correspondents", fetch)
-    server.app.state.cache.invalidate(resource)
+        monkeypatch.setattr(
+            services_of(server.app).paperless, "get_correspondents", fetch
+        )
+    services_of(server.app).cache.invalidate(resource)
     return answering
 
 
@@ -4249,7 +4257,7 @@ def _scan_and_read_the_job(page: Page, server: _BrowserServer, title: str) -> Jo
         page.click("#scan-btn")
     status = page.locator("#status-area")
     expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
-    job_store: JobStore = server.app.state.job_store
+    job_store: JobStore = services_of(server.app).job_store
     return next(job for job in job_store.list_recent(100) if job.title == title)
 
 
@@ -4276,8 +4284,8 @@ class TestLazyListsInTheBrowser:
         with _serve_black_holed(
             black_holed_paperless, tmp_path, egress_allowlist
         ) as server:
-            assert server.app.state.cache.get("tags") is None
-            assert server.app.state.cache.get("correspondents") is None
+            assert services_of(server.app).cache.get("tags") is None
+            assert services_of(server.app).cache.get("correspondents") is None
             page.goto(server.url)
             loaded = page.evaluate(
                 "() => performance.getEntriesByType('navigation')[0]"
@@ -4365,11 +4373,11 @@ class TestLazyListsInTheBrowser:
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
         monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
         answering = threading.Event()
-        paperless = defaults_server.app.state.paperless
+        paperless = services_of(defaults_server.app).paperless
         monkeypatch.setattr(
             paperless, "get_tags", _flagged_list(answering, _DEFAULTS_TAGS)
         )
-        defaults_server.app.state.cache.invalidate("tags")
+        services_of(defaults_server.app).cache.invalidate("tags")
 
         page.goto(defaults_server.url)
         tags_list = page.locator("#tags-list")
@@ -4505,7 +4513,7 @@ class TestLazyListsInTheBrowser:
         with _serve_black_holed(
             black_holed_paperless, tmp_path, egress_allowlist
         ) as server:
-            paperless = server.app.state.paperless
+            paperless = services_of(server.app).paperless
             fetches: list[object] = []
             real_fetch = paperless.get_tags
 
@@ -4552,7 +4560,7 @@ class TestLazyListsInTheBrowser:
         load = _await_the_held_load(page, held)
         expect(page.locator("#scan-btn")).to_be_disabled()
 
-        job_store: JobStore = defaults_server.app.state.job_store
+        job_store: JobStore = services_of(defaults_server.app).job_store
 
         def _fail(*_args: object, **_kwargs: object) -> NoReturn:
             msg = "disk I/O error"
@@ -4653,7 +4661,7 @@ class TestLazyListsInTheBrowser:
 
         status = page.locator("#status-area")
         expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
-        job_store: JobStore = defaults_server.app.state.job_store
+        job_store: JobStore = services_of(defaults_server.app).job_store
         job = next(
             job
             for job in job_store.list_recent(100)
@@ -4699,7 +4707,7 @@ class TestLazyListsInTheBrowser:
             )
         _await_held(page, retries, 1)
         answering.set()
-        defaults_server.app.state.cache.invalidate(failing)
+        services_of(defaults_server.app).cache.invalidate(failing)
 
         page.select_option("#profile-select", _RECEIPTS)
         if hold_the_change:
@@ -4760,7 +4768,7 @@ class TestLazyListsInTheBrowser:
         page.locator('#tags-list input[value="32"]').check()
         page.select_option("#correspondent-select", "")
         answering.set()
-        defaults_server.app.state.cache.invalidate("correspondents")
+        services_of(defaults_server.app).cache.invalidate("correspondents")
         retries[0].continue_()
         page.wait_for_function(_RETRY_HANDLED)
         page.wait_for_function(_REQUESTS_SETTLED)
@@ -4838,7 +4846,7 @@ class TestLazyListsInTheBrowser:
 
         status = page.locator("#status-area")
         expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
-        job_store: JobStore = defaults_server.app.state.job_store
+        job_store: JobStore = services_of(defaults_server.app).job_store
         job = next(
             job for job in job_store.list_recent(100) if job.title == "Released Early"
         )
@@ -4892,15 +4900,15 @@ def serve_profiles(
             settings = base.model_copy(update={"profiles": profiles})
             server = stack.enter_context(_serve(settings, _BrowserTestScanner()))
             egress_allowlist.append(server.url)
-            paperless = server.app.state.paperless
+            paperless = services_of(server.app).paperless
             monkeypatch.setattr(paperless, "get_tags", _answer_list(_DEFAULTS_TAGS))
             monkeypatch.setattr(
                 paperless,
                 "get_correspondents",
                 _answer_list(_DEFAULTS_CORRESPONDENTS),
             )
-            server.app.state.cache.invalidate("tags")
-            server.app.state.cache.invalidate("correspondents")
+            services_of(server.app).cache.invalidate("tags")
+            services_of(server.app).cache.invalidate("correspondents")
             return server
 
         yield _open
@@ -5185,7 +5193,7 @@ def _pause_background_ticks(
         monkeypatch: Restores the real tick at teardown.
 
     """
-    monkeypatch.setattr(server.app.state.refresher, "_tick", _no_tick)
+    monkeypatch.setattr(services_of(server.app).refresher, "_tick", _no_tick)
 
 
 @pytest.fixture
@@ -5286,7 +5294,7 @@ def _probe_now(server: _BrowserServer) -> None:
     """
     response = httpx2.post(f"{server.url}/api/checks/refresh", timeout=30.0)
     assert response.status_code == 200, response.status_code
-    refresher = server.app.state.refresher
+    refresher = services_of(server.app).refresher
     assert poll_until(lambda: not refresher.probe_in_flight, _REQUESTED_PROBE_BUDGET), (
         "the requested probe never finished"
     )
@@ -5416,8 +5424,8 @@ class TestStatusStripInChromium:
         the skipped label, not a green tick announced as "OK: Scanner".
         """
         server = cold_strip_server
-        job_store: JobStore = server.app.state.job_store
-        worker = server.app.state.worker
+        job_store: JobStore = services_of(server.app).job_store
+        worker = services_of(server.app).worker
         job = job_store.create_job(profile="default", title="Scanning Doc")
         job_store.update_state(job.id, JobState.SCANNING)
         worker._current_job_id = job.id
@@ -6102,8 +6110,8 @@ class TestErrorRenderingInChromium:
         household member as though it were the message.
         """
         server = empty_history_server
-        job_store: JobStore = server.app.state.job_store
-        worker = server.app.state.worker
+        job_store: JobStore = services_of(server.app).job_store
+        worker = services_of(server.app).worker
         job = job_store.create_job(
             profile="default",
             title="Broken Doc",
@@ -6138,7 +6146,7 @@ class TestErrorRenderingInChromium:
             expect(details).to_contain_text(f"Job: {job.id}")
 
             source = page.content()
-            log_file = str(server.app.state.settings.output.log_file)
+            log_file = str(services_of(server.app).settings.output.log_file)
             assert log_file not in source, log_file
             # Not just this deployment's path: any filename that looks like a
             # log would be a host filesystem detail on a page the whole LAN can
@@ -6192,8 +6200,8 @@ class TestAmberErrorRenderingInChromium:
         of them would tell half the operators to scan a filed document again.
         """
         server = empty_history_server
-        job_store: JobStore = server.app.state.job_store
-        worker = server.app.state.worker
+        job_store: JobStore = services_of(server.app).job_store
+        worker = services_of(server.app).worker
         owner = _as_owner(page, server.url)
         upload_id = self._finish_error(
             job_store, owner, "Refused Doc", ErrorCategory.UPLOAD
@@ -6280,8 +6288,8 @@ class TestPageCountsInChromium:
         the first history row is the job under test.
         """
         server = empty_history_server
-        job_store: JobStore = server.app.state.job_store
-        worker = server.app.state.worker
+        job_store: JobStore = services_of(server.app).job_store
+        worker = services_of(server.app).worker
         scanned, removed, uploaded = counts
         job = job_store.create_job(profile="default", title="Counted Doc")
         job_store.finish_job(
@@ -6380,7 +6388,7 @@ class TestHistoryTableOnAPhone:
         the reader the word goes on.
         """
         server = empty_history_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         owner = _as_owner(page, server.url)
         title = resolve_job_title(None, None, now=datetime.now(tz=UTC))
         warning = "The scanner skipped a sheet."
@@ -6535,7 +6543,7 @@ class TestManualDuplexFrontCountInChromium:
         containment assertion while failing the contract.
         """
         server = duplex_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         # Closed before the submit, so pass B is already held by the time the
         # flip is answered and the job cannot run past the state under test.
         server.scanner.gate.clear()
@@ -6741,7 +6749,7 @@ class TestTimestampZonesInChromium:
         wait on: what is under test here is the format, not the poll.
         """
         server = cold_strip_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         job = job_store.create_job(profile="default", title="Timed Doc")
         _probe_now(server)
         try:
@@ -6843,7 +6851,7 @@ def _drive_to_flip_prompt(
         The id of the job now waiting at the flip prompt.
 
     """
-    job_store: JobStore = server.app.state.job_store
+    job_store: JobStore = services_of(server.app).job_store
     page.goto(server.url)
     page.select_option("#profile-select", "duplex")
     page.fill("#title-input", title)
@@ -6913,7 +6921,7 @@ class TestTwoBrowsersOneStack:
         suite would say so.
         """
         server = flip_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
 
         blocked: list[str] = []
         # One ``seen`` list for the same reason as one ``blocked`` list: both
@@ -6994,7 +7002,7 @@ class TestTwoBrowsersOneStack:
                 # ten minutes by default: the job has to reach a terminal state
                 # before _serve shuts the app down, or the shutdown's bounded
                 # worker join is what would report this test's failure.
-                server.app.state.worker.abort_flip(job_id)
+                services_of(server.app).worker.abort_flip(job_id)
                 wait_for_state(
                     job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT
                 )
@@ -7067,7 +7075,7 @@ class TestTwoBrowsersOneStack:
         and is checked after it closes.
         """
         server = flip_server
-        worker = server.app.state.worker
+        worker = services_of(server.app).worker
         job_id = _drive_to_flip_prompt(page, server, _FLIP_JOB_TITLE)
         blocked: list[str] = []
         seen: list[str] = []
@@ -7125,7 +7133,7 @@ class TestTwoBrowsersOneStack:
         sent in the first second".
         """
         server = flip_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
 
         asked: list[str] = []
         answer = ["dismiss"]
@@ -7246,8 +7254,8 @@ class TestFlipPromptSurvivesPolls:
             job_id: The job to end.
 
         """
-        job_store: JobStore = server.app.state.job_store
-        server.app.state.worker.abort_flip(job_id)
+        job_store: JobStore = services_of(server.app).job_store
+        services_of(server.app).worker.abort_flip(job_id)
         wait_for_state(job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
 
     def test_flip_buttons_have_stable_ids(
@@ -7377,7 +7385,7 @@ class TestOnlyTheOwnerSeesTheScan:
         two-browser flip test does; ``page`` comes from the gated fixture.
         """
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
+        job_store: JobStore = services_of(app).job_store
         job = job_store.create_job(
             profile="default",
             title=_OWNED_TITLE,
@@ -7395,7 +7403,7 @@ class TestOnlyTheOwnerSeesTheScan:
                 pages_uploaded=1,
             ),
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
 
         blocked: list[str] = []
         seen: list[str] = []
@@ -7437,7 +7445,7 @@ class TestOnlyTheOwnerSeesTheScan:
             assert "data:image/jpeg" not in viewer_page.content()
         finally:
             viewer_ctx.close()
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
@@ -7537,7 +7545,7 @@ class TestSimplerFormInChromium:
         the created job can only have come from the profile.
         """
         server = simple_form_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         page.goto(server.url)
         # The form is present and usable, so the absences below are about the
         # Tags block rather than about a page that failed to render.
@@ -7634,8 +7642,8 @@ class TestBlockedButtonThroughTheStatusPoll:
         sleep: "several ticks" is a count of round trips.
         """
         server = private_blocked_server
-        job_store: JobStore = server.app.state.job_store
-        worker = server.app.state.worker
+        job_store: JobStore = services_of(server.app).job_store
+        worker = services_of(server.app).worker
         job = job_store.create_job(profile="default", title="Polled Doc")
         job_store.update_state(job.id, JobState.SCANNING)
         worker._current_job_id = job.id
@@ -7700,7 +7708,7 @@ class TestTheGuardBehindTheBlockedButton:
         sentence is what ``saneless jobs`` and the API surface.
         """
         server = private_blocked_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         page.goto(server.url)
         # The lazy list load re-renders the button, still disabled because the
         # appliance is blocked; the tamper has to come after it, or that
@@ -7765,7 +7773,7 @@ class TestRemovedBlankPagesRendering:
     ) -> Iterator[Page]:
         """Drive the live app's current job to a DONE that removed two blank pages."""
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
+        job_store: JobStore = services_of(app).job_store
         job = job_store.create_job(
             profile="default",
             title="Blank Backs Doc",
@@ -7783,14 +7791,14 @@ class TestRemovedBlankPagesRendering:
                 removed_positions=(2, 4),
             ),
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
         try:
             yield page
         finally:
             # Both halves, for the reason fallback_page gives: clearing only
             # the pointer leaves this job as list_recent's most recent row, and
             # every later "idle" page would render it.
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
 
     @pytest.fixture
@@ -7799,8 +7807,8 @@ class TestRemovedBlankPagesRendering:
     ) -> Iterator[tuple[Page, str]]:
         """Drive the live app's current job to an all-blank ERROR, then clear it."""
         app = browser_server.app
-        job_store: JobStore = app.state.job_store
-        settings: Settings = app.state.settings
+        job_store: JobStore = services_of(app).job_store
+        settings: Settings = services_of(app).settings
         kept = settings.output.failed_dir / _ALL_BLANK_FILE
         job = job_store.create_job(
             profile="default",
@@ -7816,11 +7824,11 @@ class TestRemovedBlankPagesRendering:
             ),
             error_category=ErrorCategory.ALL_BLANK,
         )
-        app.state.worker._current_job_id = job.id
+        services_of(app).worker._current_job_id = job.id
         try:
             yield page, str(kept)
         finally:
-            app.state.worker._current_job_id = None
+            services_of(app).worker._current_job_id = None
             _remove_job_row(app, job.id)
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
@@ -8054,7 +8062,7 @@ def _start_multi_page_scan(
         The id of the job now waiting for its second page.
 
     """
-    job_store: JobStore = server.app.state.job_store
+    job_store: JobStore = services_of(server.app).job_store
     page.goto(server.url)
     page.locator("#multi-page").check()
     page.fill("#title-input", title)
@@ -8083,8 +8091,8 @@ def _abort_the_document(server: _BrowserServer, job_id: str) -> None:
         job_id: The job to end.
 
     """
-    job_store: JobStore = server.app.state.job_store
-    worker = server.app.state.worker
+    job_store: JobStore = services_of(server.app).job_store
+    worker = services_of(server.app).worker
 
     def _ended_or_aborted() -> bool:
         job = job_store.get_job(job_id)
@@ -8131,8 +8139,8 @@ def _staged_prompt(
         The staged job, its coordinator and the asking thread.
 
     """
-    job_store: JobStore = server.app.state.job_store
-    worker = server.app.state.worker
+    job_store: JobStore = services_of(server.app).job_store
+    worker = services_of(server.app).worker
     job = job_store.create_job(
         profile="default", title="Staged Pages", owner_token=owner_token
     )
@@ -8180,7 +8188,7 @@ class TestMultiPagePromptInTheBrowser:
         Abort asks for confirmation, and the buttons come in their fixed order.
         """
         server = multi_page_scan_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         job_id = _start_multi_page_scan(page, server, _MULTI_PAGE_TITLE)
         try:
             prompt = page.locator("#status-area .pages-prompt")
@@ -8239,7 +8247,7 @@ class TestMultiPagePromptInTheBrowser:
         than that none was sent in the same instant as the click.
         """
         server = multi_page_scan_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         asked: list[str] = []
         answer = ["dismiss"]
         posted: list[str] = []
@@ -8351,7 +8359,7 @@ class TestMultiPagePromptInTheBrowser:
             viewer_page.goto(server.url)
 
             viewer_status = viewer_page.locator("#status-area")
-            deadline = server.app.state.worker.pass_deadline(job_id)
+            deadline = services_of(server.app).worker.pass_deadline(job_id)
             assert deadline is not None
             expect(viewer_status).to_contain_text(
                 non_owner_wait_line(JobState.AWAITING_NEXT_PASS, deadline=deadline)
@@ -8488,7 +8496,7 @@ class TestStatusPollLostContact:
         """
         server = scan_harness.server
         job_store = scan_harness.job_store
-        worker_thread = server.app.state.worker._thread
+        worker_thread = services_of(server.app).worker._thread
         original = job_store.get_job
         broken = threading.Event()
 
@@ -8733,8 +8741,8 @@ def _parked(
         The job's id.
 
     """
-    job_store: JobStore = stage.server.app.state.job_store
-    worker = stage.server.app.state.worker
+    job_store: JobStore = services_of(stage.server.app).job_store
+    worker = services_of(stage.server.app).worker
     owner = _as_owner(stage.page, stage.server.url)
     job = job_store.create_job(profile="default", title=title, owner_token=owner)
     if state is not JobState.PENDING:
@@ -8763,7 +8771,7 @@ def _open_on(stage: _Stage, line: str) -> None:
 @contextmanager
 def _reflow_queued(stage: _Stage) -> Generator[None]:
     """Queue the page's job behind two others and a running max-length title."""
-    job_store: JobStore = stage.server.app.state.job_store
+    job_store: JobStore = services_of(stage.server.app).job_store
     title = "W" * TITLE_MAX_LENGTH
     owner = _as_owner(stage.page, stage.server.url)
     with _parked(stage, JobState.SCANNING, title):
@@ -8813,7 +8821,9 @@ def _reflow_later_pass(stage: _Stage) -> Generator[None]:
     with _staged_prompt(stage.server, owner, prompt) as staged:
         assert staged.coordinator.answer(prompt.number, PassAnswer.NEXT)
         staged.asker.join(_JOB_FINISH_TIMEOUT)
-        stage.server.app.state.job_store.update_state(staged.job_id, JobState.SCANNING)
+        services_of(stage.server.app).job_store.update_state(
+            staged.job_id, JobState.SCANNING
+        )
         _open_on(stage, busy_line(JobState.SCANNING, pages_kept=_KEPT_PAGE_COUNT))
         yield
 
@@ -8821,7 +8831,7 @@ def _reflow_later_pass(stage: _Stage) -> Generator[None]:
 @contextmanager
 def _reflow_front_count(stage: _Stage) -> Generator[None]:
     """Park a manual-duplex job scanning its backs, after a counted front pass."""
-    worker = stage.server.app.state.worker
+    worker = services_of(stage.server.app).worker
     with _parked(stage, JobState.SCANNING_REVERSE):
         worker._front_pages = _FRONT_PAGE_COUNT
         try:
@@ -8837,7 +8847,7 @@ def _reflow_front_count(stage: _Stage) -> Generator[None]:
 @contextmanager
 def _reflow_flip_acknowledgement(stage: _Stage) -> Generator[None]:
     """Answer a waiting flip with Continue, so the acknowledgement shows."""
-    worker = stage.server.app.state.worker
+    worker = services_of(stage.server.app).worker
     with _parked(stage, JobState.AWAITING_FLIP) as job_id:
         coordinator = WorkerFlipCoordinator(job_id)
         coordinator.arm()
@@ -8888,7 +8898,7 @@ def _reflow_last_scan_failed(stage: _Stage) -> Generator[None]:
     Both "Last scan" lines render: the outcome naming the title, and the
     category's message and next step beneath it.
     """
-    job_store: JobStore = stage.server.app.state.job_store
+    job_store: JobStore = services_of(stage.server.app).job_store
     with _parked(stage, JobState.ERROR, "W" * TITLE_MAX_LENGTH) as job_id:
         job_store.update_state(
             job_id,
@@ -8904,7 +8914,7 @@ def _reflow_last_scan_failed(stage: _Stage) -> Generator[None]:
 @contextmanager
 def _reflow_lost_contact(stage: _Stage) -> Generator[None]:
     """Break the store's job reads under a scan, so the poll shows its fallback."""
-    job_store: JobStore = stage.server.app.state.job_store
+    job_store: JobStore = services_of(stage.server.app).job_store
     broken = threading.Event()
 
     def _guarded(original: Callable[..., object]) -> Callable[..., object]:
@@ -8940,7 +8950,7 @@ def _armed_flip(stage: _Stage, job_id: str) -> Generator[None]:
         job_id: The job waiting at the flip.
 
     """
-    worker = stage.server.app.state.worker
+    worker = services_of(stage.server.app).worker
     coordinator = WorkerFlipCoordinator(job_id)
     coordinator.arm()
     worker._flip_coordinator = coordinator
@@ -8973,8 +8983,8 @@ def _reflow_owner_flip_prompt(stage: _Stage) -> Generator[None]:
 @contextmanager
 def _reflow_non_owner_flip_wait(stage: _Stage) -> Generator[None]:
     """Show another browser's flip wait, with its deadline, to this page."""
-    job_store: JobStore = stage.server.app.state.job_store
-    worker = stage.server.app.state.worker
+    job_store: JobStore = services_of(stage.server.app).job_store
+    worker = services_of(stage.server.app).worker
     job = job_store.create_job(
         profile="default",
         title="W" * TITLE_MAX_LENGTH,
@@ -9115,8 +9125,8 @@ def _end_the_flip(server: _BrowserServer, job_id: str) -> None:
         job_id: The job to end.
 
     """
-    job_store: JobStore = server.app.state.job_store
-    server.app.state.worker.abort_flip(job_id)
+    job_store: JobStore = services_of(server.app).job_store
+    services_of(server.app).worker.abort_flip(job_id)
     wait_for_state(job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
 
 
@@ -9300,7 +9310,7 @@ class TestFocusMap:
         it closes.
         """
         server = flip_server
-        job_store: JobStore = server.app.state.job_store
+        job_store: JobStore = services_of(server.app).job_store
         blocked: list[str] = []
         seen: list[str] = []
         violations: list[str] = []
@@ -9592,7 +9602,7 @@ class TestJavaScriptOff:
         violations: list[str] = []
         with _serve(_listless_settings(tmp_path), _BrowserTestScanner()) as server:
             egress_allowlist.append(server.url)
-            job_store: JobStore = server.app.state.job_store
+            job_store: JobStore = services_of(server.app).job_store
             before = len(job_store.list_recent(limit=1_000))
             ctx = browser.new_context(java_script_enabled=False)
             try:

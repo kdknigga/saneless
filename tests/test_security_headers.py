@@ -32,7 +32,7 @@ from fastapi.testclient import TestClient
 from saneless.config import ProfileConfig, Settings
 from saneless.vocabulary import TITLE_MAX_LENGTH
 from saneless.web.app import create_app
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -95,12 +95,16 @@ def app(web_settings: Settings) -> FastAPI:
     500 it causes is the response most likely to miss a header.
     """
     application = create_app(web_settings, StubScannerBackend())
-    application.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"}
-    ]
-    application.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME"}
-    ]
+    stand_in(
+        services_of(application).paperless,
+        "get_tags",
+        lambda *, timeout=None: [{"id": 1, "name": "receipt"}],
+    )
+    stand_in(
+        services_of(application).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [{"id": 1, "name": "ACME"}],
+    )
     application.add_api_route(_BOOM_PATH, _boom)
     return application
 
@@ -207,7 +211,7 @@ def test_a_job_status_response_is_not_stored(
     lenient_client: TestClient, app: FastAPI
 ) -> None:
     """The status of one job, the owner-gated view a poll fetches, is no-store."""
-    job = app.state.job_store.create_job("default", "Private Title")
+    job = services_of(app).job_store.create_job("default", "Private Title")
     response = lenient_client.get(f"/api/jobs/{job.id}/status", headers=_HTMX)
     assert response.status_code == 200
     assert response.headers.get_list("cache-control") == ["no-store"]

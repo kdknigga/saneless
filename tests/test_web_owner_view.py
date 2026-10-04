@@ -43,7 +43,7 @@ from saneless.vocabulary import (
 from saneless.web.app import create_app
 from saneless.web.job_view import JobView
 from saneless.web.routes import OWNER_COOKIE
-from tests.conftest import StubScannerBackend, leaf_routes
+from tests.conftest import StubScannerBackend, leaf_routes, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -98,12 +98,16 @@ def view_settings(make_settings: Callable[..., Settings], tmp_path: Path) -> Set
 def app(view_settings: Settings) -> FastAPI:
     """Create the app over the stub scanner, with fixed tag and correspondent lists."""
     built = create_app(view_settings, StubScannerBackend())
-    built.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"}
-    ]
-    built.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME"}
-    ]
+    stand_in(
+        services_of(built).paperless,
+        "get_tags",
+        lambda *, timeout=None: [{"id": 1, "name": "receipt"}],
+    )
+    stand_in(
+        services_of(built).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [{"id": 1, "name": "ACME"}],
+    )
     return built
 
 
@@ -133,14 +137,14 @@ def other(owner: TestClient, request: pytest.FixtureRequest) -> TestClient:
 
 def _store(client: TestClient) -> JobStore:
     """Return the job store of the client's app."""
-    store: JobStore = _app(client).state.job_store
+    store: JobStore = services_of(client.app).job_store
     return store
 
 
 @contextmanager
 def _running(client: TestClient, job_id: str) -> Generator[None]:
     """Make the worker report ``job_id`` as the job in flight, then clear it."""
-    worker = _app(client).state.worker
+    worker = services_of(client.app).worker
     worker._current_job_id = job_id
     try:
         yield
@@ -253,7 +257,7 @@ class TestOwnedRow:
     ) -> None:
         """A submit queued behind the owner's scan names it to the owner alone."""
         monkeypatch.setattr(
-            _app(owner).state.worker,
+            services_of(owner.app).worker,
             "submit",
             lambda _job, _options: SubmitResult.ACCEPTED,
         )
@@ -486,7 +490,7 @@ class TestTemplateContract:
         None, so both keys are read, and the one that is set must be a view.
         """
         job = _done_row(_store(owner), owner_token=OWNER_TOKEN)
-        templates = _app(owner).state.templates
+        templates = services_of(owner.app).templates
         original = templates.TemplateResponse
         contexts: list[dict[str, object]] = []
 

@@ -38,7 +38,7 @@ from saneless.web.host_guard import (
     HostVerdict,
     host_verdict,
 )
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -187,12 +187,16 @@ def web_settings(make_settings: Callable[..., Settings]) -> Settings:
 def client(web_settings: Settings) -> Iterator[TestClient]:
     """TestClient over the production app, with its lifespan running."""
     app = create_app(web_settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"}
-    ]
-    app.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME"}
-    ]
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: [{"id": 1, "name": "receipt"}],
+    )
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [{"id": 1, "name": "ACME"}],
+    )
     with TestClient(app) as tc:
         yield tc
 

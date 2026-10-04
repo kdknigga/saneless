@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from saneless.config import ProfileConfig
 from saneless.web.app import TEMPLATE_DIR, create_app
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -58,12 +58,16 @@ def app(make_settings: Callable[..., Settings]) -> FastAPI:
     assert settings.web.show_tags
     assert settings.web.show_correspondent
     application = create_app(settings, StubScannerBackend())
-    application.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": _HOSTILE_NAME}
-    ]
-    application.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 2, "name": _HOSTILE_NAME}
-    ]
+    stand_in(
+        services_of(application).paperless,
+        "get_tags",
+        lambda *, timeout=None: [{"id": 1, "name": _HOSTILE_NAME}],
+    )
+    stand_in(
+        services_of(application).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [{"id": 2, "name": _HOSTILE_NAME}],
+    )
     return application
 
 
@@ -138,4 +142,6 @@ def test_no_template_switches_escaping_off(client: TestClient) -> None:
     ]
 
     assert offenders == []
-    assert app.state.templates.env.autoescape("x.html") is True
+    autoescape = services_of(app).templates.env.autoescape
+    assert callable(autoescape)
+    assert autoescape("x.html") is True

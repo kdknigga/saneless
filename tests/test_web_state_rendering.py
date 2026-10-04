@@ -93,6 +93,8 @@ from tests.conftest import (
     load_the_lists,
     poll_until,
     quiet_window,
+    services_of,
+    stand_in,
 )
 from tests.template_support import template_markup, template_start_tags
 
@@ -441,8 +443,8 @@ def _make_app(
         web=WebConfig(show_tags=show_lists, show_correspondent=show_lists),
     )
     app = create_app(settings, _StubScanner())
-    app.state.paperless.get_tags = _no_rows
-    app.state.paperless.get_correspondents = _no_rows
+    stand_in(services_of(app).paperless, "get_tags", _no_rows)
+    stand_in(services_of(app).paperless, "get_correspondents", _no_rows)
     return app
 
 
@@ -535,7 +537,7 @@ def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
     cannot race the assignment. If the worker's job tracking changes, this one
     helper is the only thing that needs updating.
     """
-    _app(client).state.worker._current_job_id = job_id
+    services_of(client.app).worker._current_job_id = job_id
 
 
 def _set_warning(job_store: JobStore, job_id: str, warning: str) -> None:
@@ -573,7 +575,7 @@ def _job_in_state(
         The job's id, which the technical-details assertions need.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
     )
@@ -803,7 +805,7 @@ def _status_response(
         return response.text
     job_id = _job_in_state(client, JobState.AWAITING_FLIP)
     if route == "lost-contact fallback":
-        store: JobStore = _app(client).state.job_store
+        store: JobStore = services_of(client.app).job_store
 
         def unreadable(*_args: object, **_kwargs: object) -> object:
             msg = "disk I/O error"
@@ -908,7 +910,7 @@ def test_a_flip_acknowledgement_is_a_busy_line(
     The machine is about to scan the backs, so the line has a spinner; the
     unanswered prompt a non-owner sees waits for a person and has none.
     """
-    worker = _app(client).state.worker
+    worker = services_of(client.app).worker
     job_id = _job_in_state(client, JobState.AWAITING_FLIP)
     unanswered = _element(_as_browser(client, None), "status-area")
     assert "aria-busy" not in unanswered
@@ -1101,7 +1103,7 @@ class TestStatusAreaError:
         a setting, and a setting can be changed, so the property is pinned here
         as it is for ``job.warning``.
         """
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job = job_store.create_job(
             profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
         )
@@ -1448,7 +1450,8 @@ def test_flip_responses_never_clear_the_status_message(
 ) -> None:
     """Flip Continue and Abort re-render the button OOB, not the slot."""
     _job_in_state(client, JobState.AWAITING_FLIP)
-    job_id = _app(client).state.worker._current_job_id
+    job_id = services_of(client.app).worker._current_job_id
+    assert job_id is not None
     response = client.post(f"/api/flip/{answer}", data={"job_id": job_id})
     assert response.status_code == 200
     assert _only_scan_button(response.text).attributes.get("hx-swap-oob") == "true"
@@ -1798,7 +1801,7 @@ def _finished_job(
         The job's id.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
     )
@@ -1881,7 +1884,7 @@ class TestPageCounts:
         the preview, which is the end of the status area.
         """
         job_id = _finished_job(client, JobState.DONE, _COUNTS)
-        _app(client).state.job_store.update_thumbnail(job_id, "dGVzdA==")
+        services_of(client.app).job_store.update_thumbnail(job_id, "dGVzdA==")
         text = client.get("/api/jobs/current/status").text
 
         assert text.index('class="status-done"') < text.index('class="page-counts"')
@@ -1891,7 +1894,7 @@ class TestPageCounts:
         self, client: TestClient
     ) -> None:
         """Under FALLBACK the counts read after the warning, not between it and the outcome."""
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job = job_store.create_job(
             profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
         )
@@ -2185,11 +2188,11 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
     broken.set()
 
     with TestClient(app) as tc:
-        job_store: JobStore = app.state.job_store
-        handling = _BreakableWrite(app.state.worker._scan_job, broken)
+        job_store: JobStore = services_of(app).job_store
+        handling = _BreakableWrite(services_of(app).worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
-        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
+        monkeypatch.setattr(services_of(app).worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 
@@ -2236,11 +2239,11 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
     broken.set()
 
     with TestClient(app) as tc:
-        job_store: JobStore = app.state.job_store
-        handling = _BreakableWrite(app.state.worker._scan_job, broken)
+        job_store: JobStore = services_of(app).job_store
+        handling = _BreakableWrite(services_of(app).worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
-        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
+        monkeypatch.setattr(services_of(app).worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 
@@ -2293,8 +2296,8 @@ def test_a_job_waiting_for_the_gate_reads_starting_scan(client: TestClient) -> N
     so the status area keeps its first line and claims no scan in progress.
     """
     app = _app(client)
-    worker = app.state.worker
-    job_store: JobStore = app.state.job_store
+    worker = services_of(app).worker
+    job_store: JobStore = services_of(app).job_store
     gate = worker.scanner_gate
     assert gate.acquire(timeout=_GATE_WAIT_BUDGET)
     try:
@@ -2365,7 +2368,7 @@ def _flip_job(client: TestClient, owner: str | None) -> str:
         The job's id.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title="Flip Render", owner_token=owner
     )
@@ -2627,7 +2630,7 @@ def _stub_pass_deadline(
     def pass_deadline(_job_id: str) -> datetime | None:
         return deadline
 
-    monkeypatch.setattr(_app(client).state.worker, "pass_deadline", pass_deadline)
+    monkeypatch.setattr(services_of(client.app).worker, "pass_deadline", pass_deadline)
 
 
 def _stub_flip_deadline(
@@ -2638,7 +2641,7 @@ def _stub_flip_deadline(
     def flip_deadline(_job_id: str) -> datetime | None:
         return deadline
 
-    monkeypatch.setattr(_app(client).state.worker, "flip_deadline", flip_deadline)
+    monkeypatch.setattr(services_of(client.app).worker, "flip_deadline", flip_deadline)
 
 
 class TestWaitingCopy:
@@ -2658,7 +2661,7 @@ class TestWaitingCopy:
         """An armed flip wait gives another browser its way forward and deadline."""
         job_id = _flip_job(client, _OWNING_BROWSER)
         _arm_flip(client, monkeypatch, job_id)
-        deadline = _app(client).state.worker.flip_deadline(job_id)
+        deadline = services_of(client.app).worker.flip_deadline(job_id)
         assert deadline is not None
 
         markup = _as_browser(client, None)
@@ -2720,7 +2723,7 @@ class TestWaitingCopy:
         """The prompt opens with the scan's title and ends with the deadline note."""
         _flip_job(client, _OWNING_BROWSER)
         _stub_flip_deadline(client, monkeypatch, _DEADLINE)
-        timeout = _app(client).state.settings.output.operator_wait_timeout_seconds
+        timeout = services_of(client.app).settings.output.operator_wait_timeout_seconds
 
         prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
 
@@ -2740,7 +2743,7 @@ class TestWaitingCopy:
     ) -> None:
         """With no recorded start the note names how long the wait lasts."""
         _flip_job(client, _OWNING_BROWSER)
-        timeout = _app(client).state.settings.output.operator_wait_timeout_seconds
+        timeout = services_of(client.app).settings.output.operator_wait_timeout_seconds
 
         prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
 
@@ -2921,7 +2924,7 @@ def _done_job_that_is_not_current(client: TestClient, title: str) -> str:
         The job's id.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title=title, owner_token=_RENDERING_BROWSER
     )
@@ -3534,7 +3537,7 @@ class TestFormHelpTextAndTagPicker:
         new profile's default, and the lazy list load's select carries the
         same wiring.
         """
-        _app(client).state.cache.set("correspondents", [{"id": 7, "name": "Acme"}])
+        services_of(client.app).cache.set("correspondents", [{"id": 7, "name": "Acme"}])
         page = client.get("/").text
         lists = load_the_lists(client, page)
 
@@ -3798,7 +3801,7 @@ def _accept_every_submit(client: TestClient, monkeypatch: pytest.MonkeyPatch) ->
     def accept(*_args: object, **_kwargs: object) -> SubmitResult:
         return SubmitResult.ACCEPTED
 
-    monkeypatch.setattr(_app(client).state.worker, "submit", accept)
+    monkeypatch.setattr(services_of(client.app).worker, "submit", accept)
 
 
 def _arm_flip(
@@ -3816,7 +3819,9 @@ def _arm_flip(
     """
     coordinator = WorkerFlipCoordinator(job_id)
     coordinator.arm()
-    monkeypatch.setattr(_app(client).state.worker, "_flip_coordinator", coordinator)
+    monkeypatch.setattr(
+        services_of(client.app).worker, "_flip_coordinator", coordinator
+    )
     return coordinator
 
 
@@ -3931,7 +3936,7 @@ class TestFocusEmission:
 
         text = _flip_answer_response(client, job_id, "abort")
 
-        assert _app(client).state.worker.flip_answer(job_id) is None
+        assert services_of(client.app).worker.flip_answer(job_id) is None
         assert "focus" not in _status_poll_query(text)
         assert "autofocus" not in _only_scan_button(text).attributes
 
@@ -3947,7 +3952,7 @@ class TestFocusEmission:
         """
         job_id = _job_in_state(client, JobState.AWAITING_FLIP)
         _arm_flip(client, monkeypatch, job_id)
-        store: JobStore = _app(client).state.job_store
+        store: JobStore = services_of(client.app).job_store
         store.update_state(job_id, JobState.CANCELLED)
 
         text = _flip_answer_response(client, job_id, "abort")
@@ -4233,7 +4238,7 @@ def _last_job(
 
     """
     state, warning, category, _, _ = _LAST_SCAN_CASES[case]
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title=title, owner_token=owner)
     job_store.update_thumbnail(job.id, _THUMBNAIL)
     job_store.finish_job(
@@ -4256,7 +4261,7 @@ def _last_job(
 
 def _started(client: TestClient, job_id: str) -> str:
     """Return how the "Last scan" line spells the job's creation time."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.get_job(job_id)
     assert job is not None
     return local_time(job.created_at)
@@ -4437,7 +4442,7 @@ def _queued_behind_a_running_job(client: TestClient) -> str:
 
     """
     _job_in_state(client, JobState.SCANNING)
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     return job_store.create_job(
         profile="default", title="Queued Render", owner_token=_RENDERING_BROWSER
     ).id
@@ -4584,7 +4589,7 @@ class TestPageTitle:
         wherever its state shows the title.
         """
         sentinel = "Tab Title Sentinel"
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job = job_store.create_job(
             profile="default", title=sentinel, owner_token=_RENDERING_BROWSER
         )

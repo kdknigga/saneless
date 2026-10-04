@@ -59,7 +59,7 @@ from saneless.web import errors
 from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanOptions, ScanWorker
-from tests.conftest import StubScannerBackend, poll_until
+from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
 from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
@@ -167,14 +167,22 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"},
-        {"id": 2, "name": "invoice"},
-    ]
-    app.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME Corp"},
-    ]
-    return app.state.paperless
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "receipt"},
+            {"id": 2, "name": "invoice"},
+        ],
+    )
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "ACME Corp"},
+        ],
+    )
+    return services_of(app).paperless
 
 
 @pytest.fixture
@@ -848,14 +856,14 @@ def _job_store(client: TestClient) -> JobStore:
     """Return the served app's job store."""
     app = client.app
     assert isinstance(app, FastAPI)
-    return app.state.job_store
+    return services_of(app).job_store
 
 
 def _worker(client: TestClient) -> ScanWorker:
     """Return the served app's scan worker."""
     app = client.app
     assert isinstance(app, FastAPI)
-    return app.state.worker
+    return services_of(app).worker
 
 
 def _force_health(monkeypatch: pytest.MonkeyPatch, health: WorkerHealth) -> None:
@@ -1774,7 +1782,7 @@ class TestStatusPollBacksOff:
         """A template that fails to render is caught exactly as a store error is."""
         app = client.app
         assert isinstance(app, FastAPI)
-        templates = app.state.templates
+        templates = services_of(app).templates
         original = templates.get_template
 
         class _Exploding:
@@ -1881,8 +1889,12 @@ def _appliance_with_credential(
         }
     )
     application = create_app(configured, scanner)
-    application.state.paperless.get_tags = lambda *, timeout=None: []
-    application.state.paperless.get_correspondents = lambda *, timeout=None: []
+    stand_in(services_of(application).paperless, "get_tags", lambda *, timeout=None: [])
+    stand_in(
+        services_of(application).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [],
+    )
     with TestClient(application) as tc:
         yield tc
 

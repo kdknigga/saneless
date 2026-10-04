@@ -40,7 +40,7 @@ from saneless.config import (
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
 from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
-from tests.conftest import StubScannerBackend, leaf_routes
+from tests.conftest import StubScannerBackend, leaf_routes, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -279,14 +279,22 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"},
-        {"id": 2, "name": "invoice"},
-    ]
-    app.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME Corp"},
-    ]
-    return app.state.paperless
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "receipt"},
+            {"id": 2, "name": "invoice"},
+        ],
+    )
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "ACME Corp"},
+        ],
+    )
+    return services_of(app).paperless
 
 
 @pytest.fixture
@@ -396,7 +404,7 @@ def test_rejected_scan_never_reaches_the_route(
         headers=CROSS_SITE_HEADERS,
     )
     assert response.status_code == 403
-    assert app.state.job_store.list_recent(limit=50) == []
+    assert services_of(app).job_store.list_recent(limit=50) == []
 
 
 def test_rejection_logs_one_warning_naming_every_header(

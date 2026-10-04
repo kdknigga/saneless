@@ -61,7 +61,7 @@ from saneless.vocabulary import (
 from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanOptions, WorkerPassCoordinator
-from tests.conftest import StubScannerBackend, poll_until
+from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -121,7 +121,7 @@ class _Served:
     @property
     def job_store(self) -> JobStore:
         """Return the app's job store."""
-        store: JobStore = self.app.state.job_store
+        store: JobStore = services_of(self.app).job_store
         return store
 
 
@@ -145,10 +145,12 @@ def _profiles(*, duplex_opens: bool = False) -> dict[str, ProfileConfig]:
 def _serve(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Served]:
     """Run an app for ``settings`` whose worker records every submit."""
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
+    stand_in(services_of(app).paperless, "get_tags", lambda *, timeout=None: [])
+    stand_in(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
     submitted = _Recorded()
-    monkeypatch.setattr(app.state.worker, "submit", submitted)
+    monkeypatch.setattr(services_of(app).worker, "submit", submitted)
     with TestClient(app) as client:
         yield _Served(client=client, app=app, submitted=submitted)
 
@@ -549,7 +551,7 @@ class _Stager:
         store = self._served.job_store
         job = store.create_job(profile=FLATBED, title="Multi-page", owner_token=owner)
         store.update_state(job.id, state)
-        self._served.app.state.worker._current_job_id = job.id
+        services_of(self._served.app).worker._current_job_id = job.id
         return job.id
 
     def prompt(self, prompt: PassPrompt, *, owner: str | None = _OWNER) -> _Waiting:
@@ -567,7 +569,7 @@ class _Stager:
         job_id = self.job(pass_wait_state(prompt.wait), owner=owner)
         coordinator = WorkerPassCoordinator(job_id, stopping=threading.Event())
         self._coordinators.append(coordinator)
-        self._served.app.state.worker._pass_coordinator = coordinator
+        services_of(self._served.app).worker._pass_coordinator = coordinator
         asker = _Asker(coordinator, prompt)
         self._askers.append(asker)
         assert poll_until(lambda: coordinator.open_prompt == prompt, _BUDGET), (
@@ -583,7 +585,7 @@ class _Stager:
             coordinator.interrupt_for_shutdown()
         for asker in self._askers:
             asker.join()
-        worker = self._served.app.state.worker
+        worker = services_of(self._served.app).worker
         worker._pass_coordinator = None
         worker._current_job_id = None
 
@@ -776,7 +778,7 @@ class TestThePromptTheOwnerSees:
         The prompt is Scan again, Finish, Abort: the failed pass added nothing,
         so there is nothing to re-scan.
         """
-        settings = served.app.state.settings
+        settings = services_of(served.app).settings
         kept_file = Path(settings.output.data_dir) / "failed" / "pass-3.pnm"
         waiting = stager.prompt(_retry(f"Could not write {kept_file}"))
         copy = pass_prompt_copy(waiting.prompt)
@@ -1095,7 +1097,7 @@ class TestTheScanButtonAndBusyLine:
         assert waiting.coordinator.answer(waiting.prompt.number, PassAnswer.NEXT)
         assert waiting.asker.result() is PassAnswer.NEXT
         served.job_store.update_state(waiting.job_id, JobState.SCANNING)
-        assert served.app.state.worker.pages_kept == 4
+        assert services_of(served.app).worker.pages_kept == 4
 
         area = _status_area(_status(served))
 

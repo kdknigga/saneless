@@ -21,14 +21,13 @@ import logging
 from typing import TYPE_CHECKING
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from saneless.vocabulary import TAGS_UNAVAILABLE
 from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.cache import MetadataCache
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -59,13 +58,6 @@ class _FakeClock:
 
 
 type _Clocked = tuple[TestClient, _FakeClock]
-
-
-def _app(client: TestClient) -> FastAPI:
-    """Return the client's app, checked so the type checkers know it."""
-    app = client.app
-    assert isinstance(app, FastAPI)
-    return app
 
 
 @pytest.fixture
@@ -100,12 +92,14 @@ def test_an_outage_keeps_the_last_good_tag_list(
 ) -> None:
     """Tags fetched once are still rendered after Paperless stops answering."""
     client, clock = clocked
-    paperless = _app(client).state.paperless
+    paperless = services_of(client.app).paperless
     offline_get_tags = paperless.get_tags
-    paperless.get_tags = lambda *, timeout=None: [{"id": 1, "name": "receipt"}]
+    stand_in(
+        paperless, "get_tags", lambda *, timeout=None: [{"id": 1, "name": "receipt"}]
+    )
     assert "receipt" in client.get("/api/tags").text
 
-    paperless.get_tags = offline_get_tags
+    stand_in(paperless, "get_tags", offline_get_tags)
     clock.advance(_TTL_SECONDS + 1)
     with caplog.at_level(logging.WARNING):
         first = client.get("/api/tags")

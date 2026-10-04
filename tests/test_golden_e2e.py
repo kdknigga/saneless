@@ -62,7 +62,7 @@ from saneless.vocabulary import (
     pass_wait_state,
 )
 from saneless.web.app import create_app
-from tests.conftest import load_the_lists, poll_until, wait_for_state
+from tests.conftest import load_the_lists, poll_until, services_of, wait_for_state
 from tests.golden_support import (
     DOCUMENTS_PATH,
     GOLDEN_CORRESPONDENT_IDS,
@@ -453,9 +453,11 @@ def _run_web(
     with TestClient(app) as client:
         submitted = client.post("/api/scan", data=form)
         assert submitted.status_code == 200, submitted.text
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         job_id = store.list_recent(limit=1)[0].id
-        prompts = _answer_passes(app.state.worker, store, job_id, scenario.answers)
+        prompts = _answer_passes(
+            services_of(app).worker, store, job_id, scenario.answers
+        )
         if scenario.flips:
             # The coordinator accepts an answer only once armed, and the worker
             # arms it as it records AWAITING_FLIP: a Continue sent earlier is
@@ -1353,7 +1355,7 @@ def _untouched_web_upload(
         }
         submitted = client.post("/api/scan", data=form)
         assert submitted.status_code == 200, submitted.text
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         job_id = store.list_recent(limit=1)[0].id
         job = wait_for_state(store, job_id, TERMINAL_STATES, _BUDGET)
     assert job.state is JobState.DONE, job
