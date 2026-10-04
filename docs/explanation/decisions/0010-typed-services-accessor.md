@@ -10,7 +10,7 @@ The web application's handlers need the same collaborators: the scan worker, the
 
 ## Decision
 
-The application holds one frozen `Services` dataclass, and every handler reads it through the plain function `services(request)` in `saneless.web.services`, which narrows the type for both type checkers. Mutable per-app state lives in a small mutable holder inside it, not in reassigned fields. A test that swaps one collaborator builds a new `Services` with `dataclasses.replace`. The old per-collaborator attributes on the application state do not exist.
+The application holds one frozen `Services` dataclass, and every handler and error handler reads it through the plain function `services(request)` in `saneless.web.services`, which narrows the type for both type checkers. It holds the scan worker, the job store, the settings, the paperless-ngx client, the metadata cache, the check cache and refresher, the templates, the two rate floors, the shared connection-test result, the status-token key and whether scanning is blocked. The one value that changes after start-up, whether the lifespan owns the scanner, lives in a small mutable `AppLifecycle` holder inside it, not in a reassigned field. Code that holds the app rather than a request, the server's stop hook and `serve`, reads the same object and acts only when it is a `Services`. Tests read it through `services_of(app)`, and a test that swaps one collaborator stores a new `Services` built with `dataclasses.replace`. The old per-collaborator attributes on the application state do not exist.
 
 The invariant: there is one source for each collaborator, it is typed, and a reader of a removed attribute fails with `AttributeError` instead of reading a stale copy.
 

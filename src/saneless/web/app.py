@@ -59,6 +59,7 @@ from .host_guard import HostGuard
 from .refresher import CheckRefresher
 from .routes import router, scan_is_blocked
 from .security_headers import STATIC_PATH, SecurityHeaders
+from .services import AppLifecycle, Services
 from .throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
     PAPERLESS_TEST_WAIT_SECONDS,
@@ -188,7 +189,7 @@ def _build_check_machinery(
     """
     Build the status strip's cache and the thread that fills it.
 
-    Neither reaches into ``app.state``: everything the refresher needs arrives
+    Neither reaches into the app's services: everything the refresher needs arrives
     through the context factory and the gate accessor built here, which is what
     keeps it unit-testable with no FastAPI application at all.
 
@@ -568,9 +569,10 @@ def _assemble_app(
     checks_cache, refresher = _build_check_machinery(
         settings, scanner, paperless, worker
     )
+    lifecycle = AppLifecycle()
 
     @contextlib.asynccontextmanager
-    async def lifespan(running_app: FastAPI) -> AsyncGenerator[None]:
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         """
         Recover, prune and start the worker at startup; stop it at shutdown.
 
@@ -607,7 +609,7 @@ def _assemble_app(
         the Paperless client and the job store, and re-raises, so the server
         refuses to start with nothing left open.  The scanner stays with
         ``serve``, which closes it when the lifespan never took it over.
-        ``app.state.lifespan_started`` is what tells it: true once startup
+        The services' ``lifecycle.started`` is what tells it: true once startup
         finished, and also when a failed startup left a thread running, since
         that thread may still be inside SANE.
 
@@ -645,9 +647,9 @@ def _assemble_app(
             # A thread still running may be inside SANE, so the scanner must
             # not be shut down under it: the lifespan keeps it, as it would
             # at shutdown.
-            running_app.state.lifespan_started = not released
+            lifecycle.started = not released
             raise
-        running_app.state.lifespan_started = True
+        lifecycle.started = True
         logger.info("App started")
         yield
         worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
@@ -708,38 +710,56 @@ def _assemble_app(
     install_error_handlers(app)
     _install_middleware(app, settings)
 
-    # Set by the lifespan once it owns the scanner; serve closes the scanner
-    # itself while this is still false.
-    app.state.lifespan_started = False
-    app.state.worker = worker
-    app.state.job_store = job_store
-    app.state.settings = settings
-    app.state.paperless = paperless
-    app.state.cache = cache
-    app.state.checks = checks_cache
-    app.state.refresher = refresher
-    app.state.templates = _build_templates()
-    # The two routes that send a token-bearing request to paperless-ngx on
-    # every call get a rate floor, decided in web/throttle.py: one refetch
-    # per resource per floor window, and one shared connection-test answer.
-    app.state.invalidate_floors = {
-        "tags": MinimumInterval(),
-        "correspondents": MinimumInterval(),
-    }
-    app.state.paperless_test_result = SingleFlightResult(
-        ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
+    services = Services(
+        worker=worker,
+        job_store=job_store,
+        settings=settings,
+        paperless=paperless,
+        cache=cache,
+        checks=checks_cache,
+        refresher=refresher,
+        templates=_build_templates(),
+        # The two routes that send a token-bearing request to paperless-ngx on
+        # every call get a rate floor, decided in web/throttle.py: one refetch
+        # per resource per floor window, and one shared connection-test answer.
+        invalidate_floors={
+            "tags": MinimumInterval(),
+            "correspondents": MinimumInterval(),
+        },
+        paperless_test_result=SingleFlightResult(
+            ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
+        ),
+        # The key the status polls' "seen" tokens are hashed with.  Those
+        # tokens travel in URLs, and so into access logs; a key minted per
+        # process makes one unlinkable to the content it stands for and
+        # impossible to compute ahead of time.  A restart mints a new key,
+        # which costs each open page one full render on its next poll and
+        # nothing else.
+        status_token_key=secrets.token_bytes(32),
+        # Whether paperless-ngx is configured well enough for any scan to
+        # start.  The settings are fixed for the life of the process, so it is
+        # decided once; the error rendering reads it so a refusal on a blocked
+        # appliance never re-renders Scan enabled.
+        scan_blocked=scan_is_blocked(settings),
+        # Set by the lifespan once it owns the scanner; serve closes the
+        # scanner itself while this is still false.
+        lifecycle=lifecycle,
     )
-    # The key the status polls' "seen" tokens are hashed with.  Those tokens
-    # travel in URLs, and so into access logs; a key minted per process makes
-    # one unlinkable to the content it stands for and impossible to compute
-    # ahead of time.  A restart mints a new key, which costs each open page
-    # one full render on its next poll and nothing else.
-    app.state.status_token_key = secrets.token_bytes(32)
-    # Whether paperless-ngx is configured well enough for any scan to start.
-    # The settings are fixed for the life of the process, so it is decided
-    # once; the error rendering reads it so a refusal on a blocked appliance
-    # never re-renders Scan enabled.
-    app.state.scan_blocked = scan_is_blocked(settings)
+    app.state.services = services
+    # The same objects under their own names, only for tests that do not read
+    # ``services`` yet; no code in the app reads these.
+    app.state.worker = services.worker
+    app.state.job_store = services.job_store
+    app.state.settings = services.settings
+    app.state.paperless = services.paperless
+    app.state.cache = services.cache
+    app.state.checks = services.checks
+    app.state.refresher = services.refresher
+    app.state.templates = services.templates
+    app.state.invalidate_floors = services.invalidate_floors
+    app.state.paperless_test_result = services.paperless_test_result
+    app.state.status_token_key = services.status_token_key
+    app.state.scan_blocked = services.scan_blocked
 
     app.mount(STATIC_PATH, StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)

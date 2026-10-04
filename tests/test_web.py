@@ -8,6 +8,7 @@ every page, partial and JSON answer is asserted as the browser receives it.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import html
 import inspect
 import json
@@ -91,7 +92,13 @@ from saneless.web.routes import OWNER_COOKIE, _profile_options, _ProfileOption
 from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
+from tests.conftest import (
+    StubScannerBackend,
+    leaf_routes,
+    load_the_lists,
+    services_of,
+    stand_in,
+)
 from tests.template_support import template_start_tags
 
 
@@ -150,14 +157,22 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda *, timeout=None: [
-        {"id": 1, "name": "receipt"},
-        {"id": 2, "name": "invoice"},
-    ]
-    app.state.paperless.get_correspondents = lambda *, timeout=None: [
-        {"id": 1, "name": "ACME Corp"},
-    ]
-    return app.state.paperless
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "receipt"},
+            {"id": 2, "name": "invoice"},
+        ],
+    )
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "ACME Corp"},
+        ],
+    )
+    return services_of(app).paperless
 
 
 @pytest.fixture
@@ -304,7 +319,11 @@ def test_web_api_reference_paperless_test_bodies_match_the_app(
     The probe is made to report each status in turn, and the body the route
     really returns must be the body in one of the rows for its status code.
     """
-    _app(client).state.paperless.test_connection = lambda timeout=None: status
+    stand_in(
+        services_of(client.app).paperless,
+        "test_connection",
+        lambda timeout=None: status,
+    )
     response = client.get("/api/paperless/test")
     rows = _table_row(
         _doc_section(WEB_API_DOC, "### `GET /api/paperless/test`"),
@@ -597,8 +616,8 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
         gate.wait(5)
         return []
 
-    app.state.paperless.get_tags = blocking_get_tags
-    app.state.cache.invalidate("tags")
+    stand_in(services_of(app).paperless, "get_tags", blocking_get_tags)
+    services_of(app).cache.invalidate("tags")
     slow = threading.Thread(target=lambda: client.get("/api/tags"), daemon=True)
     slow.start()
     try:
@@ -632,13 +651,13 @@ def test_metadata_fetch_failure_says_the_list_is_unavailable(
         msg = "paperless unreachable"
         raise ConnectionError(msg)
 
-    app.state.paperless.get_tags = failing_get_tags
+    stand_in(services_of(app).paperless, "get_tags", failing_get_tags)
     with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
         response = client.get("/api/tags")
 
     assert response.status_code == 200
     assert "receipt" not in response.text
-    assert app.state.cache.get("tags") is None
+    assert services_of(app).cache.get("tags") is None
     records = [
         r
         for r in caplog.records
@@ -669,7 +688,7 @@ def test_health_reports_degraded_worker(
 
 def test_health_reports_down_worker(client: TestClient) -> None:
     """A stopped worker makes /health a 503 naming the thread."""
-    assert _app(client).state.worker.stop()
+    assert services_of(client.app).worker.stop()
     response = client.get("/health")
     assert response.status_code == 503
     assert response.json() == {"status": "error", "detail": "worker thread is down"}
@@ -714,10 +733,10 @@ def titled_client(
         profiles={"default": ProfileConfig(title="Receipt")},
     )
     app = create_app(settings, web_scanner)
-    app.state.paperless.get_tags = _no_rows
-    app.state.paperless.get_correspondents = _no_rows
+    monkeypatch.setattr(services_of(app).paperless, "get_tags", _no_rows)
+    monkeypatch.setattr(services_of(app).paperless, "get_correspondents", _no_rows)
     monkeypatch.setattr(
-        app.state.worker, "submit", lambda _job, _options: SubmitResult.ACCEPTED
+        services_of(app).worker, "submit", lambda _job, _options: SubmitResult.ACCEPTED
     )
     with TestClient(app) as tc:
         yield tc
@@ -732,7 +751,7 @@ def test_scan_blank_title_uses_profile_title(
         "/api/scan", data={"profile": "default", "title": typed}
     )
     assert response.status_code == 200
-    job_store: JobStore = _app(titled_client).state.job_store
+    job_store: JobStore = services_of(titled_client.app).job_store
     assert job_store.list_recent(limit=1)[0].title == "Receipt"
 
 
@@ -742,13 +761,13 @@ def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None
         "/api/scan", data={"profile": "default", "title": "Typed"}
     )
     assert response.status_code == 200
-    job_store: JobStore = _app(titled_client).state.job_store
+    job_store: JobStore = services_of(titled_client.app).job_store
     assert job_store.list_recent(limit=1)[0].title == "Typed"
 
 
 def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) -> None:
     """Resolving the title never masks an unknown profile."""
-    job_store: JobStore = _app(titled_client).state.job_store
+    job_store: JobStore = services_of(titled_client.app).job_store
     before = job_store.list_recent(limit=50)
     response = titled_client.post(
         "/api/scan", data={"profile": "no-such-profile", "title": ""}
@@ -807,10 +826,10 @@ def test_status_polling_active_job(client: TestClient) -> None:
     The poll carries only the token of the rendering it shows, and that token
     is the real one: polling it while nothing changes is answered 204.
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Polling Test")
     job_store.update_state(job.id, JobState.SCANNING)
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
@@ -830,10 +849,10 @@ def test_status_polling_active_job(client: TestClient) -> None:
 
 def test_flip_prompt(client: TestClient) -> None:
     """AWAITING_FLIP state shows the flip prompt's wording and both buttons."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Flip Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     text_lower = response.text.lower()
@@ -859,13 +878,13 @@ def test_flip_prompt(client: TestClient) -> None:
 
 def test_thumbnail_display(client: TestClient) -> None:
     """The owner's job with a thumbnail shows the base64 img tag."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title="Thumb Test", owner_token=_as_owner(client)
     )
     job_store.update_thumbnail(job.id, "dGVzdA==")
     job_store.update_state(job.id, JobState.SCANNING)
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert "data:image/jpeg;base64,dGVzdA==" in response.text
@@ -873,7 +892,7 @@ def test_thumbnail_display(client: TestClient) -> None:
 
 def test_job_history(client: TestClient) -> None:
     """GET /api/jobs/history returns the owner's jobs by title."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
     owner = _as_owner(client)
     for title in titles:
@@ -887,12 +906,12 @@ def test_job_history(client: TestClient) -> None:
 
 def test_error_display(client: TestClient) -> None:
     """Error state shows the owner its error message in status area."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="default", title="Error Test", owner_token=_as_owner(client)
     )
     job_store.update_state(job.id, JobState.ERROR, error="Scanner disconnected")
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert "Scanner disconnected" in response.text
@@ -901,7 +920,7 @@ def test_error_display(client: TestClient) -> None:
 def test_cache_invalidate(client: TestClient) -> None:
     """POST /api/cache/invalidate refetches the resource and renders it."""
     app = _app(client)
-    app.state.cache.set("tags", [{"id": 1, "name": "receipt"}])
+    services_of(app).cache.set("tags", [{"id": 1, "name": "receipt"}])
     fetches: list[int] = []
 
     def fresh_tags(*, timeout: object = None) -> list[dict[str, object]]:
@@ -909,7 +928,7 @@ def test_cache_invalidate(client: TestClient) -> None:
         fetches.append(1)
         return [{"id": 7, "name": "tax-return"}]
 
-    app.state.paperless.get_tags = fresh_tags
+    stand_in(services_of(app).paperless, "get_tags", fresh_tags)
 
     response = client.post("/api/cache/invalidate?resource=tags")
 
@@ -917,12 +936,12 @@ def test_cache_invalidate(client: TestClient) -> None:
     assert fetches == [1]
     assert "tax-return" in response.text
     assert "receipt" not in response.text
-    assert app.state.cache.get("tags") == [{"id": 7, "name": "tax-return"}]
+    assert services_of(app).cache.get("tags") == [{"id": 7, "name": "tax-return"}]
 
 
 def test_cache_invalidate_rejects_an_unknown_resource(client: TestClient) -> None:
     """Only tags and correspondents can be invalidated; nothing else is."""
-    cache = _app(client).state.cache
+    cache = services_of(client.app).cache
     cache.set("tags", [{"id": 1, "name": "receipt"}])
 
     response = client.post("/api/cache/invalidate?resource=bogus")
@@ -951,8 +970,8 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     status area must still report it -- not the queue-full rejection.
     """
     app = _app(client)
-    job_store: JobStore = app.state.job_store
-    worker = app.state.worker
+    job_store: JobStore = services_of(app).job_store
+    worker = services_of(app).worker
     job = job_store.create_job(
         profile="default", title="Running Job", owner_token=_as_owner(client)
     )
@@ -988,7 +1007,7 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
 
 def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> None:
     """With only rejected rows and no current job, nothing has run."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Never Ran")
     job_store.finish_job(
         job.id,
@@ -1006,7 +1025,7 @@ def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> 
 
 def test_index_lists_the_worker_profiles(client: TestClient) -> None:
     """The profile dropdown reads the worker's locked profile set."""
-    _app(client).state.worker._set_profiles(
+    services_of(client.app).worker._set_profiles(
         {"default": ProfileConfig(), "zz-new-profile": ProfileConfig()}
     )
 
@@ -1026,12 +1045,12 @@ def test_flip_continue(client: TestClient) -> None:
     back to the most recent job, as the status poll does, rather than render
     the idle copy for a job that plainly exists.
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="duplex", title="Flip Just Finished", owner_token=_as_owner(client)
     )
     job_store.finish_job(job.id, JobState.DONE)
-    assert _app(client).state.worker.current_job_id is None
+    assert services_of(client.app).worker.current_job_id is None
 
     response = client.post("/api/flip/continue", data={"job_id": job.id})
 
@@ -1047,7 +1066,7 @@ def test_flip_abort(client: TestClient) -> None:
     Otherwise an abort that aborted nothing reports nothing either: the partial
     would say "Ready to scan." while the job that timed out sits in history.
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(
         profile="duplex", title="Flip Timed Out", owner_token=_as_owner(client)
     )
@@ -1056,7 +1075,7 @@ def test_flip_abort(client: TestClient) -> None:
         JobState.ERROR,
         error="Manual duplex flip wait timed out after 600 seconds",
     )
-    assert _app(client).state.worker.current_job_id is None
+    assert services_of(client.app).worker.current_job_id is None
 
     response = client.post("/api/flip/abort", data={"job_id": job.id})
 
@@ -1078,8 +1097,8 @@ def waiting_flip(client: TestClient) -> Iterator[tuple[str, WorkerFlipCoordinato
     hold while the job is ``AWAITING_FLIP``.  Both attributes are reset on
     teardown so the lifespan's worker thread is not left pointing at a fake.
     """
-    worker = _app(client).state.worker
-    job_store: JobStore = _app(client).state.job_store
+    worker = services_of(client.app).worker
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="duplex", title="Flip Waiting")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
     coordinator = WorkerFlipCoordinator(job.id)
@@ -1250,7 +1269,11 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
 
 def test_paperless_test_connected(client: TestClient) -> None:
     """A working Paperless connection reads ``connected`` with a 200."""
-    _app(client).state.paperless.test_connection = lambda timeout=None: "connected"
+    stand_in(
+        services_of(client.app).paperless,
+        "test_connection",
+        lambda timeout=None: "connected",
+    )
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "connected"}
@@ -1258,7 +1281,11 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
     """A refused token reads ``token_rejected`` with a 200, not an error status."""
-    _app(client).state.paperless.test_connection = lambda timeout=None: "token_rejected"
+    stand_in(
+        services_of(client.app).paperless,
+        "test_connection",
+        lambda timeout=None: "token_rejected",
+    )
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "token_rejected"}
@@ -1266,7 +1293,11 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
     """An unreachable Paperless reads ``unreachable`` with a 200, not an error status."""
-    _app(client).state.paperless.test_connection = lambda timeout=None: "unreachable"
+    stand_in(
+        services_of(client.app).paperless,
+        "test_connection",
+        lambda timeout=None: "unreachable",
+    )
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "unreachable"}
@@ -1280,7 +1311,7 @@ def test_paperless_test_error(client: TestClient) -> None:
         msg = "boom"
         raise RuntimeError(msg)
 
-    _app(client).state.paperless.test_connection = raise_exc
+    stand_in(services_of(client.app).paperless, "test_connection", raise_exc)
     response = client.get("/api/paperless/test")
     assert response.status_code == 500
     data = response.json()
@@ -1291,7 +1322,7 @@ def test_paperless_test_error(client: TestClient) -> None:
 
 def test_history_humanized_labels(client: TestClient) -> None:
     """Job history shows human-readable state labels instead of raw enum values."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Label Test")
     job_store.update_state(job.id, JobState.DONE)
 
@@ -1302,19 +1333,19 @@ def test_history_humanized_labels(client: TestClient) -> None:
 
 def test_status_no_inline_scripts(client: TestClient) -> None:
     """Status partial contains no inline script tags for DONE or ERROR states."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
 
     # DONE state
     job_done = job_store.create_job(profile="default", title="Done Script Test")
     job_store.update_state(job_done.id, JobState.DONE)
-    _app(client).state.worker._current_job_id = job_done.id
+    services_of(client.app).worker._current_job_id = job_done.id
     resp_done = client.get("/api/jobs/current/status")
     assert "<script>" not in resp_done.text
 
     # ERROR state
     job_err = job_store.create_job(profile="default", title="Err Script Test")
     job_store.update_state(job_err.id, JobState.ERROR, error="test error")
-    _app(client).state.worker._current_job_id = job_err.id
+    services_of(client.app).worker._current_job_id = job_err.id
     resp_err = client.get("/api/jobs/current/status")
     assert "<script>" not in resp_err.text
 
@@ -1341,10 +1372,10 @@ def test_scan_form_has_heading(client: TestClient) -> None:
 
 def test_flip_abort_label(client: TestClient) -> None:
     """Flip prompt cancel button reads Abort scan."""
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Flip Abort Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert "Abort scan" in response.text
@@ -1373,8 +1404,10 @@ def test_css_spacing_normalized() -> None:
 def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
     """500 response returns exception class name, not raw message with secrets."""
     sensitive_msg = "http://192.168.1.100:8000 token=abc123"
-    _app(client).state.paperless.test_connection = _raise_factory(
-        ConnectionError, sensitive_msg
+    stand_in(
+        services_of(client.app).paperless,
+        "test_connection",
+        _raise_factory(ConnectionError, sensitive_msg),
     )
     response = client.get("/api/paperless/test")
     assert response.status_code == 500
@@ -1419,7 +1452,7 @@ def test_the_connection_test_uses_the_probe_budget(client: TestClient) -> None:
     far past what a stopping server waits for.
     """
     recording = _RecordingConnectionTest()
-    _app(client).state.paperless.test_connection = recording
+    stand_in(services_of(client.app).paperless, "test_connection", recording)
 
     assert client.get("/api/paperless/test").status_code == 200
 
@@ -1473,14 +1506,14 @@ class TestAppComposition:
         try:
             yield built
         finally:
-            built.state.paperless.close()
-            built.state.job_store.close()
+            services_of(built).paperless.close()
+            services_of(built).job_store.close()
 
     def test_registers_the_filters_the_templates_reach_for(
         self, unstarted_app: FastAPI
     ) -> None:
         """Every filter name the templates reach for is registered."""
-        filters = unstarted_app.state.templates.env.filters
+        filters = services_of(unstarted_app).templates.env.filters
         expected = {
             "check_row_class",
             "check_row_glyph",
@@ -1503,7 +1536,7 @@ class TestAppComposition:
         and drift from ``saneless doctor`` the first time either side is
         edited.  ``is`` is what makes "one shared place" checkable.
         """
-        filters = unstarted_app.state.templates.env.filters
+        filters = services_of(unstarted_app).templates.env.filters
         assert filters["check_row_class"] is check_row_class
         assert filters["check_row_glyph"] is check_row_glyph
         assert filters["check_row_label"] is check_row_label
@@ -1524,7 +1557,7 @@ class TestAppComposition:
         plausible names of which only one is right.  The Python functions
         exist; they are simply not filters.
         """
-        filters = unstarted_app.state.templates.env.filters
+        filters = services_of(unstarted_app).templates.env.filters
         state_lookups = {"check_state_class", "check_state_glyph", "check_state_label"}
         assert not state_lookups & set(filters)
 
@@ -1532,14 +1565,14 @@ class TestAppComposition:
         self, unstarted_app: FastAPI
     ) -> None:
         """Routes reach both through the same channel the worker uses."""
-        assert isinstance(unstarted_app.state.checks, CheckCache)
-        assert isinstance(unstarted_app.state.refresher, CheckRefresher)
+        assert isinstance(services_of(unstarted_app).checks, CheckCache)
+        assert isinstance(services_of(unstarted_app).refresher, CheckRefresher)
 
     def test_the_cache_is_cold_before_the_app_is_entered(
         self, unstarted_app: FastAPI
     ) -> None:
         """Construction issues no probe, so the first render says Checking."""
-        cached = unstarted_app.state.checks.current()
+        cached = services_of(unstarted_app).checks.current()
         assert cached.results is None
         assert cached.checked_at is None
 
@@ -1547,19 +1580,19 @@ class TestAppComposition:
         self, unstarted_app: FastAPI, web_settings: Settings
     ) -> None:
         """
-        The app state carries its five parts, and the label filters are the right ones.
+        The app's services carry their five parts, and the label filters are right.
 
         ``state_label`` is deliberately absent: it reads the state alone, so it
         would call a warned upload "Complete".  Every label goes through
         ``job_label``, which also reads the warning.
         """
-        state = unstarted_app.state
-        assert isinstance(state.worker, ScanWorker)
-        assert isinstance(state.job_store, JobStore)
-        assert state.settings is web_settings
-        assert state.paperless is not None
-        assert state.cache is not None
-        filters = state.templates.env.filters
+        svc = services_of(unstarted_app)
+        assert isinstance(svc.worker, ScanWorker)
+        assert isinstance(svc.job_store, JobStore)
+        assert svc.settings is web_settings
+        assert svc.paperless is not None
+        assert svc.cache is not None
+        filters = svc.templates.env.filters
         assert {"job_label", "progress_label", "flip_answer_label"} <= set(filters)
         assert "state_label" not in filters
 
@@ -1573,7 +1606,7 @@ class TestAppComposition:
         and by anything that wants to inspect routes; none of them should get a
         probing daemon as a side effect.
         """
-        assert unstarted_app.state.refresher._thread.is_alive() is False
+        assert services_of(unstarted_app).refresher._thread.is_alive() is False
 
 
 # --- The owner cookie --------------------------------------------------------
@@ -1643,7 +1676,7 @@ def _newest_job(client: TestClient) -> Job:
         The newest row, which is the one the last submit created.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     return job_store.list_recent(limit=1)[0]
 
 
@@ -1687,7 +1720,7 @@ def _other_browser(client: TestClient) -> TestClient:
 def accepting_client(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Return the shared client, with submits accepted but no pipeline run."""
     monkeypatch.setattr(
-        _app(client).state.worker,
+        services_of(client.app).worker,
         "submit",
         lambda _job, _options: SubmitResult.ACCEPTED,
     )
@@ -1706,8 +1739,8 @@ def owned_flip(
     instead of a hand-made value that only resembles one.
     """
     job_id = _submit_scan(accepting_client, "Owned Flip")
-    worker = _app(accepting_client).state.worker
-    job_store: JobStore = _app(accepting_client).state.job_store
+    worker = services_of(accepting_client.app).worker
+    job_store: JobStore = services_of(accepting_client.app).job_store
     job_store.update_state(job_id, JobState.AWAITING_FLIP)
     coordinator = WorkerFlipCoordinator(job_id)
     coordinator.arm()
@@ -1814,7 +1847,7 @@ class TestOwnerCookie:
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "One"})
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "Two"})
 
-        job_store: JobStore = _app(accepting_client).state.job_store
+        job_store: JobStore = services_of(accepting_client.app).job_store
         recorded = {job.owner_token for job in job_store.list_recent(limit=2)}
         assert recorded == {accepting_client.cookies[_OWNER_COOKIE]}
 
@@ -1935,7 +1968,7 @@ class TestOwnerCookie:
         time out.
         """
         job_id, coordinator = waiting_flip
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         staged = job_store.get_job(job_id)
         assert staged is not None
         assert staged.owner_token is None
@@ -2006,7 +2039,7 @@ def _job_count(client: TestClient) -> int:
         The number of rows written so far.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     return len(job_store.list_recent(limit=10_000))
 
 
@@ -2080,8 +2113,10 @@ class TestPostSubmitRender:
     ) -> None:
         """A template that raises while rendering still reports the job."""
         browser = _lenient_browser(accepting_client)
-        templates = _app(accepting_client).state.templates
-        render = templates.TemplateResponse
+        templates = services_of(accepting_client.app).templates
+        # ``Any``: the arguments pass through unchanged, so the wrapper repeats
+        # none of their types.
+        render: Any = templates.TemplateResponse
 
         def _fail_the_scan_response(
             request: object, name: str, *args: object, **kwargs: object
@@ -2110,7 +2145,7 @@ class TestPostSubmitRender:
             return SubmitResult.ACCEPTED
 
         monkeypatch.setattr(
-            _app(accepting_client).state.worker, "submit", _record_submit
+            services_of(accepting_client.app).worker, "submit", _record_submit
         )
         monkeypatch.setattr(routes_module, "_checks_context", _fail_render)
         before = _job_count(accepting_client)
@@ -2181,10 +2216,10 @@ def _running_job(
         The job's id.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title=title, owner_token=owner_token)
     job_store.update_state(job.id, JobState.SCANNING)
-    _app(client).state.worker._current_job_id = job.id
+    services_of(client.app).worker._current_job_id = job.id
     return job.id
 
 
@@ -2200,7 +2235,7 @@ def _queued_job(client: TestClient, title: str) -> str:
         The job's id.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     return job_store.create_job(profile="default", title=title).id
 
 
@@ -2238,7 +2273,7 @@ class TestFollowedJob:
         """The named job is rendered whatever the worker happens to be running."""
         owner = _as_owner(client)
         _running_job(client, "Someone Elses Scan", owner_token=owner)
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         mine = job_store.create_job(
             profile="default", title="My Scan", owner_token=owner
         )
@@ -2346,8 +2381,8 @@ class TestFollowedJob:
 
     def test_multi_page_answer_follows_the_posted_job(self, client: TestClient) -> None:
         """A multi-page answer's response keeps polling the job it answered."""
-        job_store: JobStore = _app(client).state.job_store
-        worker = _app(client).state.worker
+        job_store: JobStore = services_of(client.app).job_store
+        worker = services_of(client.app).worker
         job = job_store.create_job(
             profile="default", title="Pages", owner_token=_as_owner(client)
         )
@@ -2373,7 +2408,7 @@ class TestFollowedJob:
         """
         owner = _as_owner(client)
         _running_job(client, "Someone Elses Scan", owner_token="another-browser")
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         mine = job_store.create_job(profile="default", title="Mine", owner_token=owner)
 
         page = client.get("/").text
@@ -2386,7 +2421,7 @@ class TestFollowedJob:
         """Of two active jobs this browser owns, the page follows the newer one."""
         owner = _as_owner(client)
         _running_job(client, "Older And Running", owner_token=owner)
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         newer = job_store.create_job(
             profile="default", title="Newer And Queued", owner_token=owner
         )
@@ -2398,7 +2433,7 @@ class TestFollowedJob:
     def test_index_never_follows_an_unowned_job(self, client: TestClient) -> None:
         """A queued job nobody owns, or someone else owns, is never followed."""
         _as_owner(client)
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         nobodys = job_store.create_job(profile="default", title="Nobody's")
         theirs = job_store.create_job(
             profile="default", title="Theirs", owner_token="another-browser"
@@ -2486,7 +2521,7 @@ class TestStatusPollAnswersWhenChanged:
         """A state the viewer has not seen yet is rendered in full."""
         job_id = _running_job(client, "Changing")
         seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job_store.update_state(job_id, JobState.UPLOADING)
 
         response = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
@@ -2498,7 +2533,7 @@ class TestStatusPollAnswersWhenChanged:
         """A preview stored mid-scan is news, though the busy line is unchanged."""
         job_id = _running_job(client, "Previewed", owner_token=_as_owner(client))
         seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job_store.update_thumbnail(job_id, _THUMBNAIL)
 
         response = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
@@ -2516,7 +2551,7 @@ class TestStatusPollAnswersWhenChanged:
         right.)
         """
         job_id = _running_job(client, "Owners Scan", owner_token=_as_owner(client))
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job_store.update_thumbnail(job_id, _THUMBNAIL)
         owners = client.get(f"/api/jobs/{job_id}/status").text
         seen = _seen_in(owners)
@@ -2640,11 +2675,11 @@ class TestQueueLine:
         named as the job being waited for, so counting it as well would tell
         the job behind it that one more is ahead.
         """
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         running = job_store.create_job(
             profile="default", title="Tax return", owner_token=_as_owner(client)
         )
-        _app(client).state.worker._current_job_id = running.id
+        services_of(client.app).worker._current_job_id = running.id
         mine = _queued_job(client, "Mine")
 
         response = client.get(f"/api/jobs/{mine}/status")
@@ -2693,7 +2728,7 @@ class TestQueueLine:
         """Pass B leads with the pages already counted on pass A."""
         monkeypatch.setattr(ScanWorker, "front_pages", property(lambda _self: 12))
         job_id = _running_job(client, "Duplex Stack")
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         job_store.update_state(job_id, JobState.SCANNING_REVERSE)
 
         response = client.get(f"/api/jobs/{job_id}/status")
@@ -2729,7 +2764,7 @@ def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) 
     fail the test that built it, never leave the test passing against
     whatever profiles happened to be there before.
     """
-    assert _app(client).state.worker._set_profiles(profiles)
+    assert services_of(client.app).worker._set_profiles(profiles)
 
 
 class TestProfileDescriptionRoute:
@@ -2835,7 +2870,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker).options
+        options = _profile_options(services_of(client.app).worker).options
 
         assert options == (
             _ProfileOption(
@@ -2858,7 +2893,7 @@ class TestProfileOrdering:
             },
         )
 
-        option, _ = _profile_options(_app(client).state.worker).options
+        option, _ = _profile_options(services_of(client.app).worker).options
 
         assert option.label == "adf-duplex"
 
@@ -2875,7 +2910,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker).options
+        options = _profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["stack", "pick", "default"]
 
@@ -2898,7 +2933,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker).options
+        options = _profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["feeder", "mystery", "default"]
 
@@ -2917,7 +2952,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker).options
+        options = _profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == [
             "stack-1",
@@ -2940,7 +2975,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker).options
+        options = _profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["glass", "stack", "default"]
 
@@ -2948,7 +2983,7 @@ class TestProfileOrdering:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A profile rewritten between the two locked calls is skipped, not None."""
-        worker = _app(client).state.worker
+        worker = services_of(client.app).worker
         _configure_profiles(
             client,
             {
@@ -3024,7 +3059,7 @@ class TestProfileChoices:
         assert profiles["default"] == profiles["flatbed"]
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(_app(client).state.worker)
+        choices = _profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["flatbed", "adf"]
         assert choices.opening == "flatbed"
@@ -3054,7 +3089,7 @@ class TestProfileChoices:
         )
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(_app(client).state.worker)
+        choices = _profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == [
             "flatbed",
@@ -3082,7 +3117,7 @@ class TestProfileChoices:
             },
         )
 
-        choices = _profile_options(_app(client).state.worker)
+        choices = _profile_options(services_of(client.app).worker)
         page = client.get("/").text
 
         assert [option.label for option in choices.options] == [
@@ -3110,7 +3145,7 @@ class TestProfileChoices:
             },
         )
 
-        choices = _profile_options(_app(client).state.worker)
+        choices = _profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["glass", "default"]
         assert [option.label for option in choices.options] == [
@@ -3127,7 +3162,7 @@ class TestProfileChoices:
         assert profiles["default"] == profiles["adf"]
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(_app(client).state.worker)
+        choices = _profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["adf", "adf-duplex"]
         assert choices.opening == "adf"
@@ -3136,7 +3171,7 @@ class TestProfileChoices:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Nothing to list is an empty select, and the page still renders."""
-        worker = _app(client).state.worker
+        worker = services_of(client.app).worker
         monkeypatch.setattr(worker, "profile_names", list)
 
         choices = _profile_options(worker)
@@ -3246,7 +3281,7 @@ class TestPageOpensOnDefault:
         )
 
         assert response.status_code == 200
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         assert job_store.list_recent(limit=1)[0].profile == "default"
 
 
@@ -3537,7 +3572,7 @@ class TestProfileSelectMarkup:
         )
 
         assert response.status_code == 200
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         assert job_store.list_recent(limit=1)[0].profile == "duplex"
 
 
@@ -3599,8 +3634,10 @@ def _serve_tag_rows(client: TestClient) -> FastAPI:
 
     """
     app = _app(client)
-    app.state.paperless.get_tags = lambda *, timeout=None: list(_TAG_ROWS)
-    app.state.cache.invalidate("tags")
+    stand_in(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: list(_TAG_ROWS)
+    )
+    services_of(app).cache.invalidate("tags")
     return app
 
 
@@ -3616,10 +3653,13 @@ def _count_upstream(app: FastAPI) -> _RecordingTransport:
 
     """
     handler = _RecordingTransport()
-    app.state.paperless = PaperlessClient(
-        url="http://paperless.invalid:8000",
-        token="a-real-looking-token",
-        transport=httpx2.MockTransport(handler),
+    app.state.services = dataclasses.replace(
+        services_of(app),
+        paperless=PaperlessClient(
+            url="http://paperless.invalid:8000",
+            token="a-real-looking-token",
+            transport=httpx2.MockTransport(handler),
+        ),
     )
     return handler
 
@@ -3751,7 +3791,7 @@ class TestTagFilter:
         """Filtering reads the cache; it is not a new fetch."""
         app = _app(client)
         handler = _count_upstream(app)
-        app.state.cache.set("tags", list(_TAG_ROWS))
+        services_of(app).cache.set("tags", list(_TAG_ROWS))
 
         response = client.get("/api/tags", params={"q": "rec"})
 
@@ -3765,7 +3805,7 @@ class TestTagFilter:
         """A cold cache fetches the whole list and carries no ``q``."""
         app = _app(client)
         handler = _count_upstream(app)
-        app.state.cache.invalidate("tags")
+        services_of(app).cache.invalidate("tags")
 
         response = client.get("/api/tags", params={"q": "receipt"})
 
@@ -3780,8 +3820,8 @@ class TestTagFilter:
     ) -> None:
         """No tags at all is its own sentence, not a blank box."""
         app = _app(client)
-        app.state.paperless.get_tags = _no_rows
-        app.state.cache.invalidate("tags")
+        stand_in(services_of(app).paperless, "get_tags", _no_rows)
+        services_of(app).cache.invalidate("tags")
 
         response = client.get("/api/tags")
 
@@ -3832,7 +3872,7 @@ class TestTagFilter:
         )
 
         assert response.status_code == 200
-        job_store: JobStore = _app(client).state.job_store
+        job_store: JobStore = services_of(client.app).job_store
         assert job_store.list_recent(limit=1)[0].title == "Stray Filter"
 
 
@@ -3867,12 +3907,18 @@ def _serve_known_lists(client: TestClient) -> FastAPI:
 
     """
     app = _app(client)
-    app.state.paperless.get_tags = lambda *, timeout=None: list(_KNOWN_TAG_ROWS)
-    app.state.paperless.get_correspondents = lambda *, timeout=None: list(
-        _KNOWN_CORRESPONDENT_ROWS
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: list(_KNOWN_TAG_ROWS),
     )
-    app.state.cache.invalidate("tags")
-    app.state.cache.invalidate("correspondents")
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: list(_KNOWN_CORRESPONDENT_ROWS),
+    )
+    services_of(app).cache.invalidate("tags")
+    services_of(app).cache.invalidate("correspondents")
     return app
 
 
@@ -3888,10 +3934,10 @@ def _serve_nothing(client: TestClient) -> FastAPI:
 
     """
     app = _app(client)
-    app.state.paperless.get_tags = _fail_fetch
-    app.state.paperless.get_correspondents = _fail_fetch
-    app.state.cache.invalidate("tags")
-    app.state.cache.invalidate("correspondents")
+    stand_in(services_of(app).paperless, "get_tags", _fail_fetch)
+    stand_in(services_of(app).paperless, "get_correspondents", _fail_fetch)
+    services_of(app).cache.invalidate("tags")
+    services_of(app).cache.invalidate("correspondents")
     return app
 
 
@@ -3945,9 +3991,9 @@ def _render_correspondent_options(client: TestClient, selected: int | None) -> s
     """
     app = _app(client)
     context = routes_module._correspondent_options_context(
-        app.state, selected, timeout=routes_module._REQUEST_FETCH_TIMEOUT
+        services_of(app), selected, timeout=routes_module._REQUEST_FETCH_TIMEOUT
     )
-    template = app.state.templates.get_template("partials/correspondents.html")
+    template = services_of(app).templates.get_template("partials/correspondents.html")
     return template.render(context)
 
 
@@ -4152,8 +4198,10 @@ def _simple_form_app(
         },
     )
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda *, timeout=None: list(_TAG_ROWS)
-    app.state.paperless.get_correspondents = _no_rows
+    stand_in(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: list(_TAG_ROWS)
+    )
+    stand_in(services_of(app).paperless, "get_correspondents", _no_rows)
     return app
 
 
@@ -4271,7 +4319,7 @@ class TestSimpleForm:
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
             )
             assert response.status_code == 200
-            job_store: JobStore = _app(client).state.job_store
+            job_store: JobStore = services_of(client.app).job_store
             assert job_store.list_recent(limit=1)[0].tags == _PROFILE_DEFAULT_TAGS
 
     def test_simple_form_without_correspondent_still_applies_its_default(
@@ -4283,7 +4331,7 @@ class TestSimpleForm:
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
             )
             assert response.status_code == 200
-            job_store: JobStore = _app(client).state.job_store
+            job_store: JobStore = services_of(client.app).job_store
             job = job_store.list_recent(limit=1)[0]
             assert job.correspondent == _PROFILE_DEFAULT_CORRESPONDENT
 
@@ -4302,7 +4350,7 @@ class TestSimpleForm:
                 data={"profile": "default", "title": "Chosen", "tags": ["7"]},
             )
             assert response.status_code == 200
-            job_store: JobStore = _app(client).state.job_store
+            job_store: JobStore = services_of(client.app).job_store
             assert job_store.list_recent(limit=1)[0].tags == [7]
 
     def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
@@ -4342,7 +4390,7 @@ def _newest_job(client: TestClient) -> Job:
         The most recent job row.
 
     """
-    job_store: JobStore = _app(client).state.job_store
+    job_store: JobStore = services_of(client.app).job_store
     rows = job_store.list_recent(limit=1)
     assert len(rows) == 1
     return rows[0]
@@ -4549,8 +4597,12 @@ def _pre_ticked_app(
     app = create_app(settings, StubScannerBackend())
     # Keyword-only ``timeout``, as the real client takes it: every list route,
     # the lazy list load included, and the check before a scan ask with one.
-    app.state.paperless.get_tags = _TimedList(_KNOWN_TAG_ROWS)
-    app.state.paperless.get_correspondents = _TimedList(_PRE_TICK_CORRESPONDENT_ROWS)
+    stand_in(services_of(app).paperless, "get_tags", _TimedList(_KNOWN_TAG_ROWS))
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        _TimedList(_PRE_TICK_CORRESPONDENT_ROWS),
+    )
     return app
 
 
@@ -4583,6 +4635,26 @@ class _TimedList:
         """
         self.timeouts.append(timeout)
         return list(self._rows)
+
+
+def _timed_list(found: object) -> _TimedList:
+    """
+    Return the ``_TimedList`` a helper installed as a list fetch.
+
+    Args:
+        found: The app's ``get_tags`` or ``get_correspondents``.
+
+    Returns:
+        The same object, typed as the stand-in it is.
+
+    Raises:
+        TypeError: If the fetch is not a ``_TimedList``.
+
+    """
+    if not isinstance(found, _TimedList):
+        msg = f"expected a _TimedList stand-in, found a {type(found).__name__}"
+        raise TypeError(msg)
+    return found
 
 
 # The budget every list route asks paperless-ngx with: the probe's connect and
@@ -4692,11 +4764,11 @@ _CORRESPONDENT_ROUTES = [
 
 def _cold(app: FastAPI) -> None:
     """Empty both cached lists and forget what the stand-ins were asked."""
-    app.state.cache.invalidate("tags")
-    app.state.cache.invalidate("correspondents")
+    services_of(app).cache.invalidate("tags")
+    services_of(app).cache.invalidate("correspondents")
     for getter in (
-        app.state.paperless.get_tags,
-        app.state.paperless.get_correspondents,
+        services_of(app).paperless.get_tags,
+        services_of(app).paperless.get_correspondents,
     ):
         if isinstance(getter, _TimedList):
             getter.timeouts.clear()
@@ -4806,7 +4878,7 @@ class TestRequestFetchBudget:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
-            fetch: _TimedList = getattr(app.state.paperless, getter)
+            fetch: _TimedList = getattr(services_of(app).paperless, getter)
             response = _ask(client, method, path, params)
 
         assert response.status_code == 200
@@ -4828,8 +4900,8 @@ class TestRequestFetchBudget:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
-            tags: _TimedList = app.state.paperless.get_tags
-            correspondents: _TimedList = app.state.paperless.get_correspondents
+            tags = _timed_list(services_of(app).paperless.get_tags)
+            correspondents = _timed_list(services_of(app).paperless.get_correspondents)
             response = client.get("/")
             assert tags.timeouts == []
             assert correspondents.timeouts == []
@@ -4852,7 +4924,7 @@ class TestListsUnavailable:
         """The unavailable line renders first, and a ticked id stays ticked."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_tags = _FailingList()
+            stand_in(services_of(app).paperless, "get_tags", _FailingList())
             _cold(app)
             response = client.get("/api/tags", params={"tags": ["3"]})
 
@@ -4868,7 +4940,7 @@ class TestListsUnavailable:
         """paperless-ngx answering with no tags is the empty-state line."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_tags = _TimedList([])
+            stand_in(services_of(app).paperless, "get_tags", _TimedList([]))
             _cold(app)
             response = client.get("/api/tags")
 
@@ -4882,7 +4954,7 @@ class TestListsUnavailable:
         """The help line under the select carries the unavailable sentence."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_correspondents = _FailingList()
+            stand_in(services_of(app).paperless, "get_correspondents", _FailingList())
             _cold(app)
             response = _ask(client, method, path, params)
 
@@ -4935,7 +5007,7 @@ class TestListsUnavailable:
         """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_correspondents = _FailingList()
+            stand_in(services_of(app).paperless, "get_correspondents", _FailingList())
             _cold(app)
             page = client.get("/").text
             lists = load_the_lists(client, page)
@@ -4950,7 +5022,7 @@ class TestListsUnavailable:
         app = _pre_ticked_app(tmp_path)
         failing = _FailingList()
         with TestClient(app) as client:
-            app.state.paperless.get_tags = failing
+            stand_in(services_of(app).paperless, "get_tags", failing)
             _cold(app)
             first = client.get("/api/tags")
             second = client.get("/api/tags")
@@ -4971,7 +5043,7 @@ class TestShowCorrespondentOff:
         app = _pre_ticked_app(tmp_path, show_correspondent=False)
         with TestClient(app) as client:
             _cold(app)
-            correspondents: _TimedList = app.state.paperless.get_correspondents
+            correspondents = _timed_list(services_of(app).paperless.get_correspondents)
             response = _ask(client, method, path, params)
 
         assert response.status_code == 200
@@ -5469,7 +5541,7 @@ class TestScanReleasedDuringTheListLoad:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             markers = _marker_values(client.get("/").text)
-            names = set(app.state.worker.profile_names())
+            names = set(services_of(app).worker.profile_names())
 
         assert set(markers.values()) == {routes_module.LISTS_LOADING_MARKER}
         assert names.isdisjoint(markers.values())
@@ -5574,10 +5646,10 @@ class TestTheLastGoodCopyProvesNothing:
         """Fill the cache while paperless-ngx answers, then take it away."""
         app = _app(client)
         assert client.get("/").status_code == 200
-        app.state.paperless.get_tags = _unreachable
-        app.state.paperless.get_correspondents = _unreachable
-        app.state.cache.invalidate("tags")
-        app.state.cache.invalidate("correspondents")
+        stand_in(services_of(app).paperless, "get_tags", _unreachable)
+        stand_in(services_of(app).paperless, "get_correspondents", _unreachable)
+        services_of(app).cache.invalidate("tags")
+        services_of(app).cache.invalidate("correspondents")
 
     def test_a_default_missing_from_the_copy_is_unlisted_not_stale(
         self, tmp_path: Path
@@ -5691,10 +5763,13 @@ def _counted_app(
     )
     counter = _MetadataRequestCounter()
     credential = "a-real-looking-token"
-    app.state.paperless = PaperlessClient(
-        url="http://paperless.invalid",
-        token=credential,
-        transport=httpx2.MockTransport(counter),
+    app.state.services = dataclasses.replace(
+        services_of(app),
+        paperless=PaperlessClient(
+            url="http://paperless.invalid",
+            token=credential,
+            transport=httpx2.MockTransport(counter),
+        ),
     )
     return app, counter
 
@@ -5831,7 +5906,7 @@ class TestRouteLogsNameExceptionsOnly:
             raise httpx2.ConnectError(_CREDENTIALLED_URL)
 
         app = _simple_form_app(tmp_path)
-        app.state.paperless.test_connection = _raise_with_the_url
+        stand_in(services_of(app).paperless, "test_connection", _raise_with_the_url)
         with TestClient(app) as client, caplog.at_level(logging.WARNING):
             response = client.get("/api/paperless/test")
 
@@ -5888,7 +5963,7 @@ def _marked_client(error: Exception, token: str = _MARKER) -> PaperlessClient:
             trailing space h11 refuses to send.
 
     Returns:
-        The client, ready to replace ``app.state.paperless``.
+        The client, ready to replace ``services_of(app).paperless``.
 
     """
 
@@ -5905,26 +5980,38 @@ def _marked_client(error: Exception, token: str = _MARKER) -> PaperlessClient:
 
 def _client_refuses_the_connection(app: FastAPI) -> None:
     """Make the tag fetch fail inside a real client, quoting its token."""
-    app.state.paperless = _marked_client(httpx2.ConnectError(f"refused: {_MARKER}"))
+    app.state.services = dataclasses.replace(
+        services_of(app),
+        paperless=_marked_client(httpx2.ConnectError(f"refused: {_MARKER}")),
+    )
 
 
 def _client_cannot_send_the_request(app: FastAPI) -> None:
     """Make the tag fetch fail the way h11 refuses a token it cannot send."""
-    app.state.paperless = _marked_client(
-        httpx2.LocalProtocolError(f"Illegal header value b'Token {_MARKER} '"),
-        token=f"{_MARKER} ",
+    app.state.services = dataclasses.replace(
+        services_of(app),
+        paperless=_marked_client(
+            httpx2.LocalProtocolError(f"Illegal header value b'Token {_MARKER} '"),
+            token=f"{_MARKER} ",
+        ),
     )
 
 
 def _fetch_raises_a_foreign_exception(app: FastAPI) -> None:
     """Make the tag fetch raise something no saneless code wrote."""
-    app.state.paperless.get_tags = _raise_factory(RuntimeError, _MARKED_TEXT)
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        _raise_factory(RuntimeError, _MARKED_TEXT),
+    )
 
 
 def _connection_test_raises(app: FastAPI) -> None:
     """Make the connection test raise httpx2's error, quoting the marker."""
-    app.state.paperless.test_connection = _raise_factory(
-        httpx2.ConnectError, _MARKED_TEXT
+    stand_in(
+        services_of(app).paperless,
+        "test_connection",
+        _raise_factory(httpx2.ConnectError, _MARKED_TEXT),
     )
 
 
@@ -6037,8 +6124,8 @@ class TestMetadataRoute:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
-            tags: _TimedList = app.state.paperless.get_tags
-            correspondents: _TimedList = app.state.paperless.get_correspondents
+            tags = _timed_list(services_of(app).paperless.get_tags)
+            correspondents = _timed_list(services_of(app).paperless.get_correspondents)
             response = client.get("/api/metadata", params={"profile": "default"})
 
         assert response.status_code == 200
@@ -6069,7 +6156,7 @@ class TestMetadataRoute:
         """A list that failed says so, releases Scan, and asks again later."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_tags = _FailingList()
+            stand_in(services_of(app).paperless, "get_tags", _FailingList())
             _cold(app)
             response = client.get("/api/metadata", params={"profile": "default"})
 
@@ -6092,7 +6179,9 @@ class TestMetadataRoute:
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 7.5)
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.paperless.get_correspondents = _FailingList()
+            monkeypatch.setattr(
+                services_of(app).paperless, "get_correspondents", _FailingList()
+            )
             _cold(app)
             response = client.get("/api/metadata", params={"profile": "default"})
 
@@ -6111,7 +6200,7 @@ class TestMetadataRoute:
         """
         app = _pre_ticked_app(tmp_path, cache_ttl=ttl)
         with TestClient(app) as client:
-            app.state.paperless.get_tags = _FailingList()
+            stand_in(services_of(app).paperless, "get_tags", _FailingList())
             _cold(app)
             response = client.get("/api/metadata", params={"profile": "default"})
 
@@ -6121,10 +6210,10 @@ class TestMetadataRoute:
         """A scan in flight keeps the button disabled after the lists land."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            job_store: JobStore = app.state.job_store
+            job_store: JobStore = services_of(app).job_store
             job = job_store.create_job(profile="default", title="In Flight")
             job_store.update_state(job.id, JobState.SCANNING)
-            app.state.worker._current_job_id = job.id
+            services_of(app).worker._current_job_id = job.id
             response = client.get("/api/metadata", params={"profile": "default"})
 
         assert response.status_code == 200
@@ -6167,10 +6256,10 @@ class TestMetadataRoute:
         """A hidden list is neither fetched nor rendered, and holds nothing up."""
         app = _pre_ticked_app(tmp_path, **{hidden: False})
         with TestClient(app) as client:
-            app.state.paperless.get_tags = _FailingList()
-            app.state.paperless.get_correspondents = _FailingList()
+            stand_in(services_of(app).paperless, "get_tags", _FailingList())
+            stand_in(services_of(app).paperless, "get_correspondents", _FailingList())
             _cold(app)
-            fetch: _TimedList = getattr(app.state.paperless, getter)
+            fetch: _TimedList = getattr(services_of(app).paperless, getter)
             response = client.get("/api/metadata", params={"profile": "default"})
 
         assert response.status_code == 200
@@ -6283,7 +6372,7 @@ def _break_the_job_store(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch: Restores the reads when the test ends.
 
     """
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
 
     def _fail(*_args: object, **_kwargs: object) -> NoReturn:
         msg = "disk I/O error"
@@ -6322,7 +6411,7 @@ class TestListRetry:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
-            fetch: _TimedList = getattr(app.state.paperless, getter)
+            fetch: _TimedList = getattr(services_of(app).paperless, getter)
             response = client.get(
                 "/api/metadata/probe",
                 params={"resource": resource},
@@ -6349,7 +6438,7 @@ class TestListRetry:
         """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            setattr(app.state.paperless, getter, _FailingList())
+            setattr(services_of(app).paperless, getter, _FailingList())
             _cold(app)
             response = client.get(
                 "/api/metadata/probe",
@@ -6382,8 +6471,11 @@ class TestListRetry:
         app = _pre_ticked_app(tmp_path)
         failing = _ClockedFailingList(now, cost=_REQUEST_BUDGET.connect or 0.0)
         with TestClient(app) as client:
-            app.state.cache = cache_module.MetadataCache(ttl=60, clock=lambda: now[0])
-            app.state.paperless.get_tags = failing
+            app.state.services = dataclasses.replace(
+                services_of(app),
+                cache=cache_module.MetadataCache(ttl=60, clock=lambda: now[0]),
+            )
+            stand_in(services_of(app).paperless, "get_tags", failing)
 
             def _probe() -> int:
                 response = client.get(
@@ -6431,7 +6523,7 @@ class TestListRetry:
         app = _pre_ticked_app(tmp_path, cache_ttl=cache_ttl)
         with TestClient(app) as client:
             _cold(app)
-            fetch: _TimedList = app.state.paperless.get_tags
+            fetch = _timed_list(services_of(app).paperless.get_tags)
             probe = client.get(
                 "/api/metadata/probe",
                 params={"resource": "tags"},
@@ -6457,7 +6549,7 @@ class TestListRetry:
         app = _pre_ticked_app(tmp_path, **{hidden: False})
         with TestClient(app) as client:
             _cold(app)
-            fetch: _TimedList = getattr(app.state.paperless, getter)
+            fetch: _TimedList = getattr(services_of(app).paperless, getter)
             response = client.get("/api/metadata/probe", params={"resource": resource})
 
         assert response.status_code == 204
@@ -6472,7 +6564,7 @@ class TestListRetry:
             response = client.get("/api/metadata/probe", params={"resource": "x"})
 
         assert response.status_code == 422
-        tags: _TimedList = app.state.paperless.get_tags
+        tags = _timed_list(services_of(app).paperless.get_tags)
         assert tags.timeouts == []
 
     @pytest.mark.parametrize(
@@ -6514,7 +6606,7 @@ class TestListRetry:
             response = client.get("/api/correspondents", params={"correspondent": "x"})
 
         assert response.status_code == 422
-        correspondents: _TimedList = app.state.paperless.get_correspondents
+        correspondents = _timed_list(services_of(app).paperless.get_correspondents)
         assert correspondents.timeouts == []
 
 
@@ -6622,8 +6714,8 @@ class TestLazyPageLoad:
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
-            tags: _TimedList = app.state.paperless.get_tags
-            correspondents: _TimedList = app.state.paperless.get_correspondents
+            tags = _timed_list(services_of(app).paperless.get_tags)
+            correspondents = _timed_list(services_of(app).paperless.get_correspondents)
             response = client.get("/")
 
         assert response.status_code == 200

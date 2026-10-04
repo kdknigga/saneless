@@ -58,6 +58,7 @@ from saneless.vocabulary import (
 )
 
 from .security_headers import NO_STORE, SECURITY_HEADERS
+from .services import services
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -360,12 +361,13 @@ def render_error(
         if not _is_the_strip_fetching_itself(request):
             headers["HX-Retarget"] = "#status-message"
             headers["HX-Reswap"] = "innerHTML"
+        svc = services(request)
         refocus_scan = (
             (request.method, request.url.path) == _SCAN_SUBMIT
             and rejection not in _BLOCKED_SCAN_REJECTIONS
-            and not request.app.state.scan_blocked
+            and not svc.scan_blocked
         )
-        return request.app.state.templates.TemplateResponse(
+        return svc.templates.TemplateResponse(
             request,
             "partials/error.html",
             {
@@ -474,7 +476,7 @@ async def _browser_navigation_refused(request: Request, exc: Exception) -> Respo
     """
     if not isinstance(exc, BrowserNavigationRefused):
         return await _unhandled_exception(request, exc)
-    return request.app.state.templates.TemplateResponse(
+    return services(request).templates.TemplateResponse(
         request,
         "no_script.html",
         {

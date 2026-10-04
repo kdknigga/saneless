@@ -20,7 +20,7 @@ import uvicorn
 
 from saneless.exceptions import ConfigError
 from saneless.vocabulary import SERVE_NEVER_STARTED_NEXT_STEP
-from saneless.web.refresher import CheckRefresher
+from saneless.web.services import Services
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -88,16 +88,16 @@ def stop_the_refresher_early(app: FastAPI) -> None:
     while the lifespan's own stop holds one, and wait on it for ever.  So this
     only notes the stop, one attribute store that takes no lock, and the
     refresher acts on it from its own thread.  The lifespan's own stop is then
-    a second one, which is harmless.  An app with no refresher, as in a test,
+    a second one, which is harmless.  An app with no services, as in a test,
     is left alone.
 
     Args:
         app: The app being served.
 
     """
-    refresher = getattr(getattr(app, "state", None), "refresher", None)
-    if isinstance(refresher, CheckRefresher):
-        refresher.note_stop()
+    found = getattr(getattr(app, "state", None), "services", None)
+    if isinstance(found, Services):
+        found.refresher.note_stop()
 
 
 class StoppingServer(uvicorn.Server):

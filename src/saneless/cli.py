@@ -2304,6 +2304,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # other command pays for FastAPI, Starlette and uvicorn.
     from .web.app import create_app
     from .web.server import run_server
+    from .web.services import Services
 
     # python-sane is mandatory: a command that needs it refuses before loading
     # config or touching the device, exit 2 through the guard. --help never
@@ -2351,8 +2352,8 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
             except BaseException:
                 # Read so that it cannot raise: an error here would replace
                 # the one that ended the run.
-                state = getattr(app, "state", None)
-                if getattr(state, "lifespan_started", False):
+                found = getattr(getattr(app, "state", None), "services", None)
+                if isinstance(found, Services) and found.lifecycle.started:
                     unowned.pop_all()
                 raise
             # A normal return means the server ran, so its lifespan owned the

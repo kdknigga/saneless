@@ -48,6 +48,7 @@ from saneless.scanner.listing import ListingReply
 from saneless.sigpipe import block_sigpipe
 from saneless.thread_unwinder import load_thread_unwinder
 from saneless.vocabulary import FlipOutcome
+from saneless.web.services import Services
 from tests.fake_clock import FakeClock
 
 if TYPE_CHECKING:
@@ -1713,6 +1714,54 @@ def leaf_routes(app: FastAPI) -> list[BaseRoute]:
         )
         raise AssertionError(msg)
     return found
+
+
+def services_of(app: object) -> Services:
+    """
+    Return the typed services of a web app, read as ``app.state.services``.
+
+    The test-side twin of the app's own ``services(request)``: a test holding
+    the app rather than a request reads its collaborators through this, and
+    swaps one by storing ``dataclasses.replace(services_of(app), name=...)``
+    back on the app.  Import it as ``from tests.conftest import services_of``.
+
+    Args:
+        app: The application, as a fixture or ``TestClient.app`` hands it over.
+
+    Returns:
+        The ``Services`` object the app holds.
+
+    Raises:
+        TypeError: If the app holds no ``Services``.
+
+    """
+    # ``Any`` because a TestClient types its app as a bare ASGI callable.
+    asgi_app: Any = app
+    found = asgi_app.state.services
+    if not isinstance(found, Services):
+        msg = f"the app holds no Services, but a {type(found).__name__}"
+        raise TypeError(msg)
+    return found
+
+
+def stand_in(owner: object, name: str, replacement: object) -> None:
+    """
+    Replace one method of a live collaborator with a test's stand-in.
+
+    ``ty`` reads a method on an instance as the class's function, ``self``
+    and all, so assigning a function to it is refused even when the stand-in
+    takes exactly the arguments the bound method does.  This sets it the way
+    ``monkeypatch.setattr`` does, for helpers that build an app of their own
+    and have no ``monkeypatch`` to hand; the object is discarded with the
+    test, so nothing needs undoing.
+
+    Args:
+        owner: The collaborator, such as ``services_of(app).paperless``.
+        name: The method to replace.
+        replacement: What the app calls instead.
+
+    """
+    setattr(owner, name, replacement)
 
 
 def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:

@@ -103,12 +103,11 @@ from saneless.web.job_view import (
     scrub_for_owner,
 )
 from saneless.web.refresher import ManualProbe
+from saneless.web.services import PaperlessTestAnswer, services
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-
-    from starlette.datastructures import State
 
     from saneless.config import ProfileConfig, Settings
     from saneless.job import Job, JobStore
@@ -116,6 +115,7 @@ if TYPE_CHECKING:
     from saneless.vocabulary import PassPrompt, PassPromptCopy
     from saneless.web.cache import CachedList, MetadataCache
     from saneless.web.checks_cache import CachedChecks
+    from saneless.web.services import Services
     from saneless.worker import ScanWorker
 
 __all__ = ["router", "scan_is_blocked"]
@@ -492,7 +492,7 @@ def _poll_line(
 
 
 def _checks_context(
-    state: State, *, attempt: int = 0, scan_active: bool | None = None
+    svc: Services, *, attempt: int = 0, scan_active: bool | None = None
 ) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
@@ -566,7 +566,7 @@ def _checks_context(
     report, because nothing has ever been checked.
 
     Args:
-        state: The application state holding the cache and the worker.
+        svc: The app's services, for the check cache and the worker.
         attempt: Which attempt produced this render.  Zero for a page render
             and for the out-of-band strip, both of which start a fresh chain;
             the browser carries the rest back in the query string.
@@ -585,13 +585,13 @@ def _checks_context(
     # `Lock.locked()`: an observation, never an acquire.  It is read before the
     # cache so that a probe finishing between the two reads is seen as in
     # flight, which asks once more and collects what it stored.
-    probe_in_flight = state.refresher.probe_in_flight
-    cached: CachedChecks = state.checks.current()
+    probe_in_flight = svc.refresher.probe_in_flight
+    cached: CachedChecks = svc.checks.current()
     # The worker's own record of a job in flight, not the scanner gate: reading
     # the gate would mean acquiring it, and a render is not allowed to contend
     # for the lock a live scan holds.
     scanning: bool = (
-        state.worker.current_job_id is not None if scan_active is None else scan_active
+        svc.worker.current_job_id is not None if scan_active is None else scan_active
     )
     # Which cap applies is the probe's decision, and it is taken once from the
     # one read above so the line and the trigger cannot disagree about it.
@@ -838,7 +838,7 @@ def _no_correspondent_options(*, shown: bool) -> dict[str, object]:
 
 
 def _tag_list_context(
-    state: State,
+    svc: Services,
     *,
     q: str,
     selected: list[int],
@@ -870,7 +870,7 @@ def _tag_list_context(
     ``max_length`` before this runs.
 
     Args:
-        state: Application state, for the metadata cache and Paperless client.
+        svc: The app's services, for the metadata cache and Paperless client.
         q: The filter text, matched case-insensitively against tag names.
         selected: The tag ids the request reports as currently ticked.
         timeout: The fetch budget on a cache miss.
@@ -890,9 +890,9 @@ def _tag_list_context(
     # including the filter, refresh and profile-change routes, which have the
     # same reason to skip.  The key set is the normal path's, emptied (see
     # ``_no_tag_list``).
-    if not state.settings.web.show_tags:
+    if not svc.settings.web.show_tags:
         return _no_tag_list()
-    cached = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
+    cached = _cached_list_or_none(svc.cache, svc.paperless, "tags", timeout=timeout)
     listed = cached.rows if cached is not None else None
     # The same rule the pre-scan check applies, so the page and the scan
     # agree on which ids paperless-ngx still has.
@@ -937,13 +937,13 @@ def _tag_list_context(
         # loaded now (see ``probe_metadata``).  Named for the list, because
         # the lazy list load spreads both lists' contexts into one.
         "tags_retry_seconds": _metadata_retry_seconds(
-            state.settings.output.paperless_cache_ttl_seconds
+            svc.settings.output.paperless_cache_ttl_seconds
         ),
     }
 
 
 def _correspondent_options_context(
-    state: State, selected: int | None, *, timeout: httpx2.Timeout
+    svc: Services, selected: int | None, *, timeout: httpx2.Timeout
 ) -> dict[str, object]:
     """
     Build the correspondent options' context, with one of them chosen.
@@ -955,7 +955,7 @@ def _correspondent_options_context(
     submit carries it, and the scan decides whether it is dropped.
 
     Args:
-        state: Application state, for the metadata cache and Paperless client.
+        svc: The app's services, for the metadata cache and Paperless client.
         selected: The correspondent id to show chosen, or None for none.
         timeout: The fetch budget on a cache miss.
 
@@ -972,10 +972,10 @@ def _correspondent_options_context(
     # every caller: the options, the refresh, the profile change and the
     # lazy list load.  The keys are the normal path's, emptied (see
     # ``_no_correspondent_options``).
-    if not state.settings.web.show_correspondent:
+    if not svc.settings.web.show_correspondent:
         return _no_correspondent_options(shown=False)
     cached = _cached_list_or_none(
-        state.cache, state.paperless, "correspondents", timeout=timeout
+        svc.cache, svc.paperless, "correspondents", timeout=timeout
     )
     listed = cached.rows if cached is not None else None
     known_ids = metadata_ids(listed)
@@ -998,7 +998,7 @@ def _correspondent_options_context(
         # not be loaded; a select cannot hold a sentence.
         "correspondents_unavailable": known_ids is None,
         "correspondents_retry_seconds": _metadata_retry_seconds(
-            state.settings.output.paperless_cache_ttl_seconds
+            svc.settings.output.paperless_cache_ttl_seconds
         ),
         "show_correspondent": True,
     }
@@ -1274,7 +1274,7 @@ def _status_facts(
         The bundle ``_status_context`` reads.
 
     """
-    settings = request.app.state.settings
+    settings = services(request).settings
     return _StatusFacts(
         settings=settings,
         claimed=claimed,
@@ -1630,8 +1630,8 @@ def _status_token(request: Request, context: Mapping[str, object]) -> str:
         The token, as hex.
 
     """
-    state = request.app.state
-    canonical = state.templates.get_template("partials/status_response.html").render(
+    svc = services(request)
+    canonical = svc.templates.get_template("partials/status_response.html").render(
         {
             **context,
             "request": request,
@@ -1668,7 +1668,7 @@ def _keyed_digest(request: Request, text: str) -> str:
     """
     return hashlib.blake2b(
         text.encode(),
-        key=request.app.state.status_token_key,
+        key=services(request).status_token_key,
         digest_size=_STATUS_TOKEN_BYTES,
     ).hexdigest()
 
@@ -1866,20 +1866,20 @@ def _answer_status_poll(
 
     """
     counted = min(max(attempt, 0), len(STATUS_BACKOFF_SECONDS))
-    state = request.app.state
+    svc = services(request)
     try:
         token, context = _with_poll(
             request,
             _status_context(
-                state.worker,
-                state.job_store,
+                svc.worker,
+                svc.job_store,
                 _status_facts(request, followed_job_id=job_id),
             ),
             focus_scan=focus_scan,
         )
         if _unchanged(seen, token):
             return Response(status_code=204)
-        return state.templates.TemplateResponse(
+        return svc.templates.TemplateResponse(
             request,
             "partials/status_response.html",
             {**context, "terminal_reload": True},
@@ -2254,11 +2254,11 @@ def _history_views(request: Request) -> list[JobView]:
         The most recent jobs, newest first, as this browser's views.
 
     """
-    state = request.app.state
+    svc = services(request)
     presented = _presented_owner(request)
     return [
-        build_job_view(job, presented=presented, settings=state.settings)
-        for job in state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
+        build_job_view(job, presented=presented, settings=svc.settings)
+        for job in svc.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
     ]
 
 
@@ -2283,13 +2283,13 @@ def index(request: Request) -> Response:
     the scan with have not arrived.  An answer that says a list could not be
     loaded releases Scan just as one that brings the list does.
     """
-    state = request.app.state
+    svc = services(request)
     # The refresher only probes while a page says someone is looking, so
     # every route that renders the strip has to stamp this.  Without it the
     # lazy thread returns at its first guard for ever and the strip never
     # leaves its cold-start rows.
-    state.refresher.note_watcher()
-    choices = _profile_options(state.worker)
+    svc.refresher.note_watcher()
+    choices = _profile_options(svc.worker)
     # The option the page opens on, found by the name the choices chose, so the
     # select, the sentence beneath it and the Multiple pages field all read the
     # same profile.  None only when there are no options at all.
@@ -2301,8 +2301,8 @@ def index(request: Request) -> Response:
     # lists themselves are never fetched here: the page carries the emptied
     # contexts, the key sets the templates read, and the lazy list load
     # brings the rows.
-    show_tags = state.settings.web.show_tags
-    show_correspondent = state.settings.web.show_correspondent
+    show_tags = svc.settings.web.show_tags
+    show_correspondent = svc.settings.web.show_correspondent
     lists_loading = show_tags or show_correspondent
 
     # The page follows the newest active job this browser owns, so a reload
@@ -2311,12 +2311,12 @@ def index(request: Request) -> Response:
     # poll URL carries the token of what the first poll would render, so that
     # poll is answered 204 and the page's own rendering stays in place.
     live = _status_context(
-        state.worker,
-        state.job_store,
+        svc.worker,
+        svc.job_store,
         _status_facts(
             request,
             followed_job_id=_owned_active_job_id(
-                state.worker, state.job_store, _presented_owner(request)
+                svc.worker, svc.job_store, _presented_owner(request)
             ),
         ),
     )
@@ -2326,11 +2326,11 @@ def index(request: Request) -> Response:
     # asks for: an area with no active job does not poll.
     shown = live["job"]
     last_scan = _last_scan_context(shown if isinstance(shown, JobView) else None)
-    block = _scan_block(state.settings)
+    block = _scan_block(svc.settings)
 
     jobs = _history_views(request)
 
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "index.html",
         {
@@ -2377,7 +2377,7 @@ def index(request: Request) -> Response:
             ),
             **status,
             **last_scan,
-            **_checks_context(state),
+            **_checks_context(svc),
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary.
             "title_max_length": TITLE_MAX_LENGTH,
@@ -2425,7 +2425,7 @@ def health(request: Request) -> dict[str, str] | JSONResponse:
     Docker's HEALTHCHECK marks the container unhealthy on a 503 but does not
     restart it, as ``docs/reference/docker.md`` explains.
     """
-    worker_health = request.app.state.worker.health
+    worker_health = services(request).worker.health
     if worker_health is WorkerHealth.HEALTHY:
         return {"status": "ok"}
     return JSONResponse(
@@ -2434,15 +2434,7 @@ def health(request: Request) -> dict[str, str] | JSONResponse:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _PaperlessTestAnswer:
-    """One connection-test response, as the shared result stores it."""
-
-    status_code: int
-    body: dict[str, str]
-
-
-def _paperless_test_error(exc: BaseException) -> _PaperlessTestAnswer:
+def _paperless_test_error(exc: BaseException) -> PaperlessTestAnswer:
     """
     Build the connection test's 500 answer, logging the class name only.
 
@@ -2460,7 +2452,7 @@ def _paperless_test_error(exc: BaseException) -> _PaperlessTestAnswer:
     """
     detail = type(exc).__name__
     logger.warning("Paperless connection test failed: %s", detail)
-    return _PaperlessTestAnswer(
+    return PaperlessTestAnswer(
         status_code=500, body={"status": "error", "detail": detail}
     )
 
@@ -2496,17 +2488,17 @@ def paperless_test(request: Request) -> JSONResponse:
     ``Retry-After`` header saying when to ask again.  That answer is not
     shared: the caller never got a turn, so there is no result to reuse.
     """
-    state = request.app.state
+    svc = services(request)
 
-    def probe() -> _PaperlessTestAnswer:
+    def probe() -> PaperlessTestAnswer:
         try:
-            status = state.paperless.test_connection(timeout=_REQUEST_FETCH_TIMEOUT)
+            status = svc.paperless.test_connection(timeout=_REQUEST_FETCH_TIMEOUT)
         except Exception as exc:
             return _paperless_test_error(exc)
-        return _PaperlessTestAnswer(status_code=200, body={"status": str(status)})
+        return PaperlessTestAnswer(status_code=200, body={"status": str(status)})
 
     try:
-        answer: _PaperlessTestAnswer = state.paperless_test_result.get(probe)
+        answer = svc.paperless_test_result.get(probe)
     except TimeoutError as exc:
         detail = type(exc).__name__
         logger.warning("Paperless connection test got no turn: %s", detail)
@@ -2970,10 +2962,10 @@ def start_scan(
             on a manual-duplex profile, or the submit was refused.
 
     """
-    state = request.app.state
+    svc = services(request)
     # One locked lookup both validates the profile and yields its title, so
     # there is no check-then-read gap for a profile rewrite to fall into.
-    found = state.worker.get_profile(choice.profile)
+    found = svc.worker.get_profile(choice.profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
     # Refused like an unknown profile, ahead of every refusal that writes a
@@ -3006,11 +2998,11 @@ def start_scan(
     # The page's markers say the lists have not answered at all until its lazy
     # list load lands, which names no profile either, so a Scan a status poll
     # released early files the defaults, not the empty controls.
-    tags_answered = state.settings.web.show_tags and choice.shows_own_defaults(
+    tags_answered = svc.settings.web.show_tags and choice.shows_own_defaults(
         choice.tags_profile
     )
     correspondent_answered = (
-        state.settings.web.show_correspondent
+        svc.settings.web.show_correspondent
         and choice.shows_own_defaults(choice.correspondent_profile)
     )
     metadata = resolve_scan_metadata(
@@ -3044,15 +3036,15 @@ def start_scan(
     # An empty ``paperless.url`` is refused the same way: the upload would
     # fail for certain as a configuration error, and no consume-folder copy is
     # made for it, so the stack would be fed for a PDF that ends in failed/.
-    block = _scan_block(state.settings)
+    block = _scan_block(svc.settings)
     if block is not None:
-        written = _record_refused_submit(state.job_store, form, error=block.job_error)
+        written = _record_refused_submit(svc.job_store, form, error=block.job_error)
         raise RequestRejected(block.rejection, job_id=written)
 
-    unhealthy = _unhealthy_rejection(state.worker.health)
+    unhealthy = _unhealthy_rejection(svc.worker.health)
     if unhealthy is not None:
         rejection, error = unhealthy
-        written = _record_refused_submit(state.job_store, form, error=error)
+        written = _record_refused_submit(svc.job_store, form, error=error)
         raise RequestRejected(rejection, job_id=written)
 
     # The mint rule: a token is minted on the first submit from a browser
@@ -3067,18 +3059,15 @@ def start_scan(
     # as a scan in progress, because it is rendered only for an accepted
     # submit, and by then the scanner is this job's or a queued-ahead one's:
     # read from the worker here, before the job exists, it would say idle.
-    checks = _checks_context(state, scan_active=True)
-    job = state.job_store.create_job(
+    checks = _checks_context(svc, scan_active=True)
+    job = svc.job_store.create_job(
         profile=form.profile,
         title=form.title,
         tags=form.tags,
         correspondent=form.correspondent,
         owner_token=owner,
     )
-    # Annotated because app.state is untyped; assert_never needs the real type.
-    result: SubmitResult = state.worker.submit(
-        job, ScanOptions(multi_page=choice.multi_page)
-    )
+    result = svc.worker.submit(job, ScanOptions(multi_page=choice.multi_page))
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
@@ -3101,8 +3090,8 @@ def start_scan(
                 _, status = _with_poll(
                     request,
                     _status_context(
-                        state.worker,
-                        state.job_store,
+                        svc.worker,
+                        svc.job_store,
                         replace(
                             _status_facts(request, followed_job_id=job.id),
                             # The token this submit is owned by, which is the
@@ -3113,7 +3102,7 @@ def start_scan(
                         ),
                     ),
                 )
-                response = state.templates.TemplateResponse(
+                response = svc.templates.TemplateResponse(
                     request,
                     "partials/status_response.html",
                     {
@@ -3150,7 +3139,7 @@ def start_scan(
             )
         case _:
             assert_never(result)
-    written = _reject_created_job(state.worker, state.job_store, job.id, error=error)
+    written = _reject_created_job(svc.worker, svc.job_store, job.id, error=error)
     raise RequestRejected(rejection, job_id=written)
 
 
@@ -3311,15 +3300,15 @@ def get_checks(
         The strip body, for an ``outerHTML`` swap.
 
     """
-    state = request.app.state
+    svc = services(request)
     counted = min(max(attempt, 0), POLL_PROBE_ATTEMPT_CAP)
     try:
-        state.refresher.note_watcher()
-        context = _checks_context(state, attempt=counted)
+        svc.refresher.note_watcher()
+        context = _checks_context(svc, attempt=counted)
     except Exception:
         logger.exception("Failed to render the status strip")
         context = _checks_fallback_context()
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/checks.html",
         context,
@@ -3431,21 +3420,21 @@ def refresh_checks(request: Request) -> Response:
     early: there is nothing to tell the person at the appliance, and the
     response is the same partial from the same cache read either way.
     """
-    state = request.app.state
-    state.refresher.note_watcher()
-    claim = state.checks.claim_manual_refresh()
+    svc = services(request)
+    svc.refresher.note_watcher()
+    claim = svc.checks.claim_manual_refresh()
     if (
         claim is not None
-        and state.refresher.request_probe(wait=CHECK_AGAIN_WAIT_SECONDS)
+        and svc.refresher.request_probe(wait=CHECK_AGAIN_WAIT_SECONDS)
         is ManualProbe.COLLAPSED
     ):
-        state.checks.release_manual_claim(claim)
+        svc.checks.release_manual_claim(claim)
     try:
-        context = _checks_context(state)
+        context = _checks_context(svc)
     except Exception:
         logger.exception("Failed to render the status strip")
         context = _checks_fallback_context()
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/checks.html",
         context,
@@ -3481,11 +3470,11 @@ def get_tags(
         tags: The tag ids the browser reports as currently ticked.
 
     """
-    state = request.app.state
-    return state.templates.TemplateResponse(
+    svc = services(request)
+    return svc.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        _tag_list_context(state, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
+        _tag_list_context(svc, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
     )
 
 
@@ -3536,12 +3525,12 @@ def get_correspondents(
             value, which "No correspondent" sends, is none.
 
     """
-    state = request.app.state
-    return state.templates.TemplateResponse(
+    svc = services(request)
+    return svc.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
         _correspondent_options_context(
-            state, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
+            svc, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
         ),
     )
 
@@ -3574,11 +3563,11 @@ def get_profile_description(request: Request, profile: str) -> Response:
         RequestRejected: The profile is not configured.
 
     """
-    state = request.app.state
-    found = state.worker.get_profile(profile)
+    svc = services(request)
+    found = svc.worker.get_profile(profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/profile_description.html",
         {"description": found.description},
@@ -3615,11 +3604,11 @@ def get_multi_page_field(
         RequestRejected: The profile is not configured.
 
     """
-    state = request.app.state
-    found = state.worker.get_profile(profile)
+    svc = services(request)
+    found = svc.worker.get_profile(profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/multi_page_field.html",
         _multi_page_field(manual_duplex=_is_manual_duplex(found), ticked=multi_page),
@@ -3655,16 +3644,16 @@ def get_profile_tags(request: Request, profile: str) -> Response:
         RequestRejected: The profile is not configured.
 
     """
-    state = request.app.state
-    found = state.worker.get_profile(profile)
+    svc = services(request)
+    found = svc.worker.get_profile(profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/tags.html",
         {
             **_tag_list_context(
-                state,
+                svc,
                 q="",
                 selected=list(found.default_tags),
                 timeout=_REQUEST_FETCH_TIMEOUT,
@@ -3697,16 +3686,16 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
         RequestRejected: The profile is not configured.
 
     """
-    state = request.app.state
-    found = state.worker.get_profile(profile)
+    svc = services(request)
+    found = svc.worker.get_profile(profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/correspondent_select.html",
         {
             **_correspondent_options_context(
-                state,
+                svc,
                 found.default_correspondent,
                 timeout=_REQUEST_FETCH_TIMEOUT,
             ),
@@ -3769,21 +3758,21 @@ def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
         The job view, or None, and whether the appliance blocks a scan.
 
     """
-    state = request.app.state
+    svc = services(request)
     try:
         live = _status_context(
-            state.worker,
-            state.job_store,
+            svc.worker,
+            svc.job_store,
             _status_facts(
                 request,
                 followed_job_id=_owned_active_job_id(
-                    state.worker, state.job_store, _presented_owner(request)
+                    svc.worker, svc.job_store, _presented_owner(request)
                 ),
             ),
         )
     except Exception:
         logger.exception("Failed to read the job for the lazy list load")
-        return None, _scan_block(state.settings) is not None
+        return None, _scan_block(svc.settings) is not None
     job = live["job"]
     return (job if isinstance(job, JobView) else None), bool(live["scan_blocked"])
 
@@ -3839,8 +3828,8 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
         Nothing in the loader's place, with the out-of-band parts.
 
     """
-    state = request.app.state
-    found = None if profile is None else state.worker.get_profile(profile)
+    svc = services(request)
+    found = None if profile is None else svc.worker.get_profile(profile)
     if found is not None:
         ticked = list(found.default_tags)
         chosen = found.default_correspondent
@@ -3852,21 +3841,21 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
         )
         ticked, chosen, follows = [], None, None
     tag_list = _tag_list_context(
-        state, q="", selected=ticked, timeout=_REQUEST_FETCH_TIMEOUT
+        svc, q="", selected=ticked, timeout=_REQUEST_FETCH_TIMEOUT
     )
     options = _correspondent_options_context(
-        state, chosen, timeout=_REQUEST_FETCH_TIMEOUT
+        svc, chosen, timeout=_REQUEST_FETCH_TIMEOUT
     )
     job, scan_blocked = _metadata_scan_state(request)
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/metadata_response.html",
         {
             **tag_list,
             **options,
             "follows_profile": follows,
-            "show_tags": state.settings.web.show_tags,
-            "show_correspondent": state.settings.web.show_correspondent,
+            "show_tags": svc.settings.web.show_tags,
+            "show_correspondent": svc.settings.web.show_correspondent,
             "job": job,
             "scan_blocked": scan_blocked,
         },
@@ -3925,27 +3914,27 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
         can be loaded, or a 204 for a hidden list.
 
     """
-    state = request.app.state
+    svc = services(request)
     shown = (
-        state.settings.web.show_tags
+        svc.settings.web.show_tags
         if resource == "tags"
-        else state.settings.web.show_correspondent
+        else svc.settings.web.show_correspondent
     )
     if not shown:
         return Response(status_code=204)
     loaded = (
         _cached_list_or_none(
-            state.cache, state.paperless, resource, timeout=_REQUEST_FETCH_TIMEOUT
+            svc.cache, svc.paperless, resource, timeout=_REQUEST_FETCH_TIMEOUT
         )
         is not None
     )
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/list_retry.html",
         {
             "retry_resource": resource,
             "retry_seconds": _metadata_retry_seconds(
-                state.settings.output.paperless_cache_ttl_seconds
+                svc.settings.output.paperless_cache_ttl_seconds
             ),
         },
         headers={"HX-Trigger": f"{resource}-recovered"} if loaded else None,
@@ -4002,24 +3991,22 @@ def invalidate_cache(
             the way the scan's is.
 
     """
-    state = request.app.state
-    if state.invalidate_floors[resource].claim() is not None:
-        state.cache.invalidate(resource)
+    svc = services(request)
+    if svc.invalidate_floors[resource].claim() is not None:
+        svc.cache.invalidate(resource)
 
     if resource == "tags":
-        return state.templates.TemplateResponse(
+        return svc.templates.TemplateResponse(
             request,
             "partials/tags.html",
-            _tag_list_context(
-                state, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT
-            ),
+            _tag_list_context(svc, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
         )
 
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
         _correspondent_options_context(
-            state, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
+            svc, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
         ),
     )
 
@@ -4032,8 +4019,8 @@ def job_history(request: Request) -> Response:
     Returns the history partial with the most recent jobs for
     HTMX swap into the history table, each one as this browser may see it.
     """
-    state = request.app.state
-    return state.templates.TemplateResponse(
+    svc = services(request)
+    return svc.templates.TemplateResponse(
         request,
         "partials/history.html",
         {"jobs": _history_views(request)},
@@ -4068,16 +4055,16 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     the pressed button is gone from the rendering, and the area is where the
     scan's progress is read from next.
     """
-    state = request.app.state
+    svc = services(request)
     presented = _presented_owner(request)
     claimed = False
-    if _owner_answers(presented, state.job_store.get_job(job_id)):
-        claimed = state.worker.continue_flip(job_id)
+    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+        claimed = svc.worker.continue_flip(job_id)
     _, context = _with_poll(
         request,
         _status_context(
-            state.worker,
-            state.job_store,
+            svc.worker,
+            svc.job_store,
             _status_facts(
                 request,
                 followed_job_id=job_id,
@@ -4085,7 +4072,7 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
             ),
         ),
     )
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/status_response.html",
         {**context, "terminal_reload": True, "focus_status_area": True},
@@ -4120,16 +4107,16 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     ``focus=scan`` into its poll URL; the first rendering whose button is
     enabled focuses it.  A dropped Abort asks for nothing.
     """
-    state = request.app.state
+    svc = services(request)
     presented = _presented_owner(request)
     claimed = False
-    if _owner_answers(presented, state.job_store.get_job(job_id)):
-        claimed = state.worker.abort_flip(job_id)
+    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+        claimed = svc.worker.abort_flip(job_id)
     _, context = _with_poll(
         request,
         _status_context(
-            state.worker,
-            state.job_store,
+            svc.worker,
+            svc.job_store,
             _status_facts(
                 request,
                 followed_job_id=job_id,
@@ -4138,7 +4125,7 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
         ),
         focus_scan=claimed,
     )
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/status_response.html",
         {**context, "terminal_reload": True, "focus_status_area": True},
@@ -4197,16 +4184,16 @@ def answer_multi_page(
         The status partial, as this browser may see it.
 
     """
-    state = request.app.state
+    svc = services(request)
     presented = _presented_owner(request)
     claimed = False
-    if _owner_answers(presented, state.job_store.get_job(job_id)):
-        claimed = state.worker.answer_pass(job_id, prompt, answer)
+    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+        claimed = svc.worker.answer_pass(job_id, prompt, answer)
     _, context = _with_poll(
         request,
         _status_context(
-            state.worker,
-            state.job_store,
+            svc.worker,
+            svc.job_store,
             _status_facts(
                 request,
                 followed_job_id=job_id,
@@ -4215,7 +4202,7 @@ def answer_multi_page(
         ),
         focus_scan=claimed and answer is PassAnswer.ABORT,
     )
-    return state.templates.TemplateResponse(
+    return svc.templates.TemplateResponse(
         request,
         "partials/status_response.html",
         {**context, "terminal_reload": True, "focus_status_area": True},

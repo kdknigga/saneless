@@ -63,6 +63,8 @@ from tests.conftest import (
     leaf_routes,
     leave_killed_workspace,
     poll_until,
+    services_of,
+    stand_in,
     wait_for_state,
 )
 from tests.fake_sane import FakeSaneModule
@@ -122,8 +124,10 @@ def settings(tmp_path: Path) -> Settings:
 def _build_app(settings: Settings) -> FastAPI:
     """Build the real app with a stub scanner and no Paperless network calls."""
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
+    stand_in(services_of(app).paperless, "get_tags", lambda *, timeout=None: [])
+    stand_in(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
     return app
 
 
@@ -182,7 +186,7 @@ def test_startup_fails_every_active_job_with_the_restart_reason(
     seeded = _seed_crashed_store(settings)
     app = _build_app(settings)
     with TestClient(app):
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         for job_id in seeded.active:
             job = store.get_job(job_id)
             assert job is not None
@@ -222,8 +226,8 @@ def test_recovery_runs_before_the_worker_starts(
     """The worker never sees an orphan as live work: it starts after recovery."""
     seeded = _seed_crashed_store(settings)
     app = _build_app(settings)
-    worker = app.state.worker
-    store: JobStore = app.state.job_store
+    worker = services_of(app).worker
+    store: JobStore = services_of(app).job_store
     original_start = worker.start
     seen: list[JobState | None] = []
 
@@ -243,8 +247,8 @@ def test_startup_order_is_recover_then_prune_then_start(
 ) -> None:
     """Prune runs after crash recovery and before the worker starts."""
     app = _build_app(settings)
-    worker = app.state.worker
-    store: JobStore = app.state.job_store
+    worker = services_of(app).worker
+    store: JobStore = services_of(app).job_store
     calls: list[str] = []
     original_fail = store.fail_active_jobs
     original_prune = store.prune
@@ -302,7 +306,7 @@ def test_prune_failure_never_blocks_startup(
 ) -> None:
     """A failing startup prune is logged with its traceback; the app serves."""
     app = _build_app(settings)
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
 
     def failing_prune(max_age_days: int, max_rows: int) -> int:
         msg = f"disk I/O error pruning {max_age_days}d / {max_rows} rows"
@@ -329,7 +333,7 @@ def test_recovery_failure_starts_the_worker_degraded(
 ) -> None:
     """A store recovery cannot write still starts, degraded, recovery pending."""
     app = _build_app(settings)
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
 
     def failing_fail_active_jobs() -> int:
         msg = "attempt to write a readonly database"
@@ -338,7 +342,7 @@ def test_recovery_failure_starts_the_worker_degraded(
     monkeypatch.setattr(store, "fail_active_jobs", failing_fail_active_jobs)
     caplog.set_level(logging.INFO, logger=_APP_LOGGER)
     with TestClient(app):
-        assert app.state.worker.health is WorkerHealth.DEGRADED
+        assert services_of(app).worker.health is WorkerHealth.DEGRADED
     assert any(
         record.name == _APP_LOGGER
         and record.levelno == logging.ERROR
@@ -382,7 +386,7 @@ def test_an_orphaned_workspace_is_named_in_its_jobs_restart_error(
     app = _build_app(settings)
     caplog.set_level(logging.INFO, logger=_APP_LOGGER)
     with TestClient(app) as client:
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         scanning = store.get_job(seeded.scanning)
         others = [store.get_job(job_id) for job_id in seeded.active[:2]]
         client.cookies.set("saneless_owner", _SEEDING_BROWSER)
@@ -425,7 +429,7 @@ def test_a_failing_orphan_sweep_never_stops_startup(
     caplog.set_level(logging.INFO, logger=_APP_LOGGER)
     with TestClient(app) as client:
         response = client.get("/health")
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         rows = [store.get_job(job_id) for job_id in seeded.active]
 
     assert response.status_code == 200
@@ -451,7 +455,7 @@ def test_an_orphan_text_the_store_refused_is_written_once_it_recovers(
     seeded = _seed_crashed_store(settings)
     _orphan_the_scanning_job(settings, seeded)
     app = _build_app(settings)
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
     original = store.fail_recovered_jobs
     calls: list[dict[str, str]] = []
 
@@ -466,7 +470,7 @@ def test_an_orphan_text_the_store_refused_is_written_once_it_recovers(
     caplog.set_level(logging.INFO, logger=_APP_LOGGER)
     with TestClient(app):
         healed = poll_until(
-            lambda: app.state.worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
+            lambda: services_of(app).worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
         )
         scanning = store.get_job(seeded.scanning)
 
@@ -544,7 +548,7 @@ def test_startup_restart_words_an_uploading_row_as_maybe_delivered(
     seeded = _seed_crashed_upload(settings)
     app = _build_app(settings)
     with TestClient(app):
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         uploading = store.get_job(seeded.uploading)
         scanning = store.get_job(seeded.scanning)
 
@@ -566,7 +570,7 @@ def test_startup_restart_names_the_kept_pages_of_an_uploading_job(
     _orphan_the_uploading_job(settings, seeded)
     app = _build_app(settings)
     with TestClient(app):
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         uploading = store.get_job(seeded.uploading)
         scanning = store.get_job(seeded.scanning)
 
@@ -596,7 +600,7 @@ def test_a_refused_restart_of_an_uploading_job_is_worded_once_the_store_recovers
     seeded = _seed_crashed_upload(settings)
     _orphan_the_uploading_job(settings, seeded)
     app = _build_app(settings)
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
     original = store.fail_recovered_jobs
     calls: list[dict[str, str]] = []
 
@@ -610,7 +614,7 @@ def test_a_refused_restart_of_an_uploading_job_is_worded_once_the_store_recovers
     monkeypatch.setattr(store, "fail_recovered_jobs", failing_once)
     with TestClient(app):
         healed = poll_until(
-            lambda: app.state.worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
+            lambda: services_of(app).worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
         )
         uploading = store.get_job(seeded.uploading)
         scanning = store.get_job(seeded.scanning)
@@ -652,12 +656,16 @@ def test_shutdown_closes_resources_after_both_threads_stop(
     """
     scanner = StubScannerBackend()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    worker = app.state.worker
-    refresher = app.state.refresher
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     original_stop = worker.stop
     original_refresher_stop = refresher.stop
@@ -719,8 +727,8 @@ def test_both_stop_events_are_set_before_either_join_begins(
     exited by the time the worker's join returns, so ``stop()`` skips it.
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    refresher = app.state.refresher
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
     events: list[str] = []
     worker_set = worker._stopping.set
     refresher_set = refresher._stopping.set
@@ -797,8 +805,8 @@ def _recorded_refresher_budget(
     stops and this test leaks neither a thread nor an open store.
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    refresher = app.state.refresher
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
     clock = _FakeMonotonic()
     budgets: list[float | None] = []
     original_worker_stop = worker.stop
@@ -876,8 +884,8 @@ def test_the_refresher_starts_after_the_worker(
 ) -> None:
     """The gate accessor needs a live worker behind it before the first tick."""
     app = _build_app(settings)
-    worker = app.state.worker
-    refresher = app.state.refresher
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
     calls: list[str] = []
     worker_start = worker.start
     refresher_start = refresher.start
@@ -902,7 +910,7 @@ def test_the_refresher_thread_runs_only_inside_the_lifespan(
 ) -> None:
     """Entering starts the thread; leaving joins it, so no test leaks one."""
     app = _build_app(settings)
-    refresher = app.state.refresher
+    refresher = services_of(app).refresher
     assert refresher._thread.is_alive() is False
     with TestClient(app):
         assert refresher._thread.is_alive() is True
@@ -926,8 +934,8 @@ def test_the_refreshers_scan_fact_is_the_workers_own_job_id(
     """
     app = _build_app(settings)
     with TestClient(app):
-        worker = app.state.worker
-        scan_active = app.state.refresher._scan_active
+        worker = services_of(app).worker
+        scan_active = services_of(app).refresher._scan_active
         assert worker.current_job_id is None
         assert scan_active() is False
         worker._current_job_id = "job-1"
@@ -958,7 +966,7 @@ def test_startup_runs_no_check_probe(
     with TestClient(app):
         pass
     assert calls == []
-    assert app.state.checks.current().results is None
+    assert services_of(app).checks.current().results is None
 
 
 def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
@@ -976,11 +984,15 @@ def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
     """
     scanner = StubScannerBackend()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    refresher = app.state.refresher
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
+    refresher = services_of(app).refresher
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     real_refresher_stop = refresher.stop
     real_store_close = store.close
@@ -1046,11 +1058,15 @@ def test_a_stop_during_a_silent_saned_pre_probe_still_closes_everything(
         )
         scanner = _ClosingScanner()
         app = create_app(settings, scanner)
-        app.state.paperless.get_tags = lambda *, timeout=None: []
-        app.state.paperless.get_correspondents = lambda *, timeout=None: []
-        store: JobStore = app.state.job_store
-        paperless = app.state.paperless
-        refresher = app.state.refresher
+        monkeypatch.setattr(
+            services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+        )
+        monkeypatch.setattr(
+            services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+        )
+        store: JobStore = services_of(app).job_store
+        paperless = services_of(app).paperless
+        refresher = services_of(app).refresher
         real_store_close = store.close
         real_paperless_close = paperless.close
 
@@ -1091,9 +1107,9 @@ def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
 ) -> None:
     """A stuck worker keeps the store and client open, and nothing is written."""
     app = _build_app(settings)
-    worker = app.state.worker
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    worker = services_of(app).worker
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     existing = store.create_job("default", "written before startup")
     calls: list[str] = []
     stop_requested = False
@@ -1175,10 +1191,14 @@ def test_shutdown_closes_the_scanner_after_the_store(
     """
     scanner = _ClosingScanner()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     original_paperless_close = paperless.close
     original_store_close = store.close
@@ -1218,10 +1238,14 @@ def test_one_failing_close_does_not_skip_the_others(
     """
     scanner = _ClosingScanner()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     original_paperless_close = paperless.close
     original_store_close = store.close
@@ -1291,10 +1315,10 @@ def test_a_failed_start_releases_the_store_and_client(
     stopped before the store and the client are closed under it.
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    refresher = app.state.refresher
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     original_paperless_close = paperless.close
     original_store_close = store.close
@@ -1329,7 +1353,7 @@ def test_a_failed_start_releases_the_store_and_client(
         )
         assert worker.health is WorkerHealth.DOWN
         assert calls == ["paperless.close", "job_store.close"]
-        assert app.state.lifespan_started is False
+        assert services_of(app).lifecycle.started is False
     finally:
         # Whatever the start left behind is released, so a failing run of
         # this test leaks neither a thread nor a database handle.
@@ -1351,10 +1375,10 @@ def test_a_failed_start_with_a_stuck_worker_leaves_everything_open(
     the owner, so ``serve`` does not shut SANE down under it either.
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    refresher = app.state.refresher
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    worker = services_of(app).worker
+    refresher = services_of(app).refresher
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     calls: list[str] = []
     real_stop = worker.stop
     real_store_close = store.close
@@ -1375,7 +1399,7 @@ def test_a_failed_start_with_a_stuck_worker_leaves_everything_open(
         ):
             pass
         assert calls == []
-        assert app.state.lifespan_started is True
+        assert services_of(app).lifecycle.started is True
     finally:
         assert real_stop()
         real_paperless_close()
@@ -1395,11 +1419,15 @@ def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
     """
     scanner = _ClosingScanner()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    worker = app.state.worker
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
+    worker = services_of(app).worker
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     real_stop = worker.stop
 
     monkeypatch.setattr(worker, "stop", lambda: False)
@@ -1428,9 +1456,9 @@ def test_the_stuck_worker_warning_names_the_preservation_extension(
     shutdown took and send the operator looking for the wrong cause.
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    worker = services_of(app).worker
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     real_stop = worker.stop
 
     monkeypatch.setattr(worker, "stop", lambda: False)
@@ -1458,7 +1486,7 @@ def test_the_stuck_worker_warning_names_the_preservation_extension(
 def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
     """With the real, idle worker, leaving the lifespan closes the job store."""
     app = _build_app(settings)
-    store: JobStore = app.state.job_store
+    store: JobStore = services_of(app).job_store
     existing = store.create_job("default", "written before startup")
     with TestClient(app):
         pass
@@ -1701,19 +1729,29 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     assert fake.init_call_count == 1
 
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    app.state.paperless.test_connection = lambda timeout=None: "connected"
-    app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
-        task_id="unreachable-sane-proof"
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_tags", lambda *, timeout=None: []
     )
-    app.state.paperless.poll_task = lambda *_a, **_k: TaskFiled(
-        task={"status": "SUCCESS"}
+    monkeypatch.setattr(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
     )
-    store: JobStore = app.state.job_store
+    monkeypatch.setattr(
+        services_of(app).paperless, "test_connection", lambda timeout=None: "connected"
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless,
+        "upload_document",
+        lambda *_a, **_k: ApiDelivery(task_id="unreachable-sane-proof"),
+    )
+    monkeypatch.setattr(
+        services_of(app).paperless,
+        "poll_task",
+        lambda *_a, **_k: TaskFiled(task={"status": "SUCCESS"}),
+    )
+    store: JobStore = services_of(app).job_store
     # Every SANE start and stop from here on, by thread.  The constructor's
     # init above is already counted by the fake.
-    sane_calls = _SaneCallsByThread(fake, app.state.worker._thread, monkeypatch)
+    sane_calls = _SaneCallsByThread(fake, services_of(app).worker._thread, monkeypatch)
 
     # Size first, contents second: an empty enumeration satisfies every set
     # comparison below, so the count is what makes them mean anything.  The
@@ -2053,14 +2091,14 @@ def test_the_worker_lookup_reads_the_page_cache_first(
 
     monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
     app = _build_app(settings)
-    app.state.paperless.get_tags = listing_tags
+    monkeypatch.setattr(services_of(app).paperless, "get_tags", listing_tags)
     with TestClient(app) as client:
-        app.state.cache.set("tags", [{"id": 3}, {"id": 7}])
+        services_of(app).cache.set("tags", [{"id": 3}, {"id": 7}])
         response = client.post(
             "/api/scan", data={"profile": "default", "title": "Wired", "tags": ["3"]}
         )
         assert response.status_code == 200, response.text
-        store: JobStore = app.state.job_store
+        store: JobStore = services_of(app).job_store
         job_id = store.list_recent(limit=1)[0].id
         wait_for_state(store, job_id, TERMINAL_STATES, timeout=5.0)
 

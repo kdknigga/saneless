@@ -120,7 +120,7 @@ class CheckRefresher:
     whatever is left of it.
 
     Every dependency is injected, and the context arrives from a factory rather
-    than from ``app.state``, so the policy can be exercised by calling
+    than from the app's services, so the policy can be exercised by calling
     :meth:`_tick` directly with no thread, no application and no network.
 
     Args:

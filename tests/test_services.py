@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fastapi import FastAPI
-from saneless.web.services import Services, services
 from starlette.requests import Request
 
 from saneless.web.app import create_app
+from saneless.web.services import Services, services
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
