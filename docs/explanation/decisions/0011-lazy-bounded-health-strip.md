@@ -12,7 +12,7 @@ The health strip reports on the scanner, paperless-ngx and the local storage. A 
 
 The checks run on one background refresher thread and the strip only reads its cache. The server never probes on the way up: the refresher starts last, the first render says the checks are running, and the strip polls for itself only while something in flight will change the answer. Every chain of polls is bounded by one of two attempt caps, a short one with nothing in flight and a longer one while a probe is running. A manual refresh collapses into a probe already in flight and is honoured at most once every couple of seconds.
 
-The invariant: no page render and no server start waits on a check, and no tab polls without a bound.
+The invariant: no page load and no server start waits on a check, a manual refresh waits a bounded few seconds for its probe and then answers with whatever the cache holds, and no tab polls without a bound.
 
 ## Consequences
 
