@@ -110,6 +110,7 @@ from tests.conftest import (
     leave_killed_workspace,
     poll_until,
     scan_batch,
+    services_of,
 )
 from tests.fake_sane import UNNAMED_OPTION_ENTRIES, FakeSaneDev, FakeSaneModule
 from tests.prompt_support import (
@@ -3517,7 +3518,7 @@ def _fake_server_run(
         runs.append(run)
         app = self.config.app
         if isinstance(app, FastAPI):
-            store: object = app.state.job_store
+            store: object = services_of(app).job_store
             if isinstance(store, JobStore):
                 store.close()
         self.started = started
@@ -3735,8 +3736,8 @@ def _record_closes(
         The record the closes are appended to.
 
     """
-    store: JobStore = app.state.job_store
-    paperless = app.state.paperless
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
     real_store_close = store.close
     real_paperless_close = paperless.close
     closes = _RecordedCloses(calls=[], skipped=[real_paperless_close, real_store_close])
@@ -3871,7 +3872,7 @@ class TestServeCommand:
         held.install(monkeypatch)
         scanner = StubScannerBackend()
         app = create_app(self._loopback_settings(tmp_path), scanner)
-        refresher: CheckRefresher = app.state.refresher
+        refresher: CheckRefresher = services_of(app).refresher
         closes = _record_closes(monkeypatch, app, scanner)
 
         def stopped_run(
@@ -3922,7 +3923,7 @@ class TestServeCommand:
         """
         assert threading.current_thread() is threading.main_thread()
         app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
-        refresher: CheckRefresher = app.state.refresher
+        refresher: CheckRefresher = services_of(app).refresher
         asked: list[str] = []
         should_exit: list[bool] = []
 
@@ -3946,8 +3947,8 @@ class TestServeCommand:
             assert asked == ["note_stop"]
         finally:
             sock.close()
-            app.state.paperless.close()
-            app.state.job_store.close()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
 
     def test_an_inherited_ignored_sigterm_still_stops_serve_and_is_put_back(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3962,7 +3963,7 @@ class TestServeCommand:
         """
         assert threading.current_thread() is threading.main_thread()
         app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
-        refresher: CheckRefresher = app.state.refresher
+        refresher: CheckRefresher = services_of(app).refresher
         should_exit: list[bool] = []
 
         def signalled_run(
@@ -3984,8 +3985,8 @@ class TestServeCommand:
         finally:
             signal.signal(signal.SIGTERM, previous)
             sock.close()
-            app.state.paperless.close()
-            app.state.job_store.close()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
 
     @pytest.mark.parametrize(
         "stopping",
@@ -4012,7 +4013,7 @@ class TestServeCommand:
         called from inside the first, as a signal arriving there would run it.
         """
         app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
-        refresher: CheckRefresher = app.state.refresher
+        refresher: CheckRefresher = services_of(app).refresher
         # serve's own config: no log_config, so uvicorn rewires no loggers
         # for the rest of the session.
         server = server_module.StoppingServer(uvicorn.Config(app, log_config=None), app)
@@ -4043,8 +4044,8 @@ class TestServeCommand:
             refresher.request_stop()
         finally:
             monkeypatch.undo()
-            app.state.paperless.close()
-            app.state.job_store.close()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
         assert signalled == [signal.SIGTERM]
         assert reentered == []
         assert server.should_exit is True
@@ -7196,7 +7197,7 @@ class TestEntryPointsCloseTheBackend:
 
         def taken_over(settings: Settings, scanner: ScannerBackend) -> FastAPI:
             app = real_create_app(settings, scanner)
-            app.state.lifespan_started = True
+            services_of(app).lifecycle.started = True
             return app
 
         monkeypatch.setattr("saneless.web.app.create_app", taken_over)

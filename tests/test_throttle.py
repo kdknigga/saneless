@@ -10,10 +10,11 @@ and the connection test shares one briefly reused result between callers.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
-from typing import TYPE_CHECKING, NoReturn, get_args
+from typing import TYPE_CHECKING, NoReturn, get_args, override
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,12 +23,13 @@ from saneless.web import checks_cache as checks_cache_module
 from saneless.web.app import create_app
 from saneless.web.errors import RETRY_AFTER_SECONDS
 from saneless.web.routes import MetadataResource
+from saneless.web.services import PaperlessTestAnswer
 from saneless.web.throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
     MinimumInterval,
     SingleFlightResult,
 )
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -404,12 +406,15 @@ def upstream(app: FastAPI, clock: _FakeClock) -> dict[str, _MetadataCounter]:
     """
     tags = _MetadataCounter([{"id": 1, "name": "receipt"}])
     correspondents = _MetadataCounter([{"id": 1, "name": "ACME Corp"}])
-    app.state.paperless.get_tags = tags
-    app.state.paperless.get_correspondents = correspondents
-    app.state.invalidate_floors = {
-        resource: MinimumInterval(clock=clock)
-        for resource in get_args(MetadataResource)
-    }
+    stand_in(services_of(app).paperless, "get_tags", tags)
+    stand_in(services_of(app).paperless, "get_correspondents", correspondents)
+    app.state.services = dataclasses.replace(
+        services_of(app),
+        invalidate_floors={
+            resource: MinimumInterval(clock=clock)
+            for resource in get_args(MetadataResource)
+        },
+    )
     return {"tags": tags, "correspondents": correspondents}
 
 
@@ -420,7 +425,7 @@ class TestInvalidateFloor:
     @pytest.mark.usefixtures("client")
     def test_create_app_installs_one_floor_per_resource(self, app: FastAPI) -> None:
         """Every invalidatable resource has its own floor, built by the app."""
-        floors = app.state.invalidate_floors
+        floors = services_of(app).invalidate_floors
         assert set(floors) == set(get_args(MetadataResource))
         assert all(isinstance(floor, MinimumInterval) for floor in floors.values())
         assert floors["tags"] is not floors["correspondents"]
@@ -505,7 +510,7 @@ class _ConnectionProbe:
         return self.answer
 
 
-def _shared_result(clock: _FakeClock) -> SingleFlightResult[object]:
+def _shared_result(clock: _FakeClock) -> SingleFlightResult[PaperlessTestAnswer]:
     """Build a connection-test result holder on the fake clock."""
     return SingleFlightResult(
         ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=_EVENT_TIMEOUT_SECONDS, clock=clock
@@ -519,15 +524,17 @@ class TestPaperlessTestSingleFlight:
     @pytest.mark.usefixtures("client")
     def test_create_app_installs_a_shared_result(self, app: FastAPI) -> None:
         """The app builds the connection test's shared result itself."""
-        assert isinstance(app.state.paperless_test_result, SingleFlightResult)
+        assert isinstance(services_of(app).paperless_test_result, SingleFlightResult)
 
     def test_a_loop_reaches_paperless_once(
         self, app: FastAPI, client: TestClient, clock: _FakeClock
     ) -> None:
         """Fifty calls inside the TTL make one probe and give one answer."""
         probe = _ConnectionProbe("connected")
-        app.state.paperless.test_connection = probe
-        app.state.paperless_test_result = _shared_result(clock)
+        stand_in(services_of(app).paperless, "test_connection", probe)
+        app.state.services = dataclasses.replace(
+            services_of(app), paperless_test_result=_shared_result(clock)
+        )
 
         for _ in range(_LOOP_CALLS):
             response = client.get("/api/paperless/test")
@@ -541,8 +548,10 @@ class TestPaperlessTestSingleFlight:
     ) -> None:
         """A probe that raised is answered from the cache as the same 500."""
         probe = _ConnectionProbe(None)
-        app.state.paperless.test_connection = probe
-        app.state.paperless_test_result = _shared_result(clock)
+        stand_in(services_of(app).paperless, "test_connection", probe)
+        app.state.services = dataclasses.replace(
+            services_of(app), paperless_test_result=_shared_result(clock)
+        )
 
         bodies = []
         for _ in range(_LOOP_CALLS):
@@ -558,8 +567,10 @@ class TestPaperlessTestSingleFlight:
     ) -> None:
         """Once the result is older than the TTL, the next call probes afresh."""
         probe = _ConnectionProbe("connected")
-        app.state.paperless.test_connection = probe
-        app.state.paperless_test_result = _shared_result(clock)
+        stand_in(services_of(app).paperless, "test_connection", probe)
+        app.state.services = dataclasses.replace(
+            services_of(app), paperless_test_result=_shared_result(clock)
+        )
         assert client.get("/api/paperless/test").json() == {"status": "connected"}
 
         clock.advance(MIN_MANUAL_REFRESH_SECONDS)
@@ -573,16 +584,22 @@ class TestPaperlessTestSingleFlight:
     ) -> None:
         """A bounded wait that expires is a 503 with Retry-After, naming TimeoutError."""
 
-        class _TimesOut:
+        class _TimesOut(SingleFlightResult[PaperlessTestAnswer]):
             """A shared result whose wait for the leader always expires."""
 
-            def get(self, compute: Callable[[], object]) -> NoReturn:
+            @override
+            def get(self, compute: Callable[[], PaperlessTestAnswer]) -> NoReturn:
                 """Give up without computing, as an expired wait does."""
                 _ = compute
                 msg = "the in-flight connection test did not finish"
                 raise TimeoutError(msg)
 
-        app.state.paperless_test_result = _TimesOut()
+        app.state.services = dataclasses.replace(
+            services_of(app),
+            paperless_test_result=_TimesOut(
+                ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=_EVENT_TIMEOUT_SECONDS
+            ),
+        )
 
         response = client.get("/api/paperless/test")
 

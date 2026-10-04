@@ -19,6 +19,7 @@ markup elsewhere on the page cannot satisfy them.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import logging
 import re
@@ -75,16 +76,16 @@ from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
-from tests.conftest import StubScannerBackend, poll_until
+from saneless.web.refresher import CheckRefresher
+from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
 from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
 
-    from starlette.datastructures import State
-
     from saneless.web.checks_cache import CachedChecks
-    from saneless.web.refresher import CheckRefresher, ManualProbe
+    from saneless.web.refresher import ManualProbe
+    from saneless.web.services import Services
 
 # The paused Scanner row, quoted from the interface spec so the route test fails
 # if the registry's sentence and the page's sentence ever drift apart.
@@ -132,7 +133,7 @@ class _StubScanner(StubScannerBackend):
         ]
 
 
-class _RecordingRefresher:
+class _RecordingRefresher(CheckRefresher):
     """
     Stands in for :class:`~saneless.web.refresher.CheckRefresher` in a request.
 
@@ -145,6 +146,10 @@ class _RecordingRefresher:
 
     :meth:`build_context` is delegated rather than faked, so the context any
     caller sees is the real one the application assembled.
+
+    It subclasses the refresher only so it can stand where the app's services
+    hold one.  It never runs the base constructor: every member a route reads
+    is overridden here to reach the wrapped refresher, which owns the thread.
     """
 
     def __init__(self, real: CheckRefresher) -> None:
@@ -387,16 +392,22 @@ def _make_app(
         },
     )
     app = create_app(settings, _StubScanner())
-    app.state.paperless.get_tags = lambda *, timeout=None: []
-    app.state.paperless.get_correspondents = lambda *, timeout=None: []
+    stand_in(services_of(app).paperless, "get_tags", lambda *, timeout=None: [])
+    stand_in(
+        services_of(app).paperless, "get_correspondents", lambda *, timeout=None: []
+    )
     if stub_connection:
         # Offline, and CONNECTED so the Paperless row is not the one that
         # varies.
-        app.state.paperless.probe_connection = lambda timeout=None: ConnectionProbe(
-            ConnectionStatus.CONNECTED
+        stand_in(
+            services_of(app).paperless,
+            "probe_connection",
+            lambda timeout=None: ConnectionProbe(ConnectionStatus.CONNECTED),
         )
     if stub_refresher:
-        app.state.refresher = _RecordingRefresher(app.state.refresher)
+        app.state.services = dataclasses.replace(
+            services_of(app), refresher=_RecordingRefresher(services_of(app).refresher)
+        )
     return app
 
 
@@ -469,7 +480,7 @@ def clocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Clocke
 
     The cache is substituted at the point the app builds it, so the refresher
     and the routes share the one instance exactly as they do in production;
-    replacing ``app.state.checks`` afterwards would leave the refresher holding
+    replacing ``services_of(app).checks`` afterwards would leave the refresher holding
     the original.
     """
     clock = _FakeClock()
@@ -524,7 +535,7 @@ def _app(client: TestClient) -> FastAPI:
 
 def _refresher(client: TestClient) -> _RecordingRefresher:
     """Return the recording refresher the routes stamp."""
-    refresher = _app(client).state.refresher
+    refresher = services_of(client.app).refresher
     if not isinstance(refresher, _RecordingRefresher):
         msg = "Expected the recording refresher"
         raise TypeError(msg)
@@ -551,7 +562,7 @@ def _spy(monkeypatch: pytest.MonkeyPatch) -> _ProbeSpy:
 
 def _warm_the_cache(client: TestClient) -> None:
     """Store a set of results directly, so the cache is warm."""
-    _app(client).state.checks.store(_synthetic_results())
+    services_of(client.app).checks.store(_synthetic_results())
 
 
 def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
@@ -563,7 +574,7 @@ def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
     scan running" through the worker, and driving it through the real submit
     path would run a pipeline these tests do not want.
     """
-    _app(client).state.worker._current_job_id = job_id
+    services_of(client.app).worker._current_job_id = job_id
 
 
 def _start_a_scan(client: TestClient) -> str:
@@ -574,7 +585,9 @@ def _start_a_scan(client: TestClient) -> str:
         The id of the job now reported as running.
 
     """
-    job = _app(client).state.job_store.create_job(profile="default", title="Paused")
+    job = services_of(client.app).job_store.create_job(
+        profile="default", title="Paused"
+    )
     _adopt_as_current_job(client, job.id)
     return job.id
 
@@ -619,7 +632,7 @@ def _raise_inside_the_checks_route(
     if target == "_checks_context":
         monkeypatch.setattr(routes_module, "_checks_context", boom)
     else:
-        monkeypatch.setattr(_app(client).state.refresher, target, boom)
+        monkeypatch.setattr(services_of(client.app).refresher, target, boom)
 
 
 class _RecordingCache(CheckCache):
@@ -679,7 +692,7 @@ def _a_recording_cache(
     Build a client whose check cache records the handler's claims and releases.
 
     Substituted where the app builds its cache, for the reason the ``clocked``
-    fixture is: replacing ``app.state.checks`` afterwards would leave the
+    fixture is: replacing ``services_of(app).checks`` afterwards would leave the
     refresher holding the original, and the two would be separate caches.
 
     Args:
@@ -723,12 +736,13 @@ def _a_probe_in_flight(client: TestClient) -> Generator[None]:
         lock.release()
 
 
-class _AProbeLandsDuringTheRead:
+class _AProbeLandsDuringTheRead(CheckCache):
     """
     A checks cache whose read lets the probe in flight land behind it.
 
     It wraps the cache the app built, the way ``_RecordingRefresher`` wraps the
-    refresher: the read is the real one, and the store is the real one.  What
+    refresher, and subclasses it for the same reason, never running the base
+    constructor: the read is the real one, and the store is the real one.  What
     it adds is the order.  ``current()`` takes its snapshot of the pre-probe
     entry, then the probe stores its results and releases the single-flight
     lock, and only then does the snapshot come back to the caller.  That is a
@@ -877,7 +891,7 @@ class TestWatcherStamping:
         """
         The wiring holds end to end, with no stand-in in the way.
 
-        Every other test here replaces ``app.state.refresher``, so none of them
+        Every other test here replaces ``services_of(app).refresher``, so none of them
         would notice if the routes stamped something the lifespan does not
         start.  ``_last_watched`` is private and read deliberately: it is the
         only observable of ``note_watcher`` short of waiting out a tick.
@@ -886,7 +900,7 @@ class TestWatcherStamping:
             "saneless.web.refresher.run_checks", lambda _context: _synthetic_results()
         )
         app = _make_app(tmp_path, stub_refresher=False)
-        refresher = app.state.refresher
+        refresher = services_of(app).refresher
         with TestClient(app) as tc:
             assert refresher._last_watched is None
             tc.get("/")
@@ -1131,10 +1145,10 @@ class TestBoundedPoll:
         seen: list[int] = []
         real = routes_module._checks_context
 
-        def recording(state: State, *, attempt: int = 0) -> dict[str, object]:
+        def recording(svc: Services, *, attempt: int = 0) -> dict[str, object]:
             """Record the attempt the handler passed on, then build normally."""
             seen.append(attempt)
-            return real(state, attempt=attempt)
+            return real(svc, attempt=attempt)
 
         monkeypatch.setattr(routes_module, "_checks_context", recording)
         for crafted in ("999999", "-5", str(cap + 1)):
@@ -1316,7 +1330,7 @@ class TestTheStripSurvivesItsOwnFailure:
             raise RuntimeError(_CHECKS_BOOM_MARKER)
 
         app = _app(client)
-        monkeypatch.setattr(getattr(app.state, owner), target, boom)
+        monkeypatch.setattr(getattr(services_of(app), owner), target, boom)
         browser = TestClient(app, raise_server_exceptions=False)
 
         response = browser.post("/api/checks/refresh", headers={"HX-Request": "true"})
@@ -1396,7 +1410,7 @@ class TestRefreshButton:
         -- which is exactly when a household member presses it.
         """
         _warm_the_cache(client)
-        assert _app(client).state.checks.is_fresh()
+        assert services_of(client.app).checks.is_fresh()
         spy = _spy(monkeypatch)
         client.post("/api/checks/refresh")
         assert spy.calls == 1
@@ -1406,9 +1420,9 @@ class TestRefreshButton:
     ) -> None:
         """The result lands in the cache, so the next render is warm."""
         _spy(monkeypatch)
-        assert _app(client).state.checks.current().results is None
+        assert services_of(client.app).checks.current().results is None
         client.post("/api/checks/refresh")
-        assert _app(client).state.checks.current().results == _synthetic_results()
+        assert services_of(client.app).checks.current().results == _synthetic_results()
 
     def test_refresh_returns_a_body_that_does_not_poll(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -1442,7 +1456,7 @@ class TestRefreshButton:
         """The gate reaches ``run_checks``, and the handler holds none."""
         spy = _spy(monkeypatch)
         client.post("/api/checks/refresh")
-        assert spy.gates == [_app(client).state.worker.scanner_gate]
+        assert spy.gates == [services_of(client.app).worker.scanner_gate]
 
     def test_refresh_during_a_scan_renders_the_paused_row(
         self, client: TestClient
@@ -1470,7 +1484,7 @@ class TestRefreshButton:
         appliance with no job never reads "not checked while a scan is running".
         """
         _warm_the_cache(client)
-        assert _app(client).state.worker.current_job_id is None
+        assert services_of(client.app).worker.current_job_id is None
         lock = _refresher(client).probe_lock
         assert lock.acquire(blocking=False) is True
         try:
@@ -1962,16 +1976,16 @@ class TestCollapsedRefreshStillDelivers:
         collects them.
         """
         app = _app(client)
-        real: CheckCache = app.state.checks
+        real: CheckCache = services_of(app).checks
         real.store(_results_with_a_skipped_scanner())
         landed = _synthetic_results()
         lock = _refresher(client).probe_lock
         assert lock.acquire(blocking=False) is True
-        monkeypatch.setattr(
-            app.state, "checks", _AProbeLandsDuringTheRead(real, lock, landed)
+        app.state.services = dataclasses.replace(
+            services_of(app), checks=_AProbeLandsDuringTheRead(real, lock, landed)
         )
         try:
-            context = routes_module._checks_context(app.state, attempt=1)
+            context = routes_module._checks_context(services_of(app), attempt=1)
         finally:
             if lock.locked():
                 lock.release()
@@ -2173,7 +2187,7 @@ class TestFreshnessLine:
     def test_results_and_idle(self, client: TestClient) -> None:
         """The timestamp is rendered through the shared ``local_time`` filter."""
         _warm_the_cache(client)
-        checked_at = _app(client).state.checks.current().checked_at
+        checked_at = services_of(client.app).checks.current().checked_at
         assert checked_at is not None
         assert (
             self._meta(client.get("/api/checks").text)
@@ -2184,7 +2198,7 @@ class TestFreshnessLine:
         """Results during a scan read "Paused during scan — last checked …"."""
         _warm_the_cache(client)
         _start_a_scan(client)
-        checked_at = _app(client).state.checks.current().checked_at
+        checked_at = services_of(client.app).checks.current().checked_at
         assert checked_at is not None
         assert (
             self._meta(client.get("/api/checks").text)
@@ -2576,7 +2590,7 @@ class TestStripVocabulary:
         A red row a household member can only escalate is the failure this
         element exists to prevent.
         """
-        _app(client).state.checks.store(
+        services_of(client.app).checks.store(
             (
                 CheckResult(
                     key=CheckKey.FALLBACK,
@@ -2608,7 +2622,7 @@ class TestASkippedRowIsNotAPassingRow:
 
     def test_a_skipped_row_renders_the_neutral_marker(self, client: TestClient) -> None:
         """The glyph, the colour and the spoken word all say nothing was checked."""
-        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        services_of(client.app).checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
         assert f'<span class="check-glyph {CHECKING_STATE_CLASS}"' in row
         assert CHECKING_GLYPH in row
@@ -2622,7 +2636,7 @@ class TestASkippedRowIsNotAPassingRow:
         rows beside this one, so every assertion here is scoped to the Scanner
         row's own markup.
         """
-        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        services_of(client.app).checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
         ok_word = f'<span class="sr-only">{check_state_label(CheckState.OK)}:</span>'
         assert check_state_class(CheckState.OK) not in row
@@ -2633,14 +2647,14 @@ class TestASkippedRowIsNotAPassingRow:
         self, client: TestClient
     ) -> None:
         """The neutral marker replaces the tick, not the registry's sentence."""
-        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        services_of(client.app).checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
         assert PAUSED_SCANNER_MESSAGE in row
         assert "check-next" not in row
 
     def test_the_other_four_rows_are_unaffected(self, client: TestClient) -> None:
         """One skipped row does not neutralise the rows that were probed."""
-        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        services_of(client.app).checks.store(_results_with_a_skipped_scanner())
         markup = client.get("/").text
         ok_class = check_state_class(CheckState.OK)
         ok_word = f'<span class="sr-only">{check_state_label(CheckState.OK)}:</span>'
@@ -2679,7 +2693,7 @@ class TestASkippedRowIsNotAPassingRow:
         running.") begins with the same two words and a bare count would be
         satisfied by the message alone.
         """
-        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        services_of(client.app).checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
         spoken = f'<span class="sr-only">{SKIPPED_STATE_LABEL}:</span>'
         assert row.count(CHECKING_STATE_CLASS) == 1
@@ -2810,7 +2824,7 @@ def _finish_a_job(client: TestClient, state: JobState) -> str:
         The job's id, for a route that names the job in its URL or form.
 
     """
-    job_store = _app(client).state.job_store
+    job_store = services_of(client.app).job_store
     job = job_store.create_job(profile="default", title="Terminal")
     job_store.update_state(job.id, state, error="disk on fire")
     _adopt_as_current_job(client, job.id)
@@ -3006,7 +3020,7 @@ class TestWhichResponsesCarryWhat:
         says idle; read from there, the paused note it is carried for would
         never appear.
         """
-        assert _app(client).state.worker.current_job_id is None
+        assert services_of(client.app).worker.current_job_id is None
         response = client.post(
             "/api/scan", data={"profile": "default", "title": "Paused proof"}
         )
@@ -3181,7 +3195,7 @@ class TestTheStripNamesItsOwnRetry:
 
         """
         failing = row()
-        _app(client).state.checks.store(
+        services_of(client.app).checks.store(
             tuple(
                 failing
                 if key is failing.key
@@ -3230,7 +3244,7 @@ class TestTheStripNeverShowsTheRedirectTarget:
         app = _app(client)
         target = "https://paperless.example/"
         monkeypatch.setattr(
-            app.state.paperless,
+            services_of(app).paperless,
             "probe_connection",
             lambda *, timeout=None: ConnectionProbe(
                 ConnectionStatus.REDIRECTED, redirect_target=target
@@ -3238,14 +3252,14 @@ class TestTheStripNeverShowsTheRedirectTarget:
         )
         row = checks_module._check_paperless(
             CheckContext(
-                settings=app.state.settings,
+                settings=services_of(app).settings,
                 scanner=None,
-                paperless=app.state.paperless,
+                paperless=services_of(app).paperless,
                 profile_storage=ProfileStorage.PERSISTED,
             )
         )
         assert target in row.terminal_detail
-        app.state.checks.store(
+        services_of(app).checks.store(
             tuple(
                 row
                 if key is row.key

@@ -1099,7 +1099,7 @@ def offline_paperless(
     running one, deliver with the test token. The client is the one
     ``refusing_paperless_client`` builds, so its waits run on a ``FakeClock``
     and the upload's before-send budget is spent at once. Tests that replace
-    ``app.state.paperless`` methods are unaffected.
+    ``services_of(app).paperless`` methods are unaffected.
 
     A test that needs the real HTTP transport -- to exercise TLS set-up, say
     -- is marked ``real_paperless_transport`` and is left alone.
