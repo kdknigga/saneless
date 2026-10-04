@@ -30,6 +30,7 @@ import saneless
 import saneless.cli as cli_module
 import saneless.pages as pages_module
 from saneless.config import ProfileConfig
+from saneless.duplex import interleave_duplex
 from saneless.pages import (
     EDGE_TRIM,
     INK_DELTA,
@@ -42,7 +43,7 @@ from saneless.pages import (
     is_blank,
     measure_ink,
 )
-from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B, _interleave_duplex
+from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.spool import SpooledPageSink
 from tests.blank_fixtures import (
     dusty_blank,
@@ -484,7 +485,7 @@ class TestFilterBlankPages:
         """
         fronts = _spool(tmp_path, [_inked_page(), _inked_page()])
         backs = _spool(tmp_path, [_white_page(), _inked_page()], _SPOOL_LABEL_B)
-        document = _interleave_duplex(fronts, backs)
+        document = interleave_duplex(fronts, backs)
 
         result = _drop_blank(document)
 

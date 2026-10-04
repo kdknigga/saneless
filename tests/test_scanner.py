@@ -7367,7 +7367,7 @@ class _AssignmentFailure(NamedTuple):
     One refused option assignment, and the message it has to produce.
 
     A named record rather than four parametrize columns, for the reason
-    ``_DuplexMismatch`` gives in ``pipeline.py``: the four facts belong
+    ``DuplexMismatch`` gives in ``saneless.duplex``: the four facts belong
     together, and a four-column table makes every reader remember an order.
     Bundled, they also keep the test within ruff's ``PLR0913`` argument limit.
 

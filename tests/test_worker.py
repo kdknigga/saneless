@@ -6183,7 +6183,7 @@ class TestWorkerFinish:
         finally:
             store.close()
 
-    def test_finish_persists_a_duplex_mismatch_warning(
+    def test_finish_persists_the_warning_of_a_duplex_mismatch(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,

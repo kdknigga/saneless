@@ -31,6 +31,7 @@ import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
 import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.config import ProfileConfig
+from saneless.duplex import interleave_duplex
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
@@ -73,7 +74,6 @@ from saneless.pipeline import (
     ScanResult,
     Settled,
     _check_disk_space,
-    _interleave_duplex,
     _note_pass_count,
     _open_workspace,
     _resolve_device,
@@ -551,12 +551,12 @@ def _spooling_at_each_resolution(
 
 
 class TestInterleave:
-    """Unit tests for _interleave_duplex, over spooled page records."""
+    """Unit tests for interleave_duplex, over spooled page records."""
 
     def test_interleave_basic(self, tmp_path: Path) -> None:
         """Interleave 3 fronts + 3 backs correctly reverses backs."""
         _, fronts, backs = _duplex_spool(tmp_path, 3, 3)
-        result = _interleave_duplex(fronts, backs)
+        result = interleave_duplex(fronts, backs)
         assert len(result) == 6
         # Backs are reversed: the last sheet fed in pass B is page 2.
         # Result: front1, back3, front2, back2, front3, back1
@@ -570,7 +570,7 @@ class TestInterleave:
     def test_interleave_single_page(self, tmp_path: Path) -> None:
         """Single front + single back works."""
         _, fronts, backs = _duplex_spool(tmp_path, 1, 1)
-        result = _interleave_duplex(fronts, backs)
+        result = interleave_duplex(fronts, backs)
         assert len(result) == 2
         assert result[0] is fronts[0]
         assert result[1] is backs[0]
@@ -579,7 +579,7 @@ class TestInterleave:
         """Mismatched front/back counts raise ScanError."""
         _, fronts, backs = _duplex_spool(tmp_path, 3, 2)
         with pytest.raises(ScanError, match="Page count mismatch: 3 fronts, 2 backs"):
-            _interleave_duplex(fronts, backs)
+            interleave_duplex(fronts, backs)
 
 
 class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
@@ -658,7 +658,7 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         paths_before = [record.path for record in [*fronts, *backs]]
         on_disk = [path.name for path in sorted(spool_dir.iterdir())]
 
-        interleaved = _interleave_duplex(fronts, backs)
+        interleaved = interleave_duplex(fronts, backs)
         document_order = [record.path.name for record in interleaved]
 
         assert on_disk != document_order
@@ -6568,7 +6568,7 @@ class TestTheDpiTheDeviceActuallyChose:
 
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
-            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+            caplog.at_level(logging.WARNING, logger="saneless.duplex"),
         ):
             mock_assemble.return_value = tmp_path / "output.pdf"
             (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")

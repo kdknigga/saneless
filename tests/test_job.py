@@ -1435,7 +1435,7 @@ class TestFinishJob:
         finally:
             store.close()
 
-    def test_finish_job_records_a_duplex_mismatch_warning(self) -> None:
+    def test_finish_job_records_the_warning_of_a_duplex_mismatch(self) -> None:
         """A warning rides alongside SUCCESS and its counts."""
         store = JobStore()
         try:
