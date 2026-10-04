@@ -842,9 +842,7 @@ class ScanChildSession:
             if self._abort is not None and self._abort.is_set():
                 if self._watch_abort:
                     raise _AbortedError
-                self._deadline = min(
-                    self._deadline, time.monotonic() + CANCEL_GRACE_SECONDS
-                )
+                self._cut_for_abort()
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise _DeadlineError
@@ -940,6 +938,10 @@ class ScanChildSession:
             except _DeadlineError:
                 return child.poll()
 
+    def _cut_for_abort(self) -> None:
+        """Hold the wait on a stopping child to the cancel grace from now."""
+        self._deadline = min(self._deadline, time.monotonic() + CANCEL_GRACE_SECONDS)
+
     def _wait_for_exit(self, child: ChildProcess) -> int | None:
         """
         Wait, in short slices, for a child whose reply channel has closed.
@@ -953,9 +955,7 @@ class ScanChildSession:
         """
         while True:
             if self._abort is not None and self._abort.is_set():
-                self._deadline = min(
-                    self._deadline, time.monotonic() + CANCEL_GRACE_SECONDS
-                )
+                self._cut_for_abort()
             remaining = self._deadline - time.monotonic()
             status = child.wait(max(0.0, min(_ABORT_POLL_SECONDS, remaining)))
             if status is not None or remaining <= 0:

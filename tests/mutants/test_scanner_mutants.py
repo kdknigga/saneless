@@ -69,14 +69,9 @@ def test_the_abort_test_fails_when_the_cancel_waits_out_the_page(
             ),
             Edit(
                 _SCAN_CHILD,
-                "                if self._watch_abort:\n"
-                "                    raise _AbortedError\n"
-                "                self._deadline = min(\n"
-                "                    self._deadline, time.monotonic() + "
-                "CANCEL_GRACE_SECONDS\n"
-                "                )\n",
-                "                if self._watch_abort:\n"
-                "                    raise _AbortedError\n",
+                "        self._deadline = min(self._deadline, time.monotonic() + "
+                "CANCEL_GRACE_SECONDS)\n",
+                "        return\n",
             ),
         ],
     )
