@@ -28,9 +28,6 @@ from saneless.exceptions import (
 )
 
 if TYPE_CHECKING:
-    # Annotation-only, so the leaf rule is untouched either way -- all are
-    # stdlib and importing them would not make this module depend on a
-    # consumer.
     from collections.abc import Sequence
     from datetime import datetime
     from pathlib import Path
@@ -202,12 +199,9 @@ its dimensions in ``saneless.paper_sizes.PAPER_SIZES_MM``.
 """
 
 
-# The member values for the two members whose names end in "PASS", named
-# rather than written inline for the same reason ``_REJECTED_WIRE_VALUE`` is:
-# ruff's S105 reads any string literal assigned to a name ending in "pass" as
-# a hardcoded password.  A multi-page scan pass is not a password, the member
-# names are fixed, and every StrEnum here has value == name, so the literals
-# get names S105 does not flag rather than the convention getting an exception.
+# The values of the members whose names end in "PASS".  Every StrEnum here has
+# value == name, and these are named constants under CONTRIBUTING.md's
+# hard-coded-credential lint note.
 _NEXT_WAIT_STATE_VALUE = "AWAITING_NEXT_PASS"
 _NEXT_WAIT_VALUE = "NEXT_PASS"
 
@@ -311,13 +305,13 @@ class ErrorAdvice:
 
 class PageCounted(Protocol):
     """
-    Anything carrying a job's three page counts.
+    Anything carrying a job's page counts.
 
-    It exists so this leaf module can format the counts sentence without
-    importing ``job.py``, which imports from here.  ``Job`` and ``JobResult``
-    satisfy it structurally; neither has to know the protocol exists.
+    It lets this leaf module format the counts sentence without importing
+    ``job.py``, which imports from here.  ``Job`` and ``JobResult`` satisfy it
+    structurally.
 
-    All three are ``int | None`` because they are NULL on every row that never
+    Every count is ``int | None`` because they are NULL on every row that never
     counted anything -- ERROR, CANCELLED, REJECTED and every row written before
     the columns existed.
     """
@@ -339,9 +333,9 @@ class RemovedPagesNoted(Protocol):
     """
     Anything carrying the positions of the pages removed as blank.
 
-    It exists for the same reason ``PageCounted`` does: this leaf module formats
-    the note without importing ``job.py``.  ``Job``, ``JobResult`` and the web
-    layer's ``JobView`` satisfy it structurally.
+    Like ``PageCounted``, it keeps this leaf module from importing ``job.py``.
+    ``Job``, ``JobResult`` and the web layer's ``JobView`` satisfy it
+    structurally.
     """
 
     @property
@@ -437,11 +431,11 @@ class ExitCode(IntEnum):
     ``assert_never`` in ``exit_code_for``, so a new ``ErrorCategory`` member
     fails the type gate until it is given an exit code.
 
-    ``CANCELLED`` is 130, the shell's convention for a process stopped by
+    ``CANCELLED`` follows the shell's convention for a process stopped by
     SIGINT, because a cancel -- Ctrl-C or the operator declining the flip -- is
     a deliberate stop and not a failure.
 
-    ``SAVED_TO_FOLDER`` (6) and ``UPLOADED_WITH_WARNING`` (7) are not failures
+    ``SAVED_TO_FOLDER`` and ``UPLOADED_WITH_WARNING`` are not failures
     either: each means a document *was* delivered, to the consume folder
     without its title, tags or correspondent, or to paperless-ngx with a
     warning about a skipped sheet or unequal duplex counts.  They are kept
@@ -451,32 +445,31 @@ class ExitCode(IntEnum):
     ``exit_code_for_outcome``, not in ``exit_code_for``, because no error
     category leads to either.
 
-    ``ALL_BLANK`` (8) means empty-page detection judged every page blank.
+    ``ALL_BLANK`` means empty-page detection judged every page blank.
     Nothing was uploaded, and the pages were kept in ``failed/``, normally as
-    one PDF (the page files, if it could not be built).  It
-    is kept apart from ``SCAN`` because the scanner worked, and a script that
-    checks the scanner on exit 1 would be sent the wrong way.
+    one PDF (the page files, if it could not be built).  It is kept apart from
+    ``SCAN`` because the scanner worked, and a script that checks the scanner
+    on ``SCAN`` would be sent the wrong way.
 
-    ``UNCONFIRMED`` (9) means the document may already be in paperless-ngx:
+    ``UNCONFIRMED`` means the document may already be in paperless-ngx:
     the upload was sent and no usable answer came back, or paperless-ngx
     received it and did not confirm filing it.  A copy is normally kept in
-    ``failed/``, and the error line names it when it is.  It is kept apart from ``PAPERLESS`` because a script that
-    retries on 3 is right to, and a script that retried on 9 could store the
-    document twice: a script must never rescan on 9, and must check
-    paperless-ngx's document list first.
+    ``failed/``, and the error line names it when it is.  It is kept apart
+    from ``PAPERLESS`` because a script that retries on ``PAPERLESS`` is right
+    to, and one that retried on ``UNCONFIRMED`` could store the document
+    twice: it must check paperless-ngx's document list first.
 
-    ``DISK_SPACE`` (10) means the server ran out of disk space for the scan,
+    ``DISK_SPACE`` means the server ran out of disk space for the scan,
     while scanning or while assembling the PDF.  The error line names the
     folder, and how much space is needed when the shortfall was found before
-    a write.  It is kept apart from ``SCAN`` and
-    ``PDF`` because neither the scanner nor the images were at fault, and
-    freeing space is the fix.
+    a write.  It is kept apart from ``SCAN`` and ``PDF`` because neither the
+    scanner nor the images were at fault, and freeing space is the fix.
 
-    ``HANGUP`` (129) and ``TERMINATED`` (143) follow the shell's convention of
+    ``HANGUP`` and ``TERMINATED`` follow the shell's convention of
     128 plus the signal number, for a SIGHUP or a SIGTERM to a one-shot
     command.  They are an interruption rather than a cancel: nobody chose to
     stop, so the pages a scan already had are kept in ``failed/`` when they
-    can be, unlike 130, which keeps nothing.  Not every interrupted command
+    can be, unlike ``CANCELLED``, which keeps nothing.  Not every interrupted command
     had pages -- any command but ``serve`` exits this way -- so the
     ``Interrupted:`` line is what says whether anything was kept, by naming
     its path, or where the pages were left.  A signal that arrives once a
@@ -484,12 +477,12 @@ class ExitCode(IntEnum):
     with that outcome's own code.
     ``exit_code_for_signal`` chooses them.
 
-    ``BROKEN_PIPE`` (141) is the shell's 128 plus SIGPIPE, for a command
+    ``BROKEN_PIPE`` is the shell's 128 plus SIGPIPE, for a command
     whose output's reader went away before it finished writing, as under
-    ``saneless jobs | head``.  It is neither a scan failure (1) nor a
-    saneless bug (5): nothing went wrong that anyone has to fix, so nothing
-    is printed about it.  A shell reports a pipeline's last command's status,
-    so a script sees 141 only when it sets ``pipefail``.  A scan never ends
+    ``saneless jobs | head``.  It is neither ``SCAN`` nor ``UNEXPECTED``:
+    nothing went wrong that anyone has to fix, so nothing is printed about
+    it.  A shell reports a pipeline's last command's status, so a script sees
+    it only when it sets ``pipefail``.  A scan never ends
     this way: its outcome's own code stands, whatever became of its output.
 
     Members are declared in value order, the order every table pinned to
@@ -539,9 +532,7 @@ class FlipOutcome(StrEnum):
     pipeline answers it by raising ``ScanInterrupted``, the same
     "interrupted, not cancelled" ending a SIGTERM or SIGHUP gives a one-shot
     command.  ``FlipCoordinator.wait_for_flip`` returns exactly one of them,
-    as one atomic answer -- which is the point, because the two events it
-    replaced let a waiter wake up and then have to ask a second question to
-    learn why.
+    as one atomic answer, so a waiter never wakes and then has to ask why.
 
     There is deliberately no "still waiting" member.  The method only returns
     once the wait has resolved, so such a value could never be observed, and
@@ -559,7 +550,7 @@ class PassWait(StrEnum):
     """
     Which question a multi-page document is waiting on.
 
-    The three members are exhaustive over the questions a multi-page scan can
+    The members are exhaustive over the questions a multi-page scan can
     ask between passes: whether there is another page, what to do about pages
     that look blank, and what to do after a pass that failed.  Each has its own
     ``JobState`` (see ``pass_wait_state``), so a history row or ``saneless jobs``
@@ -652,11 +643,9 @@ class PassPrompt:
     error: str | None = None
 
 
-# The wire string for a rejected API token, named rather than written inline
-# below.  Ruff's S105 reads any string literal assigned to a name containing
-# "token" as a hardcoded credential; this is a public API value that
-# ``docs/reference/web-api.md`` pins, not a secret, and neither the member name
-# nor the string is free to change.
+# The wire string for a rejected API token: a public value that
+# ``docs/reference/web-api.md`` pins, not a secret.  Neither the member name nor
+# the string is free to change.
 _REJECTED_WIRE_VALUE = "token_rejected"
 
 
@@ -664,23 +653,16 @@ class ConnectionStatus(StrEnum):
     """
     How a paperless-ngx connection test resolved.
 
-    The values are lowercase snake_case and so break this module's otherwise
-    uniform value-equals-name convention.  That is deliberate, not an
-    oversight: ``web.routes.paperless_test`` serialises the value straight into
-    the JSON body of ``GET /api/paperless/test``, and the endpoint's section of
-    ``docs/reference/web-api.md`` documents the exact spelling of every value.
-    The documented values are a public wire contract and have to stay
-    byte-identical; renaming them to match the member names would silently
-    break every existing client.
+    The values are lowercase snake_case, breaking this module's value-equals-name
+    convention on purpose: ``web.routes.paperless_test`` serialises them into
+    the JSON body of ``GET /api/paperless/test``, and
+    ``docs/reference/web-api.md`` documents each spelling.  They are a public
+    wire contract; renaming them would silently break every existing client.
 
-    Only the *message* lookup below is a ``match`` with ``assert_never``.
-    Deciding which member an HTTP response maps to is an ordered chain of
-    status-code comparisons, and it lives in ``paperless.py`` -- for the same
-    reason ``classify_error`` is an ``isinstance`` chain: it dispatches on a
-    range of integers rather than on a closed set of enum members, so
-    ``assert_never`` does not apply and a trailing fallback is the correct
-    total answer.  This module imports no HTTP client and never maps a
-    response status to a connection outcome.
+    Mapping an HTTP response to a member is an ordered chain of status-code
+    comparisons in ``paperless.py``, not here: it dispatches on a range of
+    integers, so ``assert_never`` does not apply and a trailing fallback is the
+    total answer.
 
     INCOMPATIBLE is a paperless-ngx that answered 406 Not Acceptable: it does
     not allow API version 9 or 10, so it is older than 2.16 or newer than
@@ -741,12 +723,8 @@ class SubmitResult(StrEnum):
     DEGRADED = "DEGRADED"
 
 
-# The member value for the unset-token refusal, named rather than written
-# inline, for the same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any
-# string literal assigned to a name containing "token" as a hardcoded
-# credential.  The member name is fixed and every StrEnum in this module has
-# value == name, so the literal gets a name S105 does not flag rather than the
-# convention getting an exception.
+# The value of the unset-token refusal member, named like
+# ``_REJECTED_WIRE_VALUE``.  The member name is fixed and its value equals it.
 _UNSET_REJECTION_VALUE = "TOKEN_UNSET"
 
 
@@ -758,7 +736,7 @@ class RequestRejection(StrEnum):
     user-facing sentence and its HTTP status.  The messages are developer
     constants: none of them contains request input or exception text, so
     nothing a client sent and nothing internal can reach the page through this
-    path (V7).
+    path (ASVS 4.0.3 V7).
     """
 
     QUEUE_FULL = "QUEUE_FULL"
@@ -796,11 +774,9 @@ class RequestRejection(StrEnum):
 # What a preserved artefact's title says it is.  It is appended to the
 # operator's own title for the PDF's /Title, and passed to
 # ``build_pdf_filename`` as its ``part`` segment, placed after the title slug
-# where the slug's length cap cannot cut it off.  The bracketed
-# spelling is the one the duplex-mismatch delivery already uses, and the two
-# paths have to agree: an operator looking in ``failed/`` should not have to
-# learn that a pass-B failure and a page-count mismatch name their halves
-# differently.  ``(partial)`` is the simplex and single-pass form.
+# where the slug's length cap cannot cut it off.  A pass-B failure and a
+# page-count mismatch name their halves with these same words.  ``(partial)``
+# is the simplex and single-pass form.
 PARTIAL_SUFFIX: Final = "(partial)"
 FRONTS_SUFFIX: Final = "(fronts)"
 BACKS_SUFFIX: Final = "(backs)"
@@ -872,9 +848,7 @@ def sentence_case(text: str) -> str:
 # rejection, the paperless check and the CLI's refusal -- derives its copy from
 # this clause, so they cannot drift apart.  It is lower-case and has no full
 # stop because the CLI and the job row use it as the tail of a line; the others
-# open a sentence with it through ``sentence_case``.  The name avoids the word
-# "token" because ruff's S105 reads a string assigned to such a name as a
-# hardcoded credential, and this is copy about a token nobody set.
+# open a sentence with it through ``sentence_case``.
 UNSET_CREDENTIAL_CLAUSE: Final = "the paperless-ngx API token has not been set"
 
 # Job-row error texts.  A submit refused because the queue was full, the
@@ -895,8 +869,7 @@ URL_UNSET_JOB_ERROR: Final = "Not started: the paperless-ngx address has not bee
 #
 # Like every other string here it is a developer constant: it names the problem
 # and nothing else -- never the token value and never the paperless-ngx URL,
-# which says where paperless-ngx runs (ASVS 4.0.3 V7.4).  The em dash is the
-# same one ``web/routes.py``'s paused-checks prefix already uses.
+# which says where paperless-ngx runs (ASVS 4.0.3 V7.4).
 SCAN_BLOCKED_REASON: Final = (
     f"{sentence_case(UNSET_CREDENTIAL_CLAUSE)} — see System status above."
 )
@@ -1344,14 +1317,14 @@ WAITING_STATES: frozenset[JobState] = PASS_WAIT_STATES | {JobState.AWAITING_FLIP
 """Job states where the job is in flight but waiting for a person.
 
 The scanner is idle and nothing happens until someone acts: the flip wait and
-the three multi-page waits.  Every one of them is in ``ACTIVE_STATES`` -- the
+the multi-page waits.  Every one of them is in ``ACTIVE_STATES`` -- the
 job is not finished -- and none is in ``BUSY_STATES``.
 """
 
 BUSY_STATES: frozenset[JobState] = ACTIVE_STATES - WAITING_STATES
 """Job states where the machine itself is working.
 
-Derived from ``ACTIVE_STATES`` and ``WAITING_STATES`` so the three can never
+Derived from ``ACTIVE_STATES`` and ``WAITING_STATES`` so the sets can never
 drift apart.  The distinction is "the machine is working" versus "we are
 waiting for a person": a job in ``WAITING_STATES`` is active -- it is not
 finished -- but the scanner is idle and the person has to act.  The web UI's
@@ -1361,11 +1334,8 @@ the busy spinner would look like a scan that hung.
 """
 
 
-# The three multi-page waits as a type, so their labels can live in helpers of
-# their own and still be checked for exhaustiveness.  With the waits inline,
-# ``state_label`` and ``progress_label`` would each carry one arm per
-# ``JobState`` member and cross ruff's PLR0912 branch limit; the limit is
-# respected rather than raised, and nothing is suppressed.
+# The multi-page waits as a type, so their labels live in helpers of their own
+# and are still checked for exhaustiveness.
 type _PassWaitState = Literal[
     JobState.AWAITING_NEXT_PASS,
     JobState.AWAITING_BLANK_DECISION,
@@ -1374,22 +1344,7 @@ type _PassWaitState = Literal[
 
 
 def _pass_wait_state_label(state: _PassWaitState) -> str:
-    """
-    Return the short history label for a multi-page wait.
-
-    Each names what the job is waiting on, so the row says it without the
-    worker.
-
-    Args:
-        state: The multi-page wait to label.
-
-    Returns:
-        The user-facing label, e.g. ``"Waiting for more pages"``.
-
-    Raises:
-        AssertionError: If the value is not one of the three waits.
-
-    """
+    """Return the history label naming what a multi-page wait waits on."""
     match state:
         case JobState.AWAITING_NEXT_PASS:
             label = "Waiting for more pages"
@@ -1403,19 +1358,7 @@ def _pass_wait_state_label(state: _PassWaitState) -> str:
 
 
 def _pass_wait_progress_label(state: _PassWaitState) -> str:
-    """
-    Return the progress prose for a multi-page wait.
-
-    Args:
-        state: The multi-page wait to describe.
-
-    Returns:
-        The user-facing progress sentence, e.g. ``"Waiting for the next page..."``.
-
-    Raises:
-        AssertionError: If the value is not one of the three waits.
-
-    """
+    """Return the progress sentence for a multi-page wait."""
     match state:
         case JobState.AWAITING_NEXT_PASS:
             label = "Waiting for the next page..."
@@ -1432,8 +1375,8 @@ def state_label(state: JobState) -> str:
     """
     Return the short human label for a job state.
 
-    These are the labels the history table has always rendered; they are part
-    of the user-visible surface and must not be reworded casually.
+    The labels are part of the user-visible surface and must not be reworded
+    casually.
 
     Args:
         state: The job state to label.
