@@ -319,6 +319,16 @@ class PipelineRequest:
     # failed/ rather than exit half way through copying them.  The worker
     # passes one; the CLI, which has no stop join to extend, passes none.
     preserving: threading.Event | None = None
+    # Set by another thread to stop the run's scan part way, while a page is
+    # being read: the backend then cancels the scan, and stops the process
+    # it scans through if that does not answer.  The worker passes its own
+    # stop flag; the CLI, stopped by a signal on its own thread, passes none.
+    abort: threading.Event | None = None
+    # Set by the backend while the run has a scan process that must be ended
+    # and waited for before the server exits, so a stopping server knows to
+    # wait for it.  The worker passes one; the CLI, whose scan process ends
+    # with the command, passes none.
+    scan_child_live: threading.Event | None = None
     # Set once the run's outcome is fixed and never cleared by the run.  From
     # then an interruption could only undo the outcome, so the CLI's signal
     # handler defers a SIGTERM or SIGHUP while it is set; the worker passes none.
@@ -353,6 +363,8 @@ class RequestHooks:
     pass_coordinator: PassCoordinator | None = None
     device_memory: DeviceMemory | None = None
     preserving: threading.Event | None = None
+    abort: threading.Event | None = None
+    scan_child_live: threading.Event | None = None
     settled: Settled | None = None
     metadata_lookup: MetadataLookup | None = None
 
@@ -399,6 +411,8 @@ def build_pipeline_request(
         pass_coordinator=hooks.pass_coordinator,
         device_memory=hooks.device_memory,
         preserving=hooks.preserving,
+        abort=hooks.abort,
+        scan_child_live=hooks.scan_child_live,
         settled=hooks.settled,
         metadata_lookup=hooks.metadata_lookup,
     )
@@ -1402,7 +1416,13 @@ class _PipelineRun:
             self.request.profile_name,
             self.device_id,
         )
-        acquired = self._acquire()
+        # One session for the whole acquisition, so every pass, the flip wait
+        # and every prompt share one scan process, which has been ended and
+        # waited for before the pages are judged, assembled and uploaded.
+        with self.scanner.scan_session(
+            abort=self.request.abort, live=self.request.scan_child_live
+        ):
+            acquired = self._acquire()
         # A match with assert_never, not a dict: ty and pyrefly catch a variant
         # missing from a match at edit time, and draw no diagnostic for a dict.
         match acquired:
@@ -1865,8 +1885,9 @@ class _PipelineRun:
             if pass_number > 1:
                 # A scanner host restarted during a long wait between passes
                 # leaves SANE holding a stale control connection, and every
-                # later pass fails with an I/O error.  No device handle is open
-                # here: scan_pages closes the device at the end of every pass.
+                # later pass fails with an I/O error, so SANE is restarted in
+                # the job's scan process before every later pass.  No device
+                # is open here: scan_pages closes it at the end of every pass.
                 self.scanner.reinitialise()
             batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
             _require_pages(batch)

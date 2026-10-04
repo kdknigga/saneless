@@ -8269,6 +8269,8 @@ class TestBuildPipelineRequest:
             pass_coordinator=ScriptedPassCoordinator([]),
             device_memory=DeviceMemory(),
             preserving=threading.Event(),
+            abort=threading.Event(),
+            scan_child_live=threading.Event(),
             settled=Settled(),
         )
 
@@ -8293,6 +8295,8 @@ class TestBuildPipelineRequest:
         assert request.pass_coordinator is hooks.pass_coordinator
         assert request.device_memory is hooks.device_memory
         assert request.preserving is hooks.preserving
+        assert request.abort is hooks.abort
+        assert request.scan_child_live is hooks.scan_child_live
         assert request.settled is hooks.settled
 
     def test_no_tags_is_none_on_the_request(self) -> None:
