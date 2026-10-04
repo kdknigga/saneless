@@ -13,8 +13,9 @@ the parent's peak with ``tracemalloc``.  Only allocations ``tracemalloc``
 can see are counted: Pillow unpacks an RGB page into memory of its own,
 which ``tracemalloc`` does not trace, so the bound is on the receive
 buffer and on everything the session allocates around it.  A copy Pillow
-makes of a grey page is caught instead by checking the image the sink gets
-still shares the receive buffer.
+makes of a page after it is received is caught instead by checking the sink
+gets the very image the receive returned, and a grey page that it still
+shares the receive buffer.
 """
 
 from __future__ import annotations
@@ -184,6 +185,28 @@ def _large_pass(
     return batch, sink, peak
 
 
+def _spy_on_receive(monkeypatch: pytest.MonkeyPatch) -> list[Image.Image]:
+    """
+    Keep every image the session's page receive returns.
+
+    Returns:
+        The images, in the order they were received.
+
+    """
+    received: list[Image.Image] = []
+    receive = scan_child_mod.receive_page
+
+    def receive_and_keep(
+        fd: int, header: PageHeader, wait: Callable[[], None]
+    ) -> Image.Image:
+        image = receive(fd, header, wait)
+        received.append(image)
+        return image
+
+    monkeypatch.setattr(scan_child_mod, "receive_page", receive_and_keep)
+    return received
+
+
 @pytest.mark.parametrize(
     "mode", [pytest.param("L", id="L"), pytest.param("RGB", id="RGB")]
 )
@@ -193,9 +216,10 @@ def test_a_scan_pass_holds_one_copy_of_a_page(
     """
     A whole pass of one A4 300 dpi page costs the parent about one page.
 
-    A grey page reaches the sink still wrapping the buffer it was received
-    into: Pillow marks an image that shares a buffer read-only, so a copy,
-    which tracemalloc cannot see because Pillow makes it, still fails here.
+    The sink is handed the very image the receive returned, in either mode,
+    so a copy made after it, which tracemalloc cannot see because Pillow
+    makes it, still fails here.  A grey page also still wraps the buffer it
+    was received into: Pillow marks an image that shares a buffer read-only.
 
     Args:
         mode: The page's image mode.
@@ -205,6 +229,7 @@ def test_a_scan_pass_holds_one_copy_of_a_page(
     """
     width, height = _A4_300_DPI
     nbytes = width * height * PAGE_BANDS[mode]
+    received = _spy_on_receive(monkeypatch)
 
     batch, sink, peak = _large_pass(mode, monkeypatch, tmp_path)
 
@@ -213,24 +238,31 @@ def test_a_scan_pass_holds_one_copy_of_a_page(
         (mode, _A4_300_DPI)
     ]
     assert peak / nbytes <= _ONE_COPY_BOUND, f"peak {peak / nbytes:.2f} pages"
+    assert sink.images[1] is received[-1], "the sink got a copy of the page"
     if mode == "L":
         assert sink.images[1].readonly, "the grey page is a copy, not the buffer"
 
 
-def test_a_grey_page_copied_after_it_is_received_is_caught(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "mode", [pytest.param("L", id="L"), pytest.param("RGB", id="RGB")]
+)
+def test_a_page_copied_after_it_is_received_is_caught(
+    mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    The read-only check catches the copy the traced peak cannot.
+    The identity check catches the copy the traced peak cannot.
 
-    A copy of a grey page made after it is received is Pillow's memory, so
-    the peak stays within one page; only the shared-buffer check sees it.
+    A copy of a page made after it is received is Pillow's memory, so the
+    peak stays within one page; only the check that the sink got the
+    received image itself sees it, in either mode.
 
     Args:
+        mode: The page's image mode.
         monkeypatch: Makes the session copy each received page.
         tmp_path: Holds the stand-in script.
 
     """
+    received = _spy_on_receive(monkeypatch)
     receive = scan_child_mod.receive_page
 
     def receive_then_copy(
@@ -241,7 +273,9 @@ def test_a_grey_page_copied_after_it_is_received_is_caught(
     monkeypatch.setattr(scan_child_mod, "receive_page", receive_then_copy)
     width, height = _A4_300_DPI
 
-    _, sink, peak = _large_pass("L", monkeypatch, tmp_path)
+    _, sink, peak = _large_pass(mode, monkeypatch, tmp_path)
 
-    assert peak / (width * height) <= _ONE_COPY_BOUND
-    assert not sink.images[1].readonly
+    assert peak / (width * height * PAGE_BANDS[mode]) <= _ONE_COPY_BOUND
+    assert sink.images[1] is not received[-1]
+    if mode == "L":
+        assert not sink.images[1].readonly
