@@ -142,12 +142,13 @@ _FAILED_STATUS: Final = 1
 _MAX_COMMAND_BYTES: Final = 1 << 20
 """The longest command line read; a longer one is off the schema."""
 
-_MAX_LOG_CHARS: Final = 8_000
+_MAX_LOG_BYTES: Final = 32_000
 """
-The longest log message sent, in characters.
+The longest a log message may escape to, as JSON, in bytes.
 
-Escaped as JSON, even an all non-ASCII message stays under the protocol's
-64 KiB header limit.
+Measured escaped, not in characters, because a character outside the Basic
+Multilingual Plane escapes to twelve bytes: the frame stays well under the
+protocol's 64 KiB header limit whatever the text.
 """
 
 _MAX_FAILURE_TEXT_BYTES: Final = 16_000
@@ -348,7 +349,7 @@ class _LogForwarder(logging.Handler):
 
         """
         try:
-            message = self.format(record)[:_MAX_LOG_CHARS]
+            message = _fit(self.format(record), _MAX_LOG_BYTES)
             self._reply.send(
                 LogLine(
                     level=_frame_level(record.levelno),
@@ -358,6 +359,20 @@ class _LogForwarder(logging.Handler):
             )
         except _ReplyClosedError, ProtocolError, ValueError, TypeError:
             self.handleError(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """
+        Drop a record that could not be sent, saying nothing.
+
+        The default prints the record's message and arguments, which can name
+        a device, to stderr, outside saneless's logging; and once the channel
+        is closed, it would do so for every record.
+
+        Args:
+            record: The record dropped.
+
+        """
+        del record
 
 
 def _frame_level(levelno: int) -> int:

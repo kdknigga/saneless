@@ -732,6 +732,82 @@ def test_a_log_record_becomes_a_log_line() -> None:
     )
 
 
+def _readable_soon(fd: int) -> None:
+    """
+    Wait until ``fd`` is readable, failing the test if nothing arrives.
+
+    Raises:
+        AssertionError: Nothing arrived in time.
+
+    """
+    readable, _, _ = select.select([fd], [], [], _REPLY_TIMEOUT_SECONDS)
+    if not readable:
+        msg = "the forwarder sent nothing"
+        raise AssertionError(msg)
+
+
+def test_a_log_record_of_any_text_fits_its_frame() -> None:
+    """
+    A long record of characters that escape to twelve bytes is still sent.
+
+    It is cut short by its escaped size, so the frame stays under the
+    protocol's header limit and is not dropped.
+    """
+    text = "\N{GRINNING FACE}" * 8_000
+    read_fd, write_fd = os.pipe()
+    try:
+        handler = scan_child_main._LogForwarder(scan_child_main._ReplyChannel(write_fd))
+        record = logging.LogRecord(
+            "saneless.scanner.scan_session",
+            logging.INFO,
+            __file__,
+            1,
+            text,
+            None,
+            None,
+        )
+
+        handler.handle(record)
+        frame = read_frame(read_fd, lambda: _readable_soon(read_fd), max_pixels=1)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert isinstance(frame, LogLine)
+    assert frame.message
+    assert text.startswith(frame.message)
+
+
+def test_a_record_that_cannot_be_sent_is_dropped_silently(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A record the channel will not take prints nothing to stderr.
+
+    Python's default would print the record's message and arguments there,
+    outside saneless's logging, and a device id with them.
+    """
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        handler = scan_child_main._LogForwarder(scan_child_main._ReplyChannel(write_fd))
+        record = logging.LogRecord(
+            "saneless.scanner.scan_session",
+            logging.WARNING,
+            __file__,
+            1,
+            "Could not close scanner %s",
+            ("net:secret-host:test:0",),
+            None,
+        )
+
+        handler.handle(record)
+    finally:
+        os.close(write_fd)
+
+    assert capfd.readouterr().err == ""
+
+
 def _run_isolated(script: str) -> str:
     """
     Run ``script`` in a fresh isolated interpreter.
