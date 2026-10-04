@@ -84,14 +84,14 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web import cache as cache_module
-from saneless.web import metadata_view, strip_view
+from saneless.web import metadata_view, status_view, strip_view
 from saneless.web import owner as owner_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.owner import OWNER_COOKIE
+from saneless.web.profile_view import ProfileOption, profile_options
 from saneless.web.refresher import CheckRefresher
-from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
@@ -2105,7 +2105,7 @@ class TestPostSubmitRender:
     ) -> None:
         """A status context that raises after the submit still reports the job."""
         browser = _lenient_browser(accepting_client)
-        monkeypatch.setattr(routes_module, "_status_context", _fail_render)
+        monkeypatch.setattr(status_view, "status_context", _fail_render)
 
         response = browser.post(
             "/api/scan", data={"profile": "duplex", "title": "Context Fails"}
@@ -2875,15 +2875,15 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(services_of(client.app).worker).options
+        options = profile_options(services_of(client.app).worker).options
 
         assert options == (
-            _ProfileOption(
+            ProfileOption(
                 name="adf",
                 label="Feeder, single-sided",
                 description="Feeds a stack of sheets.",
             ),
-            _ProfileOption(name="default", label="default", description=""),
+            ProfileOption(name="default", label="default", description=""),
         )
 
     def test_a_blank_label_falls_back_to_the_profile_name(
@@ -2898,7 +2898,7 @@ class TestProfileOrdering:
             },
         )
 
-        option, _ = _profile_options(services_of(client.app).worker).options
+        option, _ = profile_options(services_of(client.app).worker).options
 
         assert option.label == "adf-duplex"
 
@@ -2915,7 +2915,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(services_of(client.app).worker).options
+        options = profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["stack", "pick", "default"]
 
@@ -2938,7 +2938,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(services_of(client.app).worker).options
+        options = profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["feeder", "mystery", "default"]
 
@@ -2957,7 +2957,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(services_of(client.app).worker).options
+        options = profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == [
             "stack-1",
@@ -2980,7 +2980,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(services_of(client.app).worker).options
+        options = profile_options(services_of(client.app).worker).options
 
         assert [option.name for option in options] == ["glass", "stack", "default"]
 
@@ -3004,7 +3004,7 @@ class TestProfileOrdering:
             lambda name: None if name == "goes" else real_lookup(name),
         )
 
-        options = _profile_options(worker).options
+        options = profile_options(worker).options
 
         assert [option.name for option in options] == ["stays", "default"]
 
@@ -3064,7 +3064,7 @@ class TestProfileChoices:
         assert profiles["default"] == profiles["flatbed"]
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(services_of(client.app).worker)
+        choices = profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["flatbed", "adf"]
         assert choices.opening == "flatbed"
@@ -3094,7 +3094,7 @@ class TestProfileChoices:
         )
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(services_of(client.app).worker)
+        choices = profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == [
             "flatbed",
@@ -3122,7 +3122,7 @@ class TestProfileChoices:
             },
         )
 
-        choices = _profile_options(services_of(client.app).worker)
+        choices = profile_options(services_of(client.app).worker)
         page = client.get("/").text
 
         assert [option.label for option in choices.options] == [
@@ -3150,7 +3150,7 @@ class TestProfileChoices:
             },
         )
 
-        choices = _profile_options(services_of(client.app).worker)
+        choices = profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["glass", "default"]
         assert [option.label for option in choices.options] == [
@@ -3167,7 +3167,7 @@ class TestProfileChoices:
         assert profiles["default"] == profiles["adf"]
         _configure_profiles(client, profiles)
 
-        choices = _profile_options(services_of(client.app).worker)
+        choices = profile_options(services_of(client.app).worker)
 
         assert [option.name for option in choices.options] == ["adf", "adf-duplex"]
         assert choices.opening == "adf"
@@ -3179,7 +3179,7 @@ class TestProfileChoices:
         worker = services_of(client.app).worker
         monkeypatch.setattr(worker, "profile_names", list)
 
-        choices = _profile_options(worker)
+        choices = profile_options(worker)
         response = client.get("/")
 
         assert choices.options == ()
@@ -6307,7 +6307,7 @@ class TestMetadataRoute:
         with TestClient(app) as client:
             _cold(app)
             _break_the_job_store(app, monkeypatch)
-            with caplog.at_level(logging.ERROR, logger="saneless.web.routes"):
+            with caplog.at_level(logging.ERROR, logger="saneless.web.metadata_view"):
                 response = client.get(
                     "/api/metadata",
                     params={"profile": "default"},

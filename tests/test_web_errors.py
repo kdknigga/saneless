@@ -1687,7 +1687,7 @@ class TestStatusPollBacksOff:
         self, client: TestClient, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The first failing poll renders the line and polls again in 2 s."""
-        with caplog.at_level(logging.ERROR, logger="saneless.web.routes"):
+        with caplog.at_level(logging.ERROR, logger="saneless.web.status_view"):
             response = client.get(
                 f"/api/jobs/{_FOLLOWED_ID}/status", headers=HTMX_HEADERS
             )

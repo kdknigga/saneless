@@ -17,14 +17,30 @@ import ast
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from saneless.web import metadata_view, owner, routes, strip_view
+from saneless.web import (
+    metadata_view,
+    owner,
+    profile_view,
+    routes,
+    scan_block,
+    status_view,
+    strip_view,
+)
 
 if TYPE_CHECKING:
     from types import ModuleType
 
 __all__ = ["HANDLER_FAMILY", "handler_family_tree"]
 
-HANDLER_FAMILY: tuple[ModuleType, ...] = (routes, owner, strip_view, metadata_view)
+HANDLER_FAMILY: tuple[ModuleType, ...] = (
+    routes,
+    owner,
+    strip_view,
+    metadata_view,
+    status_view,
+    profile_view,
+    scan_block,
+)
 """The routes module and every module split out of it, routes first."""
 
 

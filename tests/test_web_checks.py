@@ -2285,6 +2285,9 @@ class TestRouteShape:
             "saneless.web.owner": "is_owner",
             "saneless.web.strip_view": "checks_context",
             "saneless.web.metadata_view": "tag_list_context",
+            "saneless.web.status_view": "status_context",
+            "saneless.web.profile_view": "profile_options",
+            "saneless.web.scan_block": "block_for",
         }
         assert {module.__name__ for module in HANDLER_FAMILY} == set(expected)
         missing = set(expected.values()) - defined
@@ -3104,7 +3107,7 @@ class TestWhichResponsesCarryWhat:
         """
         tree = handler_family_tree()
         assert _context_values(tree, "refresh_checks").count(True) == 1
-        # Defaulted off once in ``_status_context``, and forced off once more
+        # Defaulted off once in ``status_context``, and forced off once more
         # in the canonical poll rendering ``_status_token`` hashes.  That
         # second one is the shape of a poll, never a response anybody is sent,
         # so it cannot re-render the strip.
