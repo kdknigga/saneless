@@ -2418,10 +2418,10 @@ def _scanner_busy() -> CheckResult:
     a running scan has already been excluded: whatever holds the gate is not a
     scan, and a row that says one is running is simply false.  Today there is
     one known contender, and it is not hypothetical --
-    ``ScanWorker._read_generated_profiles`` takes the gate around
-    ``get_devices`` and ``get_capabilities`` as the worker thread's first
-    act at startup (``ScanWorker._run`` calls ``_generate_startup_profiles``
-    before it takes its first job), while ``_current_job_id`` is still ``None``
+    ``StartupProfiles`` takes the gate around ``get_devices`` and
+    ``get_capabilities`` as the worker thread's first act at startup
+    (``ScanWorker._run`` runs it before it takes its first job), while
+    ``_current_job_id`` is still ``None``
     (``ScanWorker._process_job`` sets it).  The lifespan starts the worker
     and then the refresher, so that window coincides exactly with the
     cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit

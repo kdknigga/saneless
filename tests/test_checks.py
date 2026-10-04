@@ -7604,7 +7604,7 @@ class TestRunChecksUnderTheScannerGate:
 
         ``run_checks`` honours ``skip_scanner`` before it looks at the gate, so
         a failed non-blocking acquire excludes a running scan.  What holds the
-        gate then is ``ScanWorker._read_generated_profiles`` at startup, while
+        gate then is ``StartupProfiles`` at startup, while
         ``_current_job_id`` is ``None``, which is when the cold-start poll
         probes.  The row's sentence is asserted, because it is the contract.
 
