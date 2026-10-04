@@ -113,3 +113,10 @@ def test_the_probe_sees_the_web_stack_once_the_app_is_imported() -> None:
     loaded = _loaded_top_level_modules("import saneless.web.app\n")
 
     assert "fastapi" in loaded
+
+
+def test_the_probe_sees_pydantic_settings_once_config_is_imported() -> None:
+    """The same probe reports the settings library after the config is imported."""
+    loaded = _loaded_top_level_modules("import saneless.config\n")
+
+    assert "pydantic_settings" in loaded
