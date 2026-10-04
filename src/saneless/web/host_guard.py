@@ -75,7 +75,8 @@ spent would hide a real misconfigured proxy added later until a restart.
 
 # A host name (with the underscore Docker Compose service names may carry) or a
 # bracketed IPv6 literal, then an optional port, which RFC 3986 lets be empty.
-# A Host that fails it cannot carry markup, whitespace or a control character.
+# Matched against the lower-cased value, so a Host that matches it cannot carry
+# markup, whitespace or a control character.
 _HOST_PATTERN: Final = re.compile(
     r"(?P<name>[a-z0-9._-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]*)?"
 )
