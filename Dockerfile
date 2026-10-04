@@ -80,8 +80,8 @@ ENV PATH=/opt/venv/bin:$PATH
 #
 # This RUN must stay BEFORE the VOLUME below: the legacy builder discards
 # changes made inside a declared volume afterwards, so the wrong order leaves a
-# fresh volume owned by root. BuildKit and buildah keep them, so a local build
-# cannot catch it.
+# fresh volume owned by root. BuildKit and buildah keep them, so a BuildKit or
+# buildah build cannot catch it.
 #
 # The chmod makes the directory, and so a fresh volume, private to UID 1000.
 RUN groupadd --gid 1000 saneless \

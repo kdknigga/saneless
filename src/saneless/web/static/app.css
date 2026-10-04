@@ -98,12 +98,12 @@
     color: var(--saneless-status-fallback);
 }
 
-/* The warning check reads the same amber property: the vendored-asset
-   contract pins its name, so there is no second one. */
 .check-ok {
     color: var(--pico-ins-color);
 }
 
+/* The warning check reads the same amber property: the vendored-asset
+   contract pins its name, so there is no second one. */
 .check-warn {
     color: var(--saneless-status-fallback);
 }
@@ -347,7 +347,7 @@ label.multi-page-option {
     display: none;
 }
 
-/* clip-path replaces the deprecated clip property. */
+/* clip-path, never the deprecated clip property. */
 .sr-only {
     position: absolute;
     width: 1px;
