@@ -69,14 +69,17 @@ from saneless.exceptions import (
     ListingTimedOutError,
     ScanError,
 )
-from saneless.paperless import PROBE_READ_SECONDS, PaperlessClient
+from saneless.paperless import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
+    PaperlessClient,
+)
 from saneless.scanner import listing, saned_probe
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceInfo, DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.scanner.saned_probe import (
-    PROBE_CONNECT_SECONDS,
     SANED_PORT,
     saned_hosts,
 )
@@ -850,8 +853,8 @@ class TestProbeHostCap:
         Forty configured segments yield ``saned_probe._MAX_PROBE_HOSTS`` entries.
 
         ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
-        unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and
-        that walk runs inside the ``POST /api/checks/refresh`` request thread.
+        unbounded ``getaddrinfo`` plus ``saned_probe.PROBE_CONNECT_SECONDS`` for
+        each, and that walk runs inside the ``POST /api/checks/refresh`` request thread.
         The manual-refresh floor bounds the *rate* of those requests, not the
         duration of one, so without a cap a forty-host setting is a request
         that can take minutes.

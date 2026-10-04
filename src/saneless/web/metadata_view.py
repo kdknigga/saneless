@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Final, Literal
 import httpx2
 
 from saneless.exceptions import ConfigError, PaperlessError, describe
-from saneless.paperless import PROBE_READ_SECONDS
+from saneless.paperless import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.scan_metadata import metadata_ids
-from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS
 from saneless.vocabulary import (
     stale_default_correspondent_label,
     stale_default_tag_label,

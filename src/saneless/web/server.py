@@ -31,7 +31,8 @@ __all__ = ["StoppingServer", "run_server", "stop_the_refresher_early"]
 
 # How long, in whole seconds, a stopping web server waits for requests still
 # being answered before it cancels them; uvicorn types it ``int | None``.  It
-# covers one paperless-ngx call (a 2 s connect and a 5 s read), so the lifespan
+# covers one paperless-ngx call (saneless.paperless's PROBE_CONNECT_SECONDS and
+# PROBE_READ_SECONDS, a 2 s connect and a 5 s read), so the lifespan
 # does not close the Paperless client under such a call; a multi-page list, a
 # metadata load or a name lookup can still outlast it.  The stop budget is in
 # docs/explanation/architecture.md.

@@ -52,9 +52,12 @@ from saneless.config import (
     WebConfig,
 )
 from saneless.job import JobState, JobStore
-from saneless.paperless import PROBE_READ_SECONDS, PaperlessClient
+from saneless.paperless import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
+    PaperlessClient,
+)
 from saneless.scanner.base import DeviceCapabilities
-from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS
 from saneless.vocabulary import (
     CORRESPONDENTS_LOADING,
     CORRESPONDENTS_UNAVAILABLE,
