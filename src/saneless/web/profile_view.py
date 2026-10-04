@@ -48,15 +48,13 @@ class ProfileOption:
     One entry of the Profile select: what it submits and what it reads as.
 
     Attributes:
-        name: The profile name, which is the ``value`` the option submits.
-            It is the wire contract ``POST /api/scan`` already takes, so only
-            the text a household member reads is new here.
+        name: The profile name, the ``value`` the option submits to
+            ``POST /api/scan``.
         label: The human name shown in the dropdown.
         description: The sentence shown beneath the select for this profile.
         manual_duplex: Whether the profile scans both sides by the manual
-            flip, which is what disables the Multiple pages checkbox when the
-            page opens on it.  Read here, from the same locked lookup as the
-            text, so the page never looks the profile up a second time.
+            flip, which disables the Multiple pages checkbox when the page
+            opens on it.  Read from the same locked lookup as the text.
 
     """
 
@@ -92,28 +90,15 @@ def profile_options(worker: ScanWorker) -> ProfileChoices:
     """
     Build the ordered option list the Profile select renders, and its opening.
 
-    Feeder profiles come first on a sheet-fed device, and this is
-    where ``has_flatbed`` is read: sheet-fed means the device reports no
-    flatbed source, and at render time the server's evidence for that is the
-    generated profile set, which mirrors the device's sources.  So the answer
-    is derived from the profiles already in hand -- no new device probe and no
-    new config key.
+    Feeder profiles come first on a sheet-fed device, one whose profile set has
+    no flatbed source, so no device probe is needed.  Sources are classified by
+    ``classify_source`` only, never re-derived from the string.
 
-    The classification comes from ``classify_source`` and from nowhere else:
-    its docstring states it is the only source-classification rule in the
-    codebase and forbids re-deriving the answer from the string.  That matters
-    most for the commonest real feeder name of all, whose first four letters
-    are the whole of the automatic rule -- an exact match is what keeps it out
-    of the single-page group, and this function inherits that answer rather
-    than asking again.
-
-    A generated ``default`` that equals another profile is not offered: it
-    would be a second option scanning the same way under the same words, and
-    the first profile it equals stands in for it, so the page still opens on
-    what ``saneless scan`` with no ``--profile`` does.  The name stays valid
-    everywhere else -- the CLI, the config and ``POST /api/scan`` all still
-    take it.  Any label two offered options still share then gets the profile
-    name after it, for every member of the group.
+    A generated ``default`` that equals another profile is not offered; the
+    first profile it equals stands in for it, so the page still opens on what
+    ``saneless scan`` with no ``--profile`` does, and the name stays valid
+    everywhere else.  Any label two offered options share gets the profile name
+    after it.
 
     Args:
         worker: The worker whose profile set is being rendered.
@@ -130,13 +115,9 @@ def profile_options(worker: ScanWorker) -> ProfileChoices:
         if profile is None:
             # Listing and looking up are two locked calls, so a profile
             # rewritten between them can be gone by the time it is read.  One
-            # option fewer for one render is honest; a placeholder would not
-            # be, and there is nothing to show under a name that no longer
-            # names anything.
+            # option fewer for one render is honest; a placeholder would not be.
             continue
         read[name] = profile
-    # Over every profile read, the hidden twin included: a twin shares its
-    # stand-in's source, so leaving it out could never change the answer.
     sheet_fed = not any(
         classify_source(profile.source) is SourceKind.FLATBED
         for profile in read.values()
@@ -148,12 +129,9 @@ def profile_options(worker: ScanWorker) -> ProfileChoices:
         (
             ProfileOption(
                 name=name,
-                # A deployed config whose profiles predate the ``label`` key
-                # carries an empty human name: startup generation only runs on
-                # a bare default config, so it is skipped there, and a blank
-                # option is worse than a raw profile name.  ``saneless
-                # auto-profiles --force`` is what backfills the text, and the
-                # how-to says so.
+                # A hand-kept config may carry no label, and a blank option is
+                # worse than the profile name; ``saneless auto-profiles --force``
+                # backfills the text.
                 label=profile.label or name,
                 description=profile.description,
                 manual_duplex=is_manual_duplex(profile),
@@ -163,8 +141,7 @@ def profile_options(worker: ScanWorker) -> ProfileChoices:
         for name, profile in read.items()
     ]
     if sheet_fed:
-        # A stable sort, so configuration order survives inside each group and
-        # the only thing this changes is which group comes first.
+        # A stable sort, so configuration order survives inside each group.
         entries.sort(key=lambda entry: not entry[1].uses_feeder)
     options = _distinct_labels(tuple(option for option, _ in entries))
     names = [option.name for option in options]
@@ -181,20 +158,9 @@ def _default_stand_in(profiles: dict[str, ProfileConfig]) -> str | None:
     """
     Name the profile a generated ``default`` twin is hidden behind, if any.
 
-    The whole profile is compared rather than a hand-picked subset of its
-    fields, the rule ``is_bare_default`` follows, so a field added to the
-    model later cannot be silently left out of the comparison, and any edit
-    an operator makes to ``default`` -- default tags, a title, a mode --
-    shows it again.  Only a generated ``default`` is hidden: one an operator
-    wrote is theirs to show, even when it happens to match another profile.
-
-    Args:
-        profiles: The profiles read for this render, in configuration order.
-
-    Returns:
-        The first profile in configuration order that equals a generated
-        ``default``, or None when ``default`` is absent, hand-written or
-        equal to no other profile.
+    The whole profile is compared, not a subset of its fields, so a field added
+    later cannot be left out and any operator edit shows ``default`` again.
+    Only a generated ``default`` is hidden; one an operator wrote is theirs.
 
     """
     default = profiles.get(_DEFAULT_PROFILE)
@@ -216,17 +182,8 @@ def _distinct_labels(
     """
     Append the profile name to every label two or more options share.
 
-    A household member must never see two options with the same text and no
-    way to tell which is which.  Generated labels are already unique, but a
-    hand-written config can still collide, and so can an edited ``default``
-    beside the profile it was copied from.  Every member of a shared group is
-    suffixed, not only the later ones, so none of them reads as the plain one.
-
-    Args:
-        options: The options in render order.
-
-    Returns:
-        The same options in the same order, with shared labels made distinct.
+    Every member of a shared group is suffixed, not only the later ones, so
+    none of them reads as the plain one.
 
     """
     counts = Counter(option.label for option in options)
@@ -290,13 +247,10 @@ def history_views(request: Request) -> list[JobView]:
     """
     Return the Job History rows as the browser making this request may see them.
 
-    One view per row, each decided by ``build_job_view`` from the token this
-    request presents: a row this browser started keeps its real title, and
-    every other row -- another browser's, or one that recorded no owner --
-    shows the generic title.  Time, profile, outcome and page counts are the
-    same for every viewer, so the table still shows the appliance is in use.
-    The full page and ``GET /api/jobs/history`` both read the rows here, so
-    the two cannot disagree about what a browser is shown.
+    Each row is decided by ``build_job_view`` from the token this request
+    presents, so only a row this browser started keeps its real title.  The full
+    page and ``GET /api/jobs/history`` both read the rows here, so the two cannot
+    disagree about what a browser is shown.
 
     Args:
         request: The incoming request, for its owner token and the settings.
