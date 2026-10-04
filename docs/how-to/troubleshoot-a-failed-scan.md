@@ -152,8 +152,9 @@ What the common cases mean:
 - **The scanning process ended unexpectedly, or died.** The line reads `The scanning process
   ended unexpectedly (exit status <n>)` or `The scanning process died from <signal>`, then the
   step. saneless did not stop it: the process that talks to the scanner ended by itself, often
-  in the scanner library. Its own line on saneless's stderr names the cause by type. The pages
-  scanned before it are preserved, and the next scan starts a fresh process. If it keeps
+  in the scanner library. When it ended with an exit status, its own line on saneless's stderr
+  usually names the cause by type; a process that died from a signal writes no such line. The
+  pages scanned before it are preserved, and the next scan starts a fresh process. If it keeps
   happening at the same step, run the scan with `--verbose` and report it.
 
 To check that saneless can see the scanner at all, run:
