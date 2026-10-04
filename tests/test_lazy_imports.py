@@ -18,8 +18,12 @@ import ast
 import subprocess
 import sys
 import textwrap
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _WEB_STACK = ("fastapi", "starlette", "uvicorn")
 
@@ -63,18 +67,41 @@ def test_a_leaf_module_loads_no_pydantic_settings(module: str) -> None:
     assert "pydantic_settings" not in loaded
 
 
-def test_a_command_that_does_not_serve_loads_no_web_stack() -> None:
-    """``jobs --help`` and ``doctor --help`` run without FastAPI, Starlette or uvicorn."""
+def test_a_command_that_does_not_serve_loads_no_web_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``jobs`` and ``doctor`` run to the end without FastAPI, Starlette or uvicorn.
+
+    The command bodies run, not only their ``--help``, so an import made inside
+    a body is seen.  The child reads an empty config file named on the command
+    line, and libsane an empty backend list, so neither reaches past the test's
+    own directories.
+
+    Args:
+        tmp_path: Holds the config file and the empty SANE configuration.
+        monkeypatch: Points the child's libsane at the empty configuration.
+
+    """
+    config = tmp_path / "saneless.toml"
+    config.write_text("", encoding="utf-8")
+    sane_dir = tmp_path / "sane.d"
+    sane_dir.mkdir()
+    (sane_dir / "dll.conf").write_text("", encoding="utf-8")
+    monkeypatch.setenv("SANE_CONFIG_DIR", str(sane_dir))
     loaded = _loaded_top_level_modules(
-        """
+        f"""
         from click.testing import CliRunner
 
         from saneless.cli import cli
 
         runner = CliRunner()
-        for command in ("jobs", "doctor"):
-            result = runner.invoke(cli, [command, "--help"])
-            assert result.exit_code == 0, (command, result.output)
+        for args in (["jobs"], ["jobs", "--json"], ["doctor"], ["doctor", "--help"]):
+            result = runner.invoke(cli, ["--config", {str(config)!r}, *args])
+            assert result.exception is None or isinstance(
+                result.exception, SystemExit
+            ), (args, result.output, result.exception)
+            assert result.exit_code in (0, 2), (args, result.output)
         """
     )
 
