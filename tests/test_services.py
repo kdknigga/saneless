@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from saneless.web.app import create_app
@@ -83,24 +84,26 @@ def test_services_fields_are_fixed_but_the_lifecycle_flag_moves(
         app.state.services.paperless.close()
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "worker",
-        "job_store",
-        "settings",
-        "paperless",
-        "cache",
-        "checks",
-        "refresher",
-        "templates",
-        "invalidate_floors",
-        "paperless_test_result",
-        "status_token_key",
-        "scan_blocked",
-        "lifespan_started",
-    ],
+# Every collaborator, and the lifecycle flag, by the name the app state could
+# hold a stray copy under.
+_FORMER_STATE_NAMES = (
+    "worker",
+    "job_store",
+    "settings",
+    "paperless",
+    "cache",
+    "checks",
+    "refresher",
+    "templates",
+    "invalidate_floors",
+    "paperless_test_result",
+    "status_token_key",
+    "scan_blocked",
+    "lifespan_started",
 )
+
+
+@pytest.mark.parametrize("name", _FORMER_STATE_NAMES)
 def test_collaborators_are_not_also_kept_under_their_own_names(
     default_settings: Settings, name: str
 ) -> None:
@@ -118,3 +121,18 @@ def test_collaborators_are_not_also_kept_under_their_own_names(
     finally:
         app.state.services.job_store.close()
         app.state.services.paperless.close()
+
+
+@pytest.mark.parametrize("name", _FORMER_STATE_NAMES)
+def test_a_running_app_keeps_no_collaborator_under_its_own_name(
+    default_settings: Settings, name: str
+) -> None:
+    """
+    The app state still holds no collaborator beside ``services`` once started.
+
+    The lifespan writes state of its own, so the check is repeated with the
+    lifespan running, not only on the app ``create_app`` returned.
+    """
+    app = create_app(default_settings, StubScannerBackend())
+    with TestClient(app), pytest.raises(AttributeError):
+        operator.attrgetter(f"state.{name}")(app)
