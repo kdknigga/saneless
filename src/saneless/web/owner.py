@@ -2,13 +2,10 @@
 Who may answer for a job: the owner token a browser carries in a cookie.
 
 The first scan a browser submits mints a random token, records it on the job
-row and hands it back as a cookie, and every later submit from that browser
-records the same token again.  Two things read it back: the status view,
-which shows a job's title, thumbnail and error text only to the browser that
-owns it, and the prompt handlers, which pass a flip or multi-page answer to
-the worker only from that browser.  Both ask the same question, so the cookie
-is written, read and compared in this one module, beside the handlers and the
-view rather than inside either.
+row and hands it back as a cookie; later submits record the same token.  The
+status view shows a job's title, thumbnail and error text only to the owning
+browser, and the prompt handlers pass a flip or multi-page answer to the
+worker only from it, so the cookie is written, read and compared here alone.
 """
 
 from __future__ import annotations
@@ -35,32 +32,19 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The cookie naming the browser that started a scan.  Every attribute it
-# is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
-# no script file in this application at all; ``SameSite=Lax`` so the browser
-# withholds it on any cross-site POST; ``Max-Age`` of one year, so a browser
-# keeps seeing its own scans' titles and previews after it restarts; and
-# deliberately no ``Secure``, because the appliance is served over plain HTTP
-# on a LAN and that flag would silently stop the cookie being sent rather than
-# harden it.
+# ``HttpOnly`` so no script reads it, ``SameSite=Lax`` so a cross-site POST goes
+# without it, and no ``Secure``, because over plain HTTP on a LAN that flag
+# would stop the cookie being sent rather than harden it.
 #
-# The cookie is re-set on every accepted submit, with the value the browser
-# presented or a fresh one when it presented none.  That renews the year each
-# time, and it is how a session cookie set by an older release gains the
-# lifetime: its token comes back unchanged, now persistent.
-#
-# The token's position, recorded here so a later reader does not mistake this
-# for something it is not: the token is a footgun guard for the flip prompt,
-# not an authentication mechanism.  ``CrossOriginGuard`` allows a POST that
-# carries neither ``Sec-Fetch-Site`` nor ``Origin``, so a scripted client that
-# sends a guessed cookie of its own can answer a flip.  That is accepted on a
-# trusted LAN, not overlooked.  What the token stops is the household member
-# standing at the same appliance pressing Continue on a stack they did not
-# load, which is the failure the token exists to close.
+# The owner token is a per-browser cookie that scopes what a viewer sees and
+# may answer, not a login: it stops a second person at the appliance answering
+# a prompt for paper they did not load.  A scripted client sending a guessed
+# cookie of its own can still answer one, which is accepted on a trusted LAN.
+# See docs/explanation/decisions/0014-owner-token-not-a-login.md.
 OWNER_COOKIE: Final = "saneless_owner"
 
-# One year in seconds: the owner cookie's lifetime, renewed on every accepted
-# submit.
+# Renewed on every accepted submit, so a browser keeps seeing its own scans'
+# titles and previews after it restarts.
 OWNER_COOKIE_MAX_AGE: Final = 365 * 24 * 60 * 60
 
 
@@ -109,18 +93,12 @@ def is_owner(presented: str | None, recorded: str | None) -> bool:
     """
     Report whether a presented token speaks for the job that recorded one.
 
-    A NULL recorded token means the job is unowned and everyone may answer it.
-    Every row written before owner tokens existed has one, including a
-    manual-duplex job that was in flight across an upgrade, and a strict rule
-    would leave such a job un-continuable until the manual-duplex flip timeout
-    fired it away.  Nothing creates a NULL-token job any more, so the exception
-    has a closed lifetime.
+    A NULL recorded token means the job is unowned and anyone may answer it.
+    Nothing creates one now, but a row written before owner tokens has one,
+    and a strict rule would strand its flip prompt until the timeout.
 
-    The comparison goes through ``secrets.compare_digest`` so no timing
-    difference can be read off it.  Both sides are encoded first:
-    the presented value arrives as text out of a header and ``compare_digest``
-    refuses a non-ASCII ``str``, while it compares bytes of any two lengths
-    safely.
+    ``secrets.compare_digest`` keeps the comparison constant-time.  It
+    refuses a non-ASCII ``str``, so both sides are encoded first.
 
     Args:
         presented: The token this request carries, or None.
@@ -141,11 +119,9 @@ def owner_answers(presented: str | None, job: Job | None) -> bool:
     """
     Report whether this request may answer the named job's prompt.
 
-    One rule for both kinds of wait: the manual-duplex flip prompt and every
-    multi-page prompt.  An unknown job id answers False: there is nothing to
-    own, and the worker would have dropped the answer anyway.  The outcome is logged as a match or
-    a mismatch and never as a value -- the token is not allowed into a log
-    line any more than into the markup.
+    One rule for the flip prompt and every multi-page prompt.  An unknown job
+    id answers False.  The outcome is logged as a match or a mismatch, never
+    the token, which no log line or markup may carry.
 
     Args:
         presented: The token this request carries, or None.
@@ -170,11 +146,8 @@ def token_for(presented: str | None) -> str:
     """
     Return the owner token a scan submit records and sends back.
 
-    The mint rule: a token is minted on the first submit from a browser
-    and reused for every later job from it, so two tabs on one device do not
-    disown each other.  It is recorded on the row either way, and an
-    accepted submit sends it back as a cookie either way, so the lifetime is
-    renewed.
+    Minted on a browser's first submit and reused for every later job, so two
+    tabs on one device do not disown each other.
 
     Args:
         presented: The token the request carries, or None when it carries none.
