@@ -529,6 +529,43 @@ def test_a_close_failure_is_logged_not_raised(
     assert dev.close_calls == 2
 
 
+class _ReportGoneError(Exception):
+    """The outlet could not report a stage: its channel is gone."""
+
+
+class _CloseUnreported(RecordingOutlet):
+    """An outlet that cannot report the close stage."""
+
+    def stage(self, stage: ScanStage, page: int | None) -> None:
+        """Record the stage, then fail to report the close."""
+        super().stage(stage, page)
+        if stage is ScanStage.CLOSE:
+            raise _ReportGoneError
+
+
+@pytest.mark.parametrize("flatbed_page", ["good", "unreadable"])
+def test_the_device_closes_when_the_close_cannot_be_reported(
+    monkeypatch: pytest.MonkeyPatch, flatbed_page: str
+) -> None:
+    """
+    An outlet that fails to report the close still has the device closed.
+
+    The pass's own error goes on unchanged; with none, the report's failure
+    is raised once the device is closed.
+    """
+    dev = FakeSaneDev()
+    image = _content_image(0) if flatbed_page == "good" else _unreadable_image()
+    dev.load_feeder([image])
+    _install(monkeypatch, dev)
+    expected = _ReportGoneError if flatbed_page == "good" else ScanError
+
+    with pytest.raises(expected):
+        run_pass(_DEVICE, _flatbed(), _CloseUnreported())
+
+    assert dev.cancel_calls >= 1
+    assert dev.close_calls == 1
+
+
 def test_the_reading_handle_is_registered_around_each_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -151,6 +151,9 @@ Escaped as JSON, even an all non-ASCII message stays under the protocol's
 
 _CONTROL_THREAD_NAME: Final = "saneless-scan-control"
 
+_STDERR_FD: Final = 2
+"""The descriptor the child inherits as saneless's stderr."""
+
 _PAGE_STAGES: Final = frozenset({ScanStage.START, ScanStage.READ})
 """
 The stages saneless times against the page budget.
@@ -274,8 +277,9 @@ class _ReplyChannel:
                     self._write(strip)
             except _ReplyClosedError:
                 raise
-            except BaseException:
+            except BaseException as exc:
                 self._torn = True
+                _note_cut_short(exc)
                 raise
 
     def _write(self, data: bytes) -> None:
@@ -296,6 +300,19 @@ class _ReplyChannel:
             raise _ReplyClosedError from exc
         finally:
             view.release()
+
+
+def _note_cut_short(exc: BaseException) -> None:
+    """
+    Tell stderr, by type only, why a page was cut short.
+
+    Nothing more can reach saneless on the reply channel, so this line is
+    the only trace of the cause.  The exception's text is left out: it can
+    name a device.
+    """
+    line = f"saneless scan child: a page was cut short by {type(exc).__name__}\n"
+    with contextlib.suppress(OSError):
+        os.write(_STDERR_FD, line.encode("ascii", "replace"))
 
 
 class _LogForwarder(logging.Handler):

@@ -990,7 +990,10 @@ def test_a_page_crosses_in_strips_that_rebuild_the_same_image(
 
 
 def test_a_page_cut_short_ends_the_channel_after_its_last_strip(
-    monkeypatch: pytest.MonkeyPatch, fake: FakeSaneModule, child: _ChildHarness
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    fake: FakeSaneModule,
+    child: _ChildHarness,
 ) -> None:
     """
     A strip that cannot be made leaves the page short, and nothing follows it.
@@ -998,7 +1001,8 @@ def test_a_page_cut_short_ends_the_channel_after_its_last_strip(
     The header and the strips already written cannot be taken back, so any
     later frame would be read as pixels: the child sends nothing more, not
     even the error, and ``main`` returns as for a channel that will not take
-    a write.  saneless then sees the channel close mid-page.
+    a write.  saneless then sees the channel close mid-page.  The device is
+    still cancelled and closed, and the cause is named, by type, on stderr.
     """
     source = _TALL_PAGES["L"]
     expected = source.tobytes()
@@ -1023,3 +1027,5 @@ def test_a_page_cut_short_ends_the_channel_after_its_last_strip(
     assert len(made) == 2
     assert rest == expected[: made[0] * source.width]
     assert child.join() == scan_child_main._PARENT_GONE_STATUS
+    assert fake.device.close_calls == 1
+    assert "a page was cut short by MemoryError" in capfd.readouterr().err

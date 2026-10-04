@@ -1425,10 +1425,19 @@ def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
             f"Could not open scanner {neutralise_controls(device_id)}: {describe(exc)}"
         )
         raise ScanError(open_msg) from exc
+    failed = True
     try:
         yield dev
+        failed = False
     finally:
-        outlet.stage(ScanStage.CLOSE, None)
+        # The outlet may fail to report the stage (saneless has gone, or a
+        # page was cut short); the device is cancelled and closed regardless,
+        # and that failure is raised only when the pass raised nothing else.
+        report_failure: Exception | None = None
+        try:
+            outlet.stage(ScanStage.CLOSE, None)
+        except Exception as exc:
+            report_failure = exc
         with contextlib.suppress(Exception):
             dev.cancel()
         try:
@@ -1440,6 +1449,8 @@ def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
                 neutralise_controls(device_id),
                 exc_info=True,
             )
+        if report_failure is not None and not failed:
+            raise report_failure
 
 
 def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image:
