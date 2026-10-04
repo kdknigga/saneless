@@ -662,7 +662,6 @@ def test_an_unexpected_exception_is_fatal_and_named_by_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An exception no pass should raise ends the child, naming its type."""
-    assert fake.init_call_count <= 1
 
     def broken_pass(
         device_id: str, settings: ScanSettings, outlet: PageOutlet
@@ -672,6 +671,7 @@ def test_an_unexpected_exception_is_fatal_and_named_by_type(
 
     monkeypatch.setattr(scan_session_mod, "run_pass", broken_pass)
     _ready(child)
+    assert fake.init_call_count == 1
 
     child.send(_scan())
     frames = child.frames_until(ChildFailure)
@@ -974,7 +974,6 @@ def test_a_scan_error_keeps_its_next_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A pass's own error is sent with its next step, and the child stays."""
-    assert fake.init_call_count <= 1
 
     def failing_pass(
         device_id: str, settings: ScanSettings, outlet: PageOutlet
@@ -985,6 +984,7 @@ def test_a_scan_error_keeps_its_next_step(
 
     monkeypatch.setattr(scan_session_mod, "run_pass", failing_pass)
     _ready(child)
+    assert fake.init_call_count == 1
 
     child.send(_scan())
     frames = child.frames_until(ChildFailure)
@@ -1123,8 +1123,8 @@ def test_a_cap_reached_travels_in_pass_done(
         return dataclasses.replace(outcome, cap_reached=cap, substituted_source="ADF")
 
     monkeypatch.setattr(scan_session_mod, "run_pass", capped_pass)
-    assert fake.init_call_count <= 1
     _ready(child)
+    assert fake.init_call_count == 1
 
     child.send(_scan())
     frames, _ = _spool_pass(child)
