@@ -884,6 +884,10 @@ def _no_alarm(seconds: int) -> int:
     return 0
 
 
+def _keep_sigpipe() -> None:
+    """Leave SIGPIPE alone: only the main thread may set it, and this is not it."""
+
+
 class _SelfClosingCommands(io.FileIO):
     """
     The read end of a scan child's command pipe, closed once it ends.
@@ -939,6 +943,7 @@ class _ThreadChild:
             arm_alarm=_no_alarm,
             exit_process=self.exits.append,
             grace_seconds=_SEAM_CHILD_GRACE_SECONDS,
+            ignore_sigpipe=_keep_sigpipe,
         )
         self._thread = threading.Thread(
             target=self._run,

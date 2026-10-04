@@ -48,7 +48,9 @@ option reads and writes) stops the control thread too, so an alarm is armed
 before every stage that calls into SANE and cleared while the child is idle;
 the default action for ``SIGALRM`` ends the process even inside a blocking C
 call.  The alarms outlast saneless's own deadlines, so they only ever fire
-for a child whose parent has died.
+for a child whose parent has died.  libsane can set SIGPIPE back to its
+default action, so the main thread ignores it again after starting SANE,
+after each pass and after each restart.
 
 Log records of saneless's own loggers travel to saneless as ``log`` frames,
 at the level saneless asked for.  The child ends with ``os._exit`` once its
@@ -226,12 +228,20 @@ class ChildRuntime:
         exit_process: Ends the process at once with a status: ``os._exit``.
         grace_seconds: How long the main thread has to end once stdin ends,
             before the process is ended.
+        ignore_sigpipe: Sets SIGPIPE to be ignored again, from the main
+            thread: ``_ignore_sigpipe`` in the real child.
 
     """
 
     arm_alarm: Callable[[int], object]
     exit_process: Callable[[int], None]
     grace_seconds: float
+    ignore_sigpipe: Callable[[], object]
+
+
+def _ignore_sigpipe() -> None:
+    """Ignore SIGPIPE again, as Python set it when the child started."""
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
 class _ReplyChannel:
@@ -809,7 +819,7 @@ def _scan(
         install_log_forwarding(reply, command.log_level)
     outlet = _ChildOutlet(reply, control, runtime)
     try:
-        outcome = scan_session.run_pass(command.device, settings, outlet)
+        outcome = _run_pass(command.device, settings, outlet, runtime)
     except scan_session.PassStopped:
         runtime.arm_alarm(0)
         if outlet.bad_command:
@@ -841,9 +851,32 @@ def _scan(
     return None
 
 
+def _run_pass(
+    device: str,
+    settings: ScanSettings,
+    outlet: _ChildOutlet,
+    runtime: ChildRuntime,
+) -> scan_session.PassOutcome:
+    """
+    Run one pass, and ignore SIGPIPE again however it ends.
+
+    Returns:
+        What the pass returned.
+
+    """
+    try:
+        return scan_session.run_pass(device, settings, outlet)
+    finally:
+        # libsane sets SIGPIPE back to its default action after a failed
+        # read, which ends every feeder pass.  It is ignored again before the
+        # child's next write, so a write to a saneless that has gone fails
+        # and the child ends through its own cleanup instead of dying.
+        runtime.ignore_sigpipe()
+
+
 def _restart(reply: _ReplyChannel, runtime: ChildRuntime) -> int | None:
     """
-    Restart SANE between passes.
+    Restart SANE between passes, and ignore SIGPIPE again after it.
 
     Returns:
         None when the child stays ready, or ``_FAILED_STATUS``.
@@ -853,8 +886,10 @@ def _restart(reply: _ReplyChannel, runtime: ChildRuntime) -> int | None:
     try:
         scan_session.restart_library()
     except Exception as exc:
+        runtime.ignore_sigpipe()
         reply.send(_failure(exc, ScanStage.RESTART, None, fatal=True))
         return _FAILED_STATUS
+    runtime.ignore_sigpipe()
     reply.send(Restarted())
     runtime.arm_alarm(0)
     return None
@@ -870,6 +905,7 @@ def _serve(reply: _ReplyChannel, control: _Control, runtime: ChildRuntime) -> in
     """
     runtime.arm_alarm(_STAGE_ALARM_SECONDS)
     failure = _start_library()
+    runtime.ignore_sigpipe()
     if failure is not None:
         reply.send(_failure(failure, ScanStage.STARTUP, None, fatal=True))
         return _FAILED_STATUS
@@ -967,6 +1003,7 @@ if __name__ == "__main__":
                 arm_alarm=signal.alarm,
                 exit_process=os._exit,
                 grace_seconds=_PARENT_GONE_GRACE_SECONDS,
+                ignore_sigpipe=_ignore_sigpipe,
             ),
             forward_logs=True,
         )

@@ -166,7 +166,12 @@ child.prepare_process()
 code = child.main(
     sys.stdin.buffer,
     reply_fd,
-    child.ChildRuntime(arm_alarm=signal.alarm, exit_process=os._exit, grace_seconds=10.0),
+    child.ChildRuntime(
+        arm_alarm=signal.alarm,
+        exit_process=os._exit,
+        grace_seconds=10.0,
+        ignore_sigpipe=child._ignore_sigpipe,
+    ),
     forward_logs=True,
 )
 child.flush_standard_streams()

@@ -122,21 +122,27 @@ class _ChildHarness:
 
     Attributes:
         alarms: Every value the child armed its alarm with, in order.
+        events: Every alarm and every SIGPIPE ignore, in order.
         exits: Every status the child asked its process to exit with.
         exited: Set once the child asked to exit.
 
     """
 
-    def __init__(self, *, grace_seconds: float = 5.0) -> None:
+    def __init__(
+        self, *, grace_seconds: float = 5.0, events: list[str] | None = None
+    ) -> None:
         """
         Start the child.
 
         Args:
             grace_seconds: How long the child waits after its commands end
                 before it asks to exit.
+            events: The list to record alarms and SIGPIPE ignores in, if the
+                test records more there.
 
         """
         self.alarms: list[int] = []
+        self.events: list[str] = [] if events is None else events
         self.exits: list[int] = []
         self.exited = threading.Event()
         command_read, self._command_write = os.pipe()
@@ -148,6 +154,7 @@ class _ChildHarness:
             arm_alarm=self._record_alarm,
             exit_process=self._record_exit,
             grace_seconds=grace_seconds,
+            ignore_sigpipe=self._record_ignore,
         )
         self._thread = threading.Thread(
             target=self._run, args=(runtime,), name="scan-child-main", daemon=True
@@ -157,7 +164,12 @@ class _ChildHarness:
     def _record_alarm(self, seconds: int) -> int:
         """Record an alarm instead of arming one."""
         self.alarms.append(seconds)
+        self.events.append(f"alarm {seconds}")
         return 0
+
+    def _record_ignore(self) -> None:
+        """Record a SIGPIPE ignore instead of setting one off the main thread."""
+        self.events.append("ignore sigpipe")
 
     def _record_exit(self, status: int) -> None:
         """Record an exit instead of ending the process."""
@@ -735,6 +747,72 @@ def test_the_alarm_is_armed_before_every_libsane_stage(
         0,  # pass done
         _STAGE,  # restart
         0,  # restarted
+    ]
+
+
+def test_sigpipe_is_ignored_again_after_every_libsane_stage_before_a_reply(
+    fake: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    SIGPIPE is ignored again after start-up, every pass and a restart.
+
+    libsane sets it back to its default action after a failed read, so each
+    ignore must come once the stage's last SANE call has returned and before
+    the child's next reply: a one-page pass, a pass that finds the feeder
+    empty, then a restart.  Stage reports are left out of the record.
+    """
+    events: list[str] = []
+    real_send = scan_child_main._ReplyChannel.send
+
+    def recording_send(reply: scan_child_main._ReplyChannel, frame: Frame) -> None:
+        if not isinstance(frame, LogLine | StageFrame | Configured):
+            events.append(f"send {_shape([frame])[0]}")
+        real_send(reply, frame)
+
+    monkeypatch.setattr(scan_child_main._ReplyChannel, "send", recording_send)
+    fake.device.load_feeder([_content_image(0)])
+    with _ChildHarness(events=events) as child:
+        _ready(child)
+        child.send(_scan())
+        _spool_pass(child)
+        child.send(_scan())
+        _spool_pass(child)
+        child.send(ControlOp.RESTART)
+        assert child.frame() == Restarted()
+        child.send(ControlOp.EXIT)
+        assert child.frame() == Bye()
+        assert child.join() == 0
+
+    stage, read, ignore = f"alarm {_STAGE}", f"alarm {_READ}", "ignore sigpipe"
+    assert events == [
+        stage,  # start-up
+        ignore,
+        "send ready",
+        "alarm 0",
+        stage,  # open
+        stage,  # configure
+        read,  # start 1
+        read,  # read 1
+        "alarm 0",  # waiting for page 1's answer
+        read,  # start 2: the end of the feed
+        stage,  # cancel
+        stage,  # close
+        ignore,
+        "alarm 0",
+        "send pass_done",
+        stage,  # open
+        stage,  # configure
+        read,  # start 1: the feeder is empty
+        stage,  # cancel
+        stage,  # close
+        ignore,
+        "alarm 0",
+        "send error FeederEmptyError",
+        stage,  # restart
+        ignore,
+        "send restarted",
+        "alarm 0",
+        "send bye",
     ]
 
 
