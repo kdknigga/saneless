@@ -10,7 +10,7 @@ libsane's net backend keeps one control connection per scanner host open between
 
 ## Decision
 
-Every SANE query outside a scan -- listing scanners for the Scanner check, auto-detection, start-up profile generation and the device-listing commands; opening the device for the Scanner check; reading a device's capabilities for the web form, the CLI and start-up profiles -- runs in a short-lived child process with a deadline, through `saneless.scanner.listing`. The child is a clean exec of the interpreter on the child script, in isolated mode, in a session of its own, with a literal argv and the device id passed on stdin, and it loads the thread unwinder before python-sane. The child is killed and reaped before the query returns. The scan child of ADR 0016 is started through the same launcher, `saneless.scanner.child_launch`.
+Every SANE query outside a scan -- listing scanners for the Scanner check, auto-detection, start-up profile generation and the device-listing commands; opening the device for the Scanner check; reading a device's capabilities for the CLI and the start-up profiles the web form offers -- runs in a short-lived child process with a deadline, through `saneless.scanner.listing`. The child is a clean exec of the interpreter on the child script, in isolated mode, in a session of its own, with a literal argv and the device id passed on stdin, and it loads the thread unwinder before python-sane. The child is killed and reaped before the query returns. The scan child of ADR 0016 is started through the same launcher, `saneless.scanner.child_launch`.
 
 The invariant: no SANE query happens in the server's own process, and a caller holding the scanner gate releases it only after the child has been reaped, so nothing is left inside libsane.
 
