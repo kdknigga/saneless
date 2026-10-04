@@ -3695,8 +3695,10 @@ class TestScannerCheck:
         """
         The probe dials the host SANE dials, not the one the file names.
 
-        The backend's ``_ensure_initialised`` honours a pre-existing ``SANE_NET_HOSTS`` and logs that it is ignoring
-        ``scanner.host``.  A probe reading only the setting can therefore
+        Every scanner child runs with ``SANE_NET_HOSTS`` set by
+        ``child_environment`` from ``effective_sane_net_hosts``, where a
+        non-empty exported ``SANE_NET_HOSTS`` wins over ``scanner.host``.  A
+        probe reading only the setting can therefore
         describe a host that is not in play at all: a down config host
         producing a row while the live environment host serves devices.
 
