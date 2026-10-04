@@ -389,14 +389,10 @@ def test_loading_the_child_imports_nothing_from_saneless_or_sane() -> None:
         """
     )
 
-    # Every argv element is a literal and the per-run paths travel in the
-    # environment, quoted so they are never re-split.
     result = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -I -c "$SANELESS_TEST_CODE"'],
+        [sys.executable, "-I", "-c", script],
         env={
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CODE": script,
             "SANELESS_TEST_MODULE": str(_CHILD_PATH),
         },
         capture_output=True,

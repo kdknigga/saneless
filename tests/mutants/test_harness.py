@@ -8,7 +8,6 @@ stay out of an ordinary run until they are asked for.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -45,20 +44,20 @@ def _collect(*, with_mutants: bool) -> subprocess.CompletedProcess[str]:
         The finished child, with its output captured.
 
     """
-    # The option travels unquoted, so an empty value adds no argument at all.
+    options = ["--mutants"] if with_mutants else []
     return subprocess.run(
         [
-            "/bin/sh",
-            "-c",
-            'exec "$SANELESS_TEST_PYTHON" -m pytest -p no:cacheprovider '
-            "--collect-only -q $SANELESS_TEST_OPTIONS tests/mutants/test_harness.py",
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--collect-only",
+            "-q",
+            *options,
+            "tests/mutants/test_harness.py",
         ],
         cwd=REPO_ROOT,
-        env={
-            **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_OPTIONS": "--mutants" if with_mutants else "",
-        },
         capture_output=True,
         text=True,
         check=False,

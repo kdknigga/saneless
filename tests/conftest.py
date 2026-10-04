@@ -1635,10 +1635,8 @@ def leave_killed_workspace(
 
     A child process enters a real ``JobWorkspace`` in ``tmp_dir``, spools
     ``pages`` into it, and SIGKILLs itself, so the kernel -- not saneless --
-    releases the workspace's lock. Every argv element is a literal and the
-    per-run values travel in the environment, as ``test_pdf._measure_assembly``
-    does: ``sys.executable`` in the argv would take the call off ruff's S603
-    allow-list, and this project adds no suppressions.
+    releases the workspace's lock. The per-run values travel in the
+    environment, where the child reads them.
 
     Import it as ``from tests.conftest import leave_killed_workspace``.
 
@@ -1655,8 +1653,6 @@ def leave_killed_workspace(
     """
     env = {
         **os.environ,
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_SOURCE": _KILLED_WORKSPACE_CHILD,
         "SANELESS_TEST_TMP_DIR": str(tmp_dir),
         "SANELESS_TEST_JOB_ID": job_id,
         "SANELESS_TEST_TITLE": title,
@@ -1664,7 +1660,7 @@ def leave_killed_workspace(
         "SANELESS_TEST_PAGES": ",".join(pages),
     }
     completed = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"'],
+        [sys.executable, "-c", _KILLED_WORKSPACE_CHILD],
         env=env,
         capture_output=True,
         text=True,

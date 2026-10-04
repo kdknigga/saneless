@@ -75,6 +75,20 @@ _GIT_ENV = {
 _TRAILING_COMMENT = re.compile(r"\s#")
 
 
+def _git() -> str:
+    """
+    Return the git executable on PATH, failing the test when there is none.
+
+    Returns:
+        The absolute path ``shutil.which`` resolved.
+
+    """
+    git = shutil.which("git")
+    if git is None:
+        pytest.fail("git is not on PATH, so the ignore rules cannot be checked")
+    return git
+
+
 @pytest.fixture(scope="module")
 def ignore_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """
@@ -87,9 +101,8 @@ def ignore_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     """
     repo = tmp_path_factory.mktemp("ignore-repo")
-    # Every argv element is a literal and the repository travels in ``cwd``.
     init = subprocess.run(
-        ["/usr/bin/git", "init", "--quiet", "--template="],
+        [_git(), "init", "--quiet", "--template="],
         cwd=repo,
         env={**os.environ, **_GIT_ENV},
         capture_output=True,
@@ -118,11 +131,10 @@ def _ignored(repo: Path, paths: tuple[str, ...]) -> set[str]:
         The paths git reports as ignored.
 
     """
-    # Every argv element is a literal and the repository travels in ``cwd``;
-    # the paths go over stdin, so no variable data reaches the argv.
+    # The paths go over stdin, so none of them can be read as an option.
     result = subprocess.run(
         [
-            "/usr/bin/git",
+            _git(),
             "-c",
             "core.excludesFile=/dev/null",
             "check-ignore",

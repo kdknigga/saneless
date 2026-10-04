@@ -127,14 +127,10 @@ def test_a_failed_libsane_read_cannot_let_a_dead_peer_kill_saneless(
         status: The status the test backend ends its read with.
 
     """
-    # Every argv element is a literal and the per-run values travel in the
-    # environment, quoted so they are never re-split.
     result = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+        [sys.executable, "-c", _LIBSANE_PROBE],
         env={
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CODE": _LIBSANE_PROBE,
             "SANELESS_TEST_STATUS": status,
         },
         capture_output=True,

@@ -221,9 +221,6 @@ def _run_child(
     """
     Run ``code`` in a fresh interpreter and return the finished child.
 
-    Every argv element is a literal; the interpreter, the code and the per-run
-    values travel in the environment, quoted so they are never re-split.
-
     Args:
         code: The Python source the child runs.
         extra_env: Variables added to the child's environment.
@@ -234,13 +231,8 @@ def _run_child(
 
     """
     return subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
-        env={
-            **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CODE": code,
-            **extra_env,
-        },
+        [sys.executable, "-c", code],
+        env={**os.environ, **extra_env},
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,

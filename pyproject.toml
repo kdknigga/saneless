@@ -214,6 +214,8 @@ exclude = [".planning/**/*.md"]
     "S101",   # assert is the test mechanism
     "ARG",    # unused args in ABC stubs and fixture overrides
     "S104", "S105", "S106",  # hardcoded test values are inherent to fixtures
+    "S603",  # tests start their own interpreter and git with argument lists, never a shell string
+    "S607",  # git and ruff are resolved on PATH with shutil.which
 ]
 "src/saneless/__init__.py" = ["PLC0415"]
 "src/saneless/config.py" = ["S104"]

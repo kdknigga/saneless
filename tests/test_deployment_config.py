@@ -18,8 +18,8 @@ from __future__ import annotations
 import ast
 import io
 import logging
-import os
 import re
+import shutil
 import subprocess
 import sys
 import tokenize
@@ -2477,13 +2477,10 @@ def _shipped_files() -> list[str]:
         here.
 
     """
-    # Every argv element is a literal and the repository path travels in the
-    # ``cwd`` keyword -- the shape test_scanner.py and test_atomic_write.py
-    # established for the other child-process tests in this suite. Passing
-    # ``str(REPO_ROOT)`` as a ``-C`` argument instead trips ruff S603, and
-    # suppression is forbidden.
+    git = shutil.which("git")
+    assert git is not None, "git is not on PATH, so the shipped files are unknown"
     result = subprocess.run(
-        ["/usr/bin/git", "ls-files", "-z"],
+        [git, "ls-files", "-z"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -5253,30 +5250,19 @@ def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
     constructing the ``APIRouter`` somewhere else stops the exemption applying
     while the config still looks exactly right.
     """
-    env = {
-        **os.environ,
-        "SANELESS_TEST_RUFF": str(Path(sys.executable).with_name("ruff")),
-        "SANELESS_TEST_FILE": _TC002_TARGET,
-    }
-
-    # Every argv element is a literal and the per-run paths travel in the
-    # environment, double-quoted so the shell never re-splits them -- the
-    # shape the other child-process tests in this suite established. The two
-    # obvious alternatives are both rejected by this project's own lint rules:
-    # a bare command name relying on PATH trips ruff S607, and putting the
-    # resolved executable path in argv[0] trips S603, because argv[0] stops
-    # being a literal. Suppression is forbidden, so the shell indirection is
-    # what is left. The repository path travels in ``cwd``, never as a -C
-    # argument, for the reason the git helper above gives. The command string
-    # stays inline rather than moving to a named constant: S603 only accepts
-    # an argv whose elements are literals at the call site.
+    # The interpreter running the tests runs ruff, so the check uses the ruff
+    # installed beside it, not whichever one is first on PATH.
     result = subprocess.run(
         [
-            "/bin/sh",
-            "-c",
-            'exec "$SANELESS_TEST_RUFF" check --no-fix --select TC002 "$SANELESS_TEST_FILE"',
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--no-fix",
+            "--select",
+            "TC002",
+            _TC002_TARGET,
         ],
-        env=env,
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

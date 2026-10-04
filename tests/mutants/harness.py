@@ -51,9 +51,11 @@ def _listed_paths() -> list[str]:
         Repository-relative paths, as git prints them.
 
     """
+    git = shutil.which("git")
+    assert git is not None, "git is not on PATH, so the repository cannot be listed"
     listing = subprocess.run(
         [
-            "/usr/bin/git",
+            git,
             "ls-files",
             "-z",
             "--cached",
@@ -125,9 +127,6 @@ def run_test(
     """
     Run one test inside a copied repository.
 
-    The interpreter and node id travel in the environment so the argv stays a
-    literal, which keeps the call on ruff's subprocess allow-list.
-
     Args:
         copy: The copied repository to run in.
         nodeid: The pytest node id, relative to the repository root.
@@ -138,19 +137,9 @@ def run_test(
 
     """
     return subprocess.run(
-        [
-            "/bin/sh",
-            "-c",
-            'exec "$SANELESS_TEST_PYTHON" -m pytest -p no:cacheprovider -q '
-            '"$SANELESS_TEST_NODEID"',
-        ],
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", nodeid],
         cwd=copy,
-        env={
-            **os.environ,
-            "PYTHONPATH": str(copy / "src"),
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_NODEID": nodeid,
-        },
+        env={**os.environ, "PYTHONPATH": str(copy / "src")},
         capture_output=True,
         text=True,
         check=False,

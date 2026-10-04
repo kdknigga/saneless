@@ -850,13 +850,7 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
     """
     Spool and assemble ``page_count`` pages in a child, and read its peak RSS.
 
-    Every argv element is a literal and the per-run values travel in the
-    environment, exactly as ``test_atomic_write._run_in_mount_namespace`` does.
-    That is not decoration: ``sys.executable`` sitting in the argv is the one
-    thing that takes the call off ruff's S603 allow-list, and this project adds
-    no suppressions. ``shell=False`` throughout -- the shell is an explicit
-    program running an explicit literal, with nothing interpolated into it.
-
+    The per-run values travel in the environment, where the child reads them.
     The child inherits this process's environment, ``PYTHONPATH`` included,
     so it imports the same ``saneless`` the test does.
 
@@ -871,15 +865,13 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
     """
     env = {
         **os.environ,
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_SCRIPT": str(script),
         "SANELESS_TEST_PAGES": str(page_count),
         "SANELESS_TEST_WIDTH": str(_MEMORY_PAGE_WIDTH),
         "SANELESS_TEST_HEIGHT": str(_MEMORY_PAGE_HEIGHT),
         "SANELESS_TEST_WORKSPACE": str(workspace),
     }
     completed = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_SCRIPT"'],
+        [sys.executable, str(script)],
         env=env,
         capture_output=True,
         text=True,
