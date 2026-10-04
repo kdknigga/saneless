@@ -64,8 +64,8 @@ def test_net_hosts_is_a_leaf_that_imports_nothing_from_saneless() -> None:
     ``checks.py`` imports it at runtime, and ``doctor`` must still run on a
     machine without python-sane, so it may import nothing from the package.
     The module is loaded from its file under a private name in a fresh
-    interpreter, because importing it by its dotted name would run the package
-    ``__init__``, which imports the configuration.
+    interpreter, so ``sys.modules`` shows only what the module itself imports,
+    not the packages a dotted import would load on the way.
     """
     module_path = Path(saneless.__file__).parent / "scanner" / "net_hosts.py"
     script = textwrap.dedent(

@@ -841,8 +841,8 @@ def test_serve_installs_no_handler(
     ``serve`` installs no handler of its own before the server runs.
 
     The one-shot commands' SIGTERM and SIGHUP handlers are not ``serve``'s:
-    it reaches ``_run_server`` with the handlers it started with, and those
-    are in place again once it returns.  ``_run_server`` itself installs a
+    it reaches ``run_server`` with the handlers it started with, and those
+    are in place again once it returns.  ``run_server`` itself installs a
     SIGTERM handler around uvicorn's run and restores the previous one.
     """
     before = {signum: signal.getsignal(signum) for signum in _INTERRUPTING}
@@ -858,8 +858,8 @@ def test_serve_installs_no_handler(
         for signum in _INTERRUPTING:
             seen[signum] = signal.getsignal(signum)
 
-    monkeypatch.setattr("saneless.cli.create_app", create_app)
-    monkeypatch.setattr("saneless.cli._run_server", run_server)
+    monkeypatch.setattr("saneless.web.app.create_app", create_app)
+    monkeypatch.setattr("saneless.web.server.run_server", run_server)
 
     result = CliRunner().invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 
