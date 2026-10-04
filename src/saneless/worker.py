@@ -16,21 +16,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, Literal
 
-from .auto_profiles import (
-    device_type_of,
-    generate_profiles,
-    is_bare_default,
-    write_profiles_to_config,
-)
-from .config import (
-    CONFIG_FILENAME,
-    absolute_or_as_spelled,
-    config_file_state,
-    config_search_paths,
-    profile_storage_for_loaded,
-)
+from .auto_profiles import is_bare_default
 from .exceptions import (
-    ConfigError,
     ScanCancelledError,
     ScanInterrupted,
     failure_text,
@@ -50,11 +37,11 @@ from .pipeline import (
     run_pipeline,
 )
 from .scan_metadata import ScanMetadata
+from .startup_profiles import StartupProfiles
 from .vocabulary import (
     ACTIVE_STATES,
     PASS_WAIT_STATES,
     WAITING_STATES,
-    ConfigFileState,
     ErrorCategory,
     FlipOutcome,
     JobState,
@@ -72,7 +59,6 @@ from .vocabulary import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig, Settings
     from .job import Job, JobStore
     from .paperless import PaperlessClient
@@ -208,46 +194,6 @@ class _Queued:
 
     job: Job
     options: ScanOptions
-
-
-def _profiles_after_persist(
-    loaded: Mapping[str, ProfileConfig],
-    generated: Mapping[str, ProfileConfig],
-    result: ProfileWriteResult | None,
-) -> dict[str, ProfileConfig]:
-    """
-    Choose the profiles to use in memory, matching what a restart will load.
-
-    ``write_profiles_to_config`` never touches a same-name profile without
-    ``auto_generated = true``, and the worker never forces, so a flagged one
-    is skipped too.  A file that spells out a bare ``[profiles.default]``
-    therefore keeps it.  Swapping the generated ``default`` into memory anyway
-    would give this run one ``default`` and every later run another.
-
-    Args:
-        loaded: The bare default profile set the settings were loaded with.
-        generated: The profiles generated from the scanner.
-        result: What the write did to the config file, or ``None`` when
-            nothing was persisted and the generated set is for this run only.
-
-    Returns:
-        A new dict: the generated set when nothing was persisted, otherwise
-        each generated profile that was persisted, with the loaded profile
-        kept for every name the write did not persist.
-
-    """
-    if result is None:
-        return dict(generated)
-    persisted = result.persisted
-    profiles: dict[str, ProfileConfig] = {}
-    for name, profile in generated.items():
-        if name in persisted:
-            profiles[name] = profile
-        elif name in loaded:
-            profiles[name] = loaded[name]
-    for name, profile in loaded.items():
-        profiles.setdefault(name, profile)
-    return profiles
 
 
 class WorkerFlipCoordinator(FlipCoordinator):
@@ -766,7 +712,7 @@ class ScanWorker:
         # enter get_devices(), and have a job start a microsecond later.
         self._scanner_gate = threading.Lock()
         # What became of the one startup persist attempt.  Recorded rather
-        # than recomputed because _persist_generated_profiles returns None for
+        # than recomputed because StartupProfiles's write result is None for
         # two different situations -- no config file was loaded, and one was
         # loaded and could not be written -- and the Profiles row has to tell
         # them apart.  A fresh os.access() probe at check time cannot
@@ -1479,216 +1425,6 @@ class ScanWorker:
             self._settings.profiles = replacement
         return True
 
-    def _generate_startup_profiles(self) -> None:
-        """
-        Generate profiles from the scanner once, as the thread's first act.
-
-        This runs on the worker thread before it takes any job, so the server
-        is already answering requests while it works.  A page loaded meanwhile
-        may list only ``default`` until it is reloaded; a job submitted
-        meanwhile waits in the queue and then runs against the generated set.
-
-        It is tried once per start.  A scanner failure is logged with the real
-        exception class and the bare default is kept; the cause is never
-        guessed.  Restarting saneless, or ``saneless auto-profiles``, retries.
-
-        The profiles are written only to ``settings.config_path``, the file
-        these settings were loaded from.  With no loaded file they are used in
-        memory for this run (INFO); when the loaded file cannot be written they
-        are used in memory too (WARNING).  Nothing is ever written to a path
-        worked out afresh here.
-
-        Memory matches what the file will load after a restart.  When the file
-        already defines ``default``, the write keeps it, so the loaded
-        ``default`` is kept in memory too rather than the generated one.
-        """
-        with self._profiles_lock:
-            bare = is_bare_default(self._settings)
-            loaded = self._settings.profiles
-        if not bare:
-            # Nothing was generated, so nothing was persisted -- but the
-            # profiles in hand came from the loaded file, and the Profiles row
-            # must not tell a household member they are in memory and lost on
-            # restart when they are in the file they just edited.
-            self._profile_storage = profile_storage_for_loaded(self._settings)
-            return
-        profiles = self._read_generated_profiles()
-        if profiles is None:
-            # A SANE failure during generation leaves the loaded profiles in
-            # place; they are no more in-memory than they were a moment ago.
-            self._profile_storage = profile_storage_for_loaded(self._settings)
-            return
-        result = self._persist_generated_profiles(profiles)
-        self._set_profiles(_profiles_after_persist(loaded, profiles, result))
-
-    def _read_generated_profiles(self) -> dict[str, ProfileConfig] | None:
-        """
-        Ask the scanner for its capabilities and build profiles from them.
-
-        Returns:
-            The generated profiles, or ``None`` when no scanner was found or the
-            scanner could not be read -- both logged, with the bare default kept.
-
-        """
-        try:
-            # Gated for the same reason _scan_job is, and it is a real second
-            # entry into SANE rather than a precaution.  get_devices() lists in
-            # a short-lived child process that holds the gate for its whole
-            # life, so the gate still keeps a probe from overlapping it; and
-            # get_capabilities() opens the device in this process and reads its
-            # option list.  Held across both, because a probe slipping between
-            # them is inside SANE just as surely as one during either.
-            #
-            # No restart of SANE here, unlike the top of every job: this runs
-            # once, before any job, on the SANE the backend's constructor has
-            # only just started, so there is no stale connection to clear.
-            #
-            # No re-entrancy hazard: this runs once, as the worker thread's
-            # first act, strictly before any job -- so the gate is never
-            # already held by this thread when it arrives here.
-            #
-            # That same fact makes this the health checks' one known gate
-            # contender with no scan anywhere in sight: _current_job_id is
-            # still None here, and the lifespan starts the refresher right
-            # after the worker, so this window is exactly the cold-start poll's
-            # window.  A check that loses this gate has therefore *not* lost it
-            # to a scan and must not report one -- which is why checks.py has
-            # _scanner_busy() beside _scanner_skipped().
-            with self._scanner_gate:
-                devices = self._scanner.get_devices()
-                if not devices:
-                    logger.warning(
-                        "Auto-profiles: no scanners found, using bare default"
-                    )
-                    return None
-                device_id = self._settings.scanner.device or devices[0].name
-                caps = self._scanner.get_capabilities(device_id)
-            return generate_profiles(caps, device_type_of(devices, device_id))
-        except Exception as exc:
-            # The exception class is named, never interpreted.  The old
-            # message blamed the network for every failure, a parse error
-            # included, and sent operators after faults that were not there.
-            logger.warning(
-                "Auto-profiles: could not read scanner capabilities (%s); keeping "
-                "the bare default profile. Restart saneless or run "
-                "'saneless auto-profiles' to retry",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            return None
-
-    def _log_no_config_file(self) -> None:
-        """
-        Say why the generated profiles were not written, naming the real reason.
-
-        Two situations end up here and they want different sentences.  Usually
-        nothing was found and the fix is to create a file, so the message
-        lists the places that were looked at.  But a file under the superseded
-        name sitting in one of those directories is also "nothing loaded", and
-        telling that operator to create a file -- while naming the very
-        directory the file they already wrote is in, without mentioning it --
-        is how one appliance came to report four symptoms and no cause.
-
-        The state comes from ``config_file_state``, the same derivation the
-        startup log, the Configuration row, ``doctor`` and the CLI read, so
-        this message cannot come to disagree with them.  Nothing is written
-        and the superseded-name file is only named: a rename is the operator's
-        to make, and doing it for them would be this process deciding which of
-        two files holds the configuration.
-        """
-        discovery = self._settings.config_discovery
-        if (
-            discovery is not None
-            and config_file_state(self._settings) is ConfigFileState.STALE_ONLY
-        ):
-            logger.info(
-                "Auto-profiles: no config file was loaded, so the generated "
-                "profiles are used for this run only and were not written; %s "
-                "was ignored because saneless reads %s, not the old name; "
-                "rename it to keep them",
-                discovery.stale[0].absolute(),
-                CONFIG_FILENAME,
-            )
-            return
-        # The recorded search when there is one, so the list is what this
-        # process actually looked at rather than what a fresh call would
-        # return; settings built directly carry no recording and fall back.
-        searched = (
-            tuple(absolute_or_as_spelled(path) for path in discovery.searched)
-            if discovery is not None
-            else config_search_paths()
-        )
-        logger.info(
-            "Auto-profiles: no config file was loaded, so the generated "
-            "profiles are used for this run only and were not written; pass "
-            "--config or create one of %s to keep them",
-            ", ".join(str(path) for path in searched),
-        )
-
-    def _persist_generated_profiles(
-        self, profiles: dict[str, ProfileConfig]
-    ) -> ProfileWriteResult | None:
-        """
-        Write generated profiles to the loaded config file, if there is one.
-
-        Failure to write is logged, never raised, whatever it raises: the
-        profiles are still used in memory for this run.  Success is logged in
-        the same group vocabulary the CLI prints.
-
-        Args:
-            profiles: The generated profiles.
-
-        Returns:
-            What the write did to the file, or ``None`` when nothing was
-            persisted because no file was loaded or the write failed.
-
-        """
-        config_path = self._settings.config_path
-        if config_path is None:
-            self._log_no_config_file()
-            self._profile_storage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
-            return None
-        try:
-            result = write_profiles_to_config(config_path, profiles)
-        except (OSError, ConfigError) as exc:
-            # The OSError text goes to the server log for the operator, never
-            # into an HTTP response.
-            logger.warning(
-                "Auto-profiles: could not write %s (%s: %s); the generated "
-                "profiles are used for this run only and will not survive a "
-                "restart",
-                config_path,
-                type(exc).__name__,
-                exc,
-            )
-            self._profile_storage = ProfileStorage.IN_MEMORY_UNWRITABLE
-            return None
-        except Exception as exc:
-            # Anything else -- a tomlkit container error, say; a parse or UTF-8
-            # failure is already a ConfigError -- must not throw away the
-            # generated profiles either.  Unexpected, so the traceback is
-            # logged too; the exception class is named, never interpreted.
-            logger.warning(
-                "Auto-profiles: could not write %s (%s); the generated "
-                "profiles are used for this run only and will not survive a "
-                "restart",
-                config_path,
-                type(exc).__name__,
-                exc_info=True,
-            )
-            # The same outcome as the branch above, and deliberately so: two
-            # causes, one fact.  A file was loaded, and the profiles did not
-            # reach it.  The row says that; the log says why.
-            self._profile_storage = ProfileStorage.IN_MEMORY_UNWRITABLE
-            return None
-        logger.info(
-            "Auto-profiles: %s: %s",
-            result.path,
-            "; ".join(result.describe()) or "no changes",
-        )
-        self._profile_storage = ProfileStorage.PERSISTED
-        return result
-
     def _run(self) -> None:
         """
         Worker loop: process jobs until stop() sets the stop flag.
@@ -1710,9 +1446,19 @@ class ScanWorker:
         After the loop, it tries once more to write whatever is still owed.
         """
         try:
-            self._generate_startup_profiles()
+            # The profiles and whether they are bare are read together, under
+            # the lock; the swap goes through _set_profiles, which takes it.
+            with self._profiles_lock:
+                bare = is_bare_default(self._settings)
+                loaded = self._settings.profiles
+            profiles, storage = StartupProfiles(
+                self._settings, self._scanner, self._scanner_gate
+            ).run(loaded=loaded, bare=bare)
+            self._profile_storage = storage
+            if profiles is not None:
+                self._set_profiles(profiles)
         except Exception:
-            # _generate_startup_profiles catches what it expects itself; this
+            # StartupProfiles catches what it expects itself; this
             # is the backstop that keeps a surprise from ending the thread
             # before it has taken a single job.
             logger.exception("Auto-profiles: startup generation failed")
