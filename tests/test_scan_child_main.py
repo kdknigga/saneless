@@ -13,6 +13,7 @@ hanging it.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -979,6 +980,20 @@ def test_sigpipe_is_ignored_again_before_every_reply(
     ]
     assert not unguarded, events
     assert events.count("ignore sigpipe") == len(sends)
+
+
+def test_every_reply_channel_is_given_its_sigpipe_hook() -> None:
+    """
+    A reply channel cannot be made without saying how SIGPIPE is ignored.
+
+    A default that did nothing would let a new channel in the real child
+    write with SIGPIPE at libsane's default action, and no error would say
+    so; the caller must pass the hook by name.
+    """
+    hook = inspect.signature(scan_child_main._ReplyChannel).parameters["ignore_sigpipe"]
+
+    assert hook.default is inspect.Parameter.empty
+    assert hook.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_a_record_logged_off_the_main_thread_is_not_forwarded() -> None:
