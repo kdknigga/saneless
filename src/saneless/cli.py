@@ -818,9 +818,7 @@ _CLICK_CONTROL_FLOW: tuple[type[Exception], ...] = (
 
 ``--help`` raises ``Exit``, EOF at a prompt raises ``Abort``, and a usage error
 is a ``ClickException``; click's ``main`` turns each into its own output and exit
-code. Held under a name because the parenthesis-free multi-type ``except`` ruff
-formats to (PEP 758) does not parse on the older interpreter the pre-commit AST
-hooks run.
+code.
 """
 
 
