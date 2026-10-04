@@ -2551,8 +2551,8 @@ def refresh_checks(request: Request) -> Response:
     ``HX-Target`` -- which, until the exemption was narrowed to a GET,
     meant the error body was written over the strip, taking every row and
     the only button that could bring them back.  Now a failure inside the
-    strip's rendering ends as ``strip_view.checks_fallback_context`` at 200 on this route
-    too, so the strip and the button stay on the page.  Everything before the
+    strip's rendering ends as ``strip_view.checks_fallback_context`` at 200 on
+    this route too, so the strip and the button stay on the page.  Everything before the
     render -- the watcher stamp, the claim, the probe request -- is the click's
     action rather than the strip's drawing, and stays outside the guard on
     purpose: a request that raises is a failed click, and a failed click is
