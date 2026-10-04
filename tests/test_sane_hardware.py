@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import threading
 from typing import TYPE_CHECKING
 
 import pytest
@@ -24,6 +23,7 @@ import pytest
 import saneless.scanner.scan_session as scan_session_mod
 from saneless.exceptions import ScanError
 from saneless.pipeline import _SPOOL_LABEL_A
+from saneless.scanner import child_launch
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink
@@ -39,10 +39,6 @@ if TYPE_CHECKING:
 # about libsane, not about the spool's shortfall arithmetic, and a positive reserve
 # would fail them on a CI runner with a nearly full disk.
 _NO_FREE_SPACE_RESERVE = 0
-
-# How a thread reading a SANE page in this process would be named.  Scans
-# read in a child, so after a scan no thread of this process carries it.
-_READER_THREAD_NAME = "sane-read"
 
 # The only port libsane's net backend dials: it resolves every host with
 # getaddrinfo(name, "sane-port"), and SANE_NET_HOSTS has no port syntax.
@@ -276,33 +272,37 @@ class TestRealSaneTestBackend:
             image.convert("L").getextrema() == (0, 0) for image in images_of(batch)
         )
 
-    def test_a_scan_reads_its_pages_without_a_reader_thread_here(
-        self, tmp_path: Path
+    def test_a_scan_reads_its_pages_in_a_scan_child_process(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A real scan returns its page and leaves no SANE reader thread behind.
+        A real scan returns its page from a child process the scan started.
 
-        ``SaneBackend`` reads pages in a scan child, so the scan must not
-        have started SANE reads on a thread of this process.  A thread named
-        ``sane-read...`` still alive here after the scan returned is a read
-        made in this process and left running, which is the state that once
-        made the next scan or ``sane_exit`` unsafe.
+        ``SaneBackend`` reads pages in a scan child, so a scan must start one,
+        running the scan child's script; a scan made in this process instead
+        starts none.
 
         Args:
             tmp_path: Where the page is spooled.
+            monkeypatch: Records each child the launcher starts.
 
         """
+        started: list[str] = []
+        real_start = child_launch.start_child
+
+        def recording_start(
+            script: Path, configured_host: str
+        ) -> subprocess.Popen[bytes]:
+            started.append(script.name)
+            return real_start(script, configured_host)
+
+        monkeypatch.setattr(child_launch, "start_child", recording_start)
         settings = ScanSettings(source="Flatbed", resolution=75, mode="Gray")
 
         batch = SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path))
 
         assert [record.sequence for record in batch.pages] == [1]
-        readers = [
-            thread.name
-            for thread in threading.enumerate()
-            if thread.name.startswith(_READER_THREAD_NAME)
-        ]
-        assert readers == []
+        assert started == ["_scan_child.py"]
 
 
 # What ``test:0`` reports for a 75 dpi gray frame over its default 80 x 100 mm
