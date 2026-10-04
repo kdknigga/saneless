@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import re
 
-# The identifier shapes the planning records use: decision, finding and
-# requirement IDs, threat IDs, the code review's report and nit IDs, phase and
-# plan numbers, numbered research pitfalls and the planning file names. The
-# architecture, enumeration and multi-page requirement IDs are covered too,
-# because their prefixes appear in no other identifier shape above. It also
+# The identifier shapes the planning records use: decision, finding, research
+# and requirement IDs, threat IDs, the code review's report and nit IDs, phase
+# and plan numbers, numbered research pitfalls and the planning file names. An
+# ID is matched only when the pattern names its prefix, so a requirement or
+# audit family the records start using is added here, with a sample, or it gets
+# through. Those families need two digits or more, because some of their
+# prefixes open ordinary text with one, such as a PDF version or TEST-NET-1. The
+# architecture, enumeration and multi-page requirement IDs are covered with one
+# digit too, because their prefixes appear in no other identifier shape. It also
 # rejects a Python, HTML, CSS or JavaScript file named with a line number after
 # a colon, the name of the assistant instructions file, and a phase referred
 # to without its number: line numbers drift, and the other two cannot be
@@ -28,10 +32,12 @@ import re
 # pattern, and a test in tests/test_deployment_config.py keeps the two
 # identical.
 PLANNING_CITATION = re.compile(
-    r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
+    r"\b(R[0-9]+-)?(C|D|M|N|R|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
     r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
     r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\b(ARC|CLI|DOC|JOB|OPS|PIP|PPL|SCN|"
-    r"SEC|UI|WEB)-[0-9]{2,}\b|\bT-[0-9]+-[0-9]+\b|\bT-[0-9]{2,}\b|"
+    r"SEC|UI|WEB)-[0-9]{2,}\b|\b(AP|AR|AUDIT|CF|CI|CONF|CORE|DEP|DPI|FW|GAP|"
+    r"GATE|GS|HLTH|HTTP|LOG|NET|OBS|PDF|PIN|PIPE|PKG|PLSS|PROF|PS|RH|TOOL|"
+    r"TQUAL|UIX|XC|P[0-9]+)-[0-9]{2,}\b|\bT-[0-9]+-[0-9]+\b|\bT-[0-9]{2,}\b|"
     r"\b([Pp]hases?|PHASES?)[ -]?[0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
     r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
     r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
@@ -84,6 +90,38 @@ CITATION_SAMPLES = (
     "index.html:42",
     "app.css:120",
     "htmx.js:7",
+    "R-04",
+    "AP-02",
+    "AR-03",
+    "AUDIT-01",
+    "CF-01",
+    "CI-01",
+    "CONF-01",
+    "CORE-02",
+    "DEP-03",
+    "DPI-01",
+    "DOC-FW-02",
+    "GAP-02",
+    "GATE-01",
+    "DOC-GS-01",
+    "HLTH-01",
+    "HTTP-02",
+    "LOG-01",
+    "NET-01",
+    "OBS-01",
+    "PDF-01",
+    "PIN-01",
+    "PIPE-01",
+    "PKG-01",
+    "PLSS-01",
+    "PROF-01",
+    "PS-01",
+    "RH-08",
+    "TOOL-01",
+    "TQUAL-01",
+    "UIX-01",
+    "XC-01",
+    "P12-01",
     "the previous phase",
     "a later phase",
     "next phase",
@@ -94,7 +132,8 @@ CITATION_SAMPLES = (
 )
 
 # Ordinary text the pattern must leave alone: encodings, standards and hash
-# names, a paper size, an off-by-one, and SQLite's EXPLAIN QUERY PLAN.
+# names, a paper size, an off-by-one, SQLite's EXPLAIN QUERY PLAN, a PDF
+# header, a documentation network and an elliptic curve.
 NON_CITATIONS = (
     "UTF-8",
     "ISO-8601",
@@ -114,4 +153,7 @@ NON_CITATIONS = (
     "WEB-1",
     "T-1",
     "data.json:4",
+    "%PDF-1.7",
+    "TEST-NET-1",
+    "P-256",
 )
