@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import errno
 import logging
 import os
@@ -12,7 +13,7 @@ import time
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 from PIL import Image, ImageDraw
@@ -54,7 +55,10 @@ from saneless.job import (
 )
 from saneless.paperless import ApiDelivery, UploadResult
 from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
+from saneless.scanner import scan_child as scan_child_mod
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
+from saneless.scanner.sane_backend import SaneBackend
 from saneless.startup_profiles import StartupProfiles
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
@@ -68,6 +72,7 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     classify_error,
+    page_timeout_error,
     restart_category,
     restart_error,
 )
@@ -82,9 +87,17 @@ from tests.conftest import (
     scan_batch,
     wait_for_state,
 )
+from tests.fake_sane import FakeSaneDev, FakeSaneModule, ReadBlockMode
+from tests.test_scan_child import (
+    _PAGE_DESCRIPTION,
+    _SHORT_SECONDS,
+    _assert_reaped,
+    _shorten_deadlines,
+    _stand_in,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
     from unittest.mock import MagicMock
 
     from saneless.pipeline import PipelineRequest
@@ -7148,11 +7161,11 @@ class _GatedProfileScanner(StubScannerBackend):
 
 class TestScannerGate:
     """
-    ``ScanWorker.scanner_gate`` is real mutual exclusion on SANE.
+    ``ScanWorker.scanner_gate`` is real mutual exclusion on the scanner.
 
-    Nothing in ``scanner/sane_backend.py`` excludes two concurrent SANE calls:
-    ``_refuse_if_wedged`` fires on a *stuck* read rather than a running one,
-    and ``_INIT_LOCK`` guards ``sane_init``/``sane_exit`` only.  The advisory
+    Nothing in the scanner backend serialises two scanner calls: listings and
+    scans each run in a child process of their own, and nothing stops two of
+    them running at once.  The gate is the only mutual exclusion.  The advisory
     ``current_job_id is None`` test has a genuine race -- read ``None``, enter
     ``get_devices()``, and the worker starts a job a microsecond later -- and
     on the ``net`` backend losing that race is a second RPC on the control
@@ -7302,62 +7315,53 @@ class TestScannerGate:
         assert freed
 
 
-# The refusal a wedged read makes a restart of SANE raise, in the backend's
-# own words: a job refused this way fails exactly as a refused scan does.
-_WEDGED_REINIT_REFUSAL = (
-    "Could not start a scan on the scanner: a read on test:0 (page 1) has not "
-    "returned, and SANE allows no other operation on a device while one is "
-    "outstanding. The scan will be possible again as soon as the scanner "
-    "releases it. Restart saneless if it does not."
-)
-
-
-class _ReinitRecordingScanner(StubScannerBackend):
+class _CallRecordingScanner(StubScannerBackend):
     """
-    A scanner that logs, in order, every SANE entry the worker makes.
+    A scanner that logs, in order, every scanner entry the worker makes.
 
-    ``reinitialise``, ``get_devices``, ``get_capabilities`` and ``scan_pages``
-    all append their name to one list, so a test can read the order of a
-    job's calls.  ``reinitialise`` also records whether the scanner gate
-    was free at that moment, as a probe would see it, and can be told to
-    refuse the way a wedged read makes the real backend refuse.
+    ``scan_session``, ``reinitialise``, ``get_devices``, ``get_capabilities``
+    and ``scan_pages`` all append their name to one list, so a test can read
+    the order of a job's calls; ``scan_session`` also keeps the Events it was
+    given.
 
     It reports one flatbed, so startup generation builds a ``default``
     profile and a job with no device configured picks this one.
 
     Attributes:
         calls: The name of each call made, in order.
-        gate_free_at_reinit: For each restart, whether the gate could be taken.
-        worker: The worker whose gate to test; set once the worker exists.
+        sessions: The abort and live-child Events of each session, in order.
 
     """
 
-    def __init__(self, *, refusal: str | None = None) -> None:
+    def __init__(self) -> None:
+        """Start with no calls recorded."""
+        self.calls: list[str] = []
+        self.sessions: list[tuple[threading.Event | None, threading.Event | None]] = []
+
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
         """
-        Start with no calls recorded.
+        Record the session and its Events, then open the stub's own.
 
         Args:
-            refusal: When set, every restart raises a ``ScanError`` with this text.
+            abort: Recorded, and passed through.
+            live: Recorded, and passed through.
+
+        Returns:
+            The stub's session.
 
         """
-        self.calls: list[str] = []
-        self.gate_free_at_reinit: list[bool] = []
-        self.worker: ScanWorker | None = None
-        self._refusal = refusal
+        self.calls.append("scan_session")
+        self.sessions.append((abort, live))
+        return super().scan_session(abort=abort, live=live)
 
     def reinitialise(self) -> None:
-        """
-        Record the restart and the gate's state, then refuse if told to.
-
-        Raises:
-            ScanError: When the scanner was built with a refusal.
-
-        """
+        """Record a restart."""
         self.calls.append("reinitialise")
-        if self.worker is not None:
-            self.gate_free_at_reinit.append(_gate_is_free(self.worker))
-        if self._refusal is not None:
-            raise ScanError(self._refusal)
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -7443,155 +7447,77 @@ def _reinit_call_sites() -> list[tuple[str, str]]:
     return sites
 
 
-class TestPerJobReinitialise:
+class TestOneScanSessionPerJob:
     """
-    Every scan job restarts SANE first, under the scanner gate.
+    Each job scans inside one scan session, whose child starts SANE afresh.
 
-    After a saned restart, the net backend keeps using a control connection
-    the server has already dropped, so every later open in this process fails
-    until SANE is restarted.  Restarting at the top of each job, before its
-    first listing or open, means every scan starts on a fresh connection.
-    The gate is already held there and no handle of this process is open,
-    which is the one state in which a restart is known to be safe.
+    The session is opened by the pipeline around the job's whole acquisition,
+    with the worker's own stop flag as its abort and the worker's live-child
+    flag as its ``live``, so a server stop reaches a page read and the stop's
+    join knows when there is a scan process to wait for.  Each job's scan
+    process starts its own SANE, so a scanner host restarted between jobs
+    needs no restart from the worker.
     """
 
-    def test_a_job_reinitialises_once_under_the_gate_before_listing(
+    def test_a_job_hands_its_scan_session_the_workers_own_events(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """The restart is the job's first SANE call, made with the gate held."""
-        default_settings.scanner.device = ""
-        scanner = _ReinitRecordingScanner()
+        """The session's abort is the worker's stop flag, its live flag the worker's."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, default_settings, store)
-        scanner.worker = worker
         try:
             worker.start()
-            job = store.create_job("default", "Reinit Once")
+            job = store.create_job("default", "Session Events")
             worker.submit(job)
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
             worker.stop()
             store.close()
 
-        assert "reinitialise" in scanner.calls, "the job never restarted SANE"
-        job_calls = scanner.calls[scanner.calls.index("reinitialise") :]
-        assert job_calls[:2] == ["reinitialise", "get_devices"]
-        assert "scan_pages" in job_calls
-        assert scanner.calls.count("reinitialise") == 1
-        assert scanner.gate_free_at_reinit == [False]
         assert finished.state is JobState.DONE
+        assert len(scanner.sessions) == 1
+        ((abort, live),) = scanner.sessions
+        assert abort is worker._stopping
+        assert live is worker._scan_child_live
 
-    def test_each_of_two_jobs_reinitialises_once_at_its_start(
+    def test_a_job_does_not_restart_the_library_at_its_start(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """A saned restart between two jobs is met by the second job's restart."""
-        scanner = _ReinitRecordingScanner()
+        """Two jobs open a session each, and neither restarts the library."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, default_settings, store)
-        scanner.worker = worker
         try:
             worker.start()
-            first = store.create_job("default", "Reinit First")
-            worker.submit(first)
-            wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
-            mark = len(scanner.calls)
-            second = store.create_job("default", "Reinit Second")
-            worker.submit(second)
-            wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+            for title in ("First", "Second"):
+                job = store.create_job("default", title)
+                worker.submit(job)
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
             worker.stop()
             store.close()
 
-        assert scanner.calls[:mark].count("reinitialise") == 1
-        assert scanner.calls[mark:].count("reinitialise") == 1
-        assert scanner.calls[mark : mark + 1] == ["reinitialise"]
-        assert scanner.gate_free_at_reinit == [False, False]
-
-    def test_startup_profile_read_does_not_reinitialise(
-        self,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-    ) -> None:
-        """
-        The startup read uses the SANE the backend just started; jobs restart it.
-
-        It runs once, before any job, so there is nothing stale to clear.
-        """
-        scanner = _ReinitRecordingScanner()
-        store = JobStore()
-        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
-        scanner.worker = worker
-        try:
-            worker.start()
-            generated = poll_until(
-                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
-            )
-            before_any_job = list(scanner.calls)
-            job = store.create_job("default", "Reinit After Startup")
-            worker.submit(job)
-            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-        finally:
-            worker.stop()
-            store.close()
-
-        assert generated
-        assert before_any_job == ["get_devices", "get_capabilities"]
-        assert scanner.calls.count("reinitialise") == 1
-
-    def test_a_refused_reinitialise_fails_the_job_as_a_scanner_error(
-        self,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-    ) -> None:
-        """
-        A restart refused over a wedged read fails the job and frees the gate.
-
-        Nothing else reaches SANE for that job: no listing and no scan.
-        """
-        default_settings.scanner.device = ""
-        scanner = _ReinitRecordingScanner(refusal=_WEDGED_REINIT_REFUSAL)
-        store = JobStore()
-        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
-        scanner.worker = worker
-        try:
-            worker.start()
-            job = store.create_job("default", "Reinit Refused")
-            worker.submit(job)
-            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
-        finally:
-            worker.stop()
-            store.close()
-
-        assert "reinitialise" in scanner.calls, "the job never restarted SANE"
-        job_calls = scanner.calls[scanner.calls.index("reinitialise") :]
-        assert job_calls == ["reinitialise"]
-        assert finished.state is JobState.ERROR
-        assert finished.error_category is ErrorCategory.SCANNER
-        assert finished.error is not None
-        assert "Restart saneless" in finished.error
-        assert freed
+        assert scanner.calls.count("scan_session") == 2
+        assert "reinitialise" not in scanner.calls
 
     @pytest.mark.source_structure
-    def test_reinitialise_is_called_only_from_the_scan_job(self) -> None:
+    def test_reinitialise_is_called_only_before_a_later_multi_page_pass(
+        self,
+    ) -> None:
         """
-        SANE is restarted in the job's gated block and nowhere outside the job.
+        The library is restarted only before a multi-page scan's later passes.
 
-        The job's own restart is in ``_scan_job``; the only other one is a
-        multi-page scan's before each later pass, which runs inside that same
-        job, under the gate it holds, after the previous pass closed its
-        device.  A restart anywhere else could run while a handle is open or a
-        listing child holds the gate, which is exactly the state it must never
-        see.
+        That restart runs inside the job's scan session, under the gate the
+        job holds, after the previous pass closed its device.  A restart
+        anywhere else could run with no session open or while a listing
+        child holds the gate.
         """
-        assert _reinit_call_sites() == [
-            ("pipeline.py", "_scan_pass"),
-            ("worker.py", "_scan_job"),
-        ]
+        assert _reinit_call_sites() == [("pipeline.py", "_scan_pass")]
 
 
 # How long a test leaves a job waiting on a held gate before it looks at the
@@ -7644,7 +7570,7 @@ class _GateStateRecorder:
 
 def _a_scanner_free_of_startup_generation(
     settings: Settings,
-) -> _ReinitRecordingScanner:
+) -> _CallRecordingScanner:
     """
     Give a worker test a recording scanner the worker reaches only for a job.
 
@@ -7656,12 +7582,12 @@ def _a_scanner_free_of_startup_generation(
         settings: The test's settings, given the second profile in place.
 
     Returns:
-        A scanner recording every SANE call the worker makes.
+        A scanner recording every scanner call the worker makes.
 
     """
     settings.scanner.device = ""
     settings.profiles["duplex"] = ProfileConfig(source="ADF Duplex")
-    return _ReinitRecordingScanner()
+    return _CallRecordingScanner()
 
 
 class TestScanningWaitsForTheGate:
@@ -8540,3 +8466,331 @@ class TestProgressWriteFailures:
         assert len(preserved) == 1
         assert "fronts" in preserved[0].name
         assert at_finish == [(0, False)]
+
+
+# How long the stop-join double's pass takes to end once its abort is set:
+# longer than the shortened ordinary join, well inside the extension.
+_STOPPED_CHILD_SECONDS = 0.4
+
+# The shortened ordinary join and cancel grace the stop-join tests use.
+_SHORT_STOP_JOIN_SECONDS = 0.2
+_SHORT_CANCEL_GRACE_SECONDS = 0.5
+
+# How long a job over a stand-in scan child is given to end: its page budget
+# and cancel grace are 0.3 s each, so a passing run takes under a second.
+_HUNG_CHILD_BUDGET = 10.0
+
+_FEEDER_DEVICE = ("test:device:001", "Test", "Feeder", "scanner")
+
+
+class _SlowToStopScanner(StubScannerBackend):
+    """
+    A scanner whose pass ends only some time after its session's abort is set.
+
+    It stands for a scan whose child is being cancelled: the session can say
+    a child is live, and the pass raises the server-stop interruption
+    ``_STOPPED_CHILD_SECONDS`` after the abort, as a cancelled child ends
+    within its grace.
+
+    Attributes:
+        entered: Set once the pass has started.
+        released: Set by the test to end a pass whose abort never came.
+
+    """
+
+    def __init__(self, *, sets_live: bool) -> None:
+        """
+        Prepare the double.
+
+        Args:
+            sets_live: Whether the session sets its ``live`` Event, as a
+                session with a running child does.
+
+        """
+        self._sets_live = sets_live
+        self._abort: threading.Event | None = None
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """
+        Keep the abort, and mark a child live for the session if told to.
+
+        Args:
+            abort: Watched by the pass.
+            live: Set for the session's length when ``sets_live`` was given.
+
+        Returns:
+            The session.
+
+        """
+        return self._session(abort, live)
+
+    @contextlib.contextmanager
+    def _session(
+        self, abort: threading.Event | None, live: threading.Event | None
+    ) -> Generator[None]:
+        """
+        Hold the session open, with ``live`` set when the double says so.
+
+        Yields:
+            Nothing.
+
+        """
+        self._abort = abort
+        if self._sets_live and live is not None:
+            live.set()
+        try:
+            yield
+        finally:
+            if live is not None:
+                live.clear()
+
+    def _stopped(self) -> bool:
+        """
+        Tell whether the pass has been told to end.
+
+        Returns:
+            Whether the abort or the test's release is set.
+
+        """
+        abort = self._abort
+        return self.released.is_set() or (abort is not None and abort.is_set())
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Wait for the abort, take a while to stop, then report the interruption.
+
+        Args:
+            device_id: Ignored.
+            settings: Ignored.
+            sink: Ignored.
+
+        Raises:
+            ScanInterrupted: Always, once stopped.
+
+        """
+        del device_id, settings, sink
+        self.entered.set()
+        poll_until(self._stopped, _PASS_B_GATE_CEILING)
+        quiet_window(_STOPPED_CHILD_SECONDS)
+        msg = "The server is stopping"
+        raise ScanInterrupted(msg)
+
+
+def _stop_mid_pass(
+    worker: ScanWorker, store: JobStore, scanner: _SlowToStopScanner
+) -> tuple[bool, float, bool]:
+    """
+    Start a job, stop the worker inside its pass, and time the stop.
+
+    Args:
+        worker: The worker, not yet started.
+        store: Its job store.
+        scanner: The worker's scanner.
+
+    Returns:
+        What ``stop()`` returned, how long it took, and whether a scan child
+        was marked live when it began.
+
+    """
+    worker.start()
+    worker.submit(store.create_job("default", "Stopped Mid Pass"))
+    assert scanner.entered.wait(_PASS_B_GATE_CEILING)
+    live = worker._scan_child_live.is_set()
+    started = time.monotonic()
+    stopped = worker.stop()
+    return stopped, time.monotonic() - started, live
+
+
+def test_stop_waits_for_a_live_scan_child(
+    mock_paperless: MagicMock,
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A stop that finds a scan child live waits for the grace plus reaping.
+
+    The pass outlasts the (shortened) ordinary join, so only the extension
+    can see the thread end; the extension is the cancel grace, read at call
+    time, plus the reaping margin.
+    """
+    monkeypatch.setattr(worker_module, "STOP_JOIN_SECONDS", _SHORT_STOP_JOIN_SECONDS)
+    monkeypatch.setattr(
+        scan_child_mod, "CANCEL_GRACE_SECONDS", _SHORT_CANCEL_GRACE_SECONDS
+    )
+    caplog.set_level(logging.INFO, logger="saneless.worker")
+    default_settings.profiles["adf"] = ProfileConfig(source="ADF")
+    scanner = _SlowToStopScanner(sets_live=True)
+    store = JobStore()
+    worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+    try:
+        stopped, elapsed, live = _stop_mid_pass(worker, store, scanner)
+    finally:
+        scanner.released.set()
+        worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+        store.close()
+
+    assert live
+    assert stopped is True
+    assert elapsed >= _STOPPED_CHILD_SECONDS
+    extension = _SHORT_CANCEL_GRACE_SECONDS + worker_module._CHILD_REAP_MARGIN_SECONDS
+    waiting = (
+        f"Waiting up to {extension} s more while the scan's child process is stopped"
+    )
+    assert len(_worker_records(caplog, logging.INFO, waiting)) == 1
+
+
+def test_stop_does_not_wait_without_a_live_scan_child(
+    mock_paperless: MagicMock,
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no scan child live, the stop gives up after the ordinary join."""
+    monkeypatch.setattr(worker_module, "STOP_JOIN_SECONDS", _SHORT_STOP_JOIN_SECONDS)
+    monkeypatch.setattr(
+        scan_child_mod, "CANCEL_GRACE_SECONDS", _SHORT_CANCEL_GRACE_SECONDS
+    )
+    default_settings.profiles["adf"] = ProfileConfig(source="ADF")
+    scanner = _SlowToStopScanner(sets_live=False)
+    store = JobStore()
+    worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+    try:
+        stopped, elapsed, live = _stop_mid_pass(worker, store, scanner)
+    finally:
+        scanner.released.set()
+        worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+        exited = not worker.is_alive
+        store.close()
+
+    assert not live
+    assert stopped is False
+    assert elapsed < _STOPPED_CHILD_SECONDS
+    assert exited
+
+
+def test_a_hung_scan_child_fails_the_job_and_frees_the_gate(
+    mock_paperless: MagicMock,
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    real_scan_launcher: None,
+) -> None:
+    """
+    A scan child that hangs mid-read fails the job, is reaped, and frees the gate.
+
+    The child is a real process, a stand-in that sends page 1 and half of
+    page 2 and then blocks for good, ignoring the cancel.  The page budget
+    runs out, the child is killed, and the job ends with the page-timeout
+    text; its process is gone and the scanner gate is free.
+    """
+    _ = real_scan_launcher
+    files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_HANG_AT="read")
+    _shorten_deadlines(monkeypatch)
+    monkeypatch.setattr(
+        scan_session_mod, "sane", FakeSaneModule(devices=[_FEEDER_DEVICE])
+    )
+    default_settings.profiles["adf"] = ProfileConfig(source="ADF")
+    store = JobStore()
+    worker = ScanWorker(SaneBackend(), mock_paperless, default_settings, store)
+    try:
+        worker.start()
+        job = store.create_job("adf", "Hung Child")
+        worker.submit(job)
+        finished = wait_for_state(store, job.id, TERMINAL_STATES, _HUNG_CHILD_BUDGET)
+        gate_free = worker._scanner_gate.acquire(blocking=False)
+        if gate_free:
+            worker._scanner_gate.release()
+    finally:
+        worker.stop()
+        store.close()
+
+    assert finished.state is JobState.ERROR
+    assert finished.error is not None
+    timed_out = page_timeout_error(
+        "Page 2", _SHORT_SECONDS, _PAGE_DESCRIPTION, returned=False
+    )
+    assert timed_out in finished.error
+    _assert_reaped(files.pid())
+    assert gate_free
+
+
+class _BlocksAfterTheFirstPage(FakeSaneDev):
+    """A device whose every read after the first blocks until it is cancelled."""
+
+    @override
+    def snap(self, *, no_cancel: bool = False) -> Image.Image:
+        """
+        Arm the blocking read once one page has been read, then read.
+
+        Args:
+            no_cancel: Passed through.
+
+        Returns:
+            The page, or the truncated page a cancelled read hands back.
+
+        """
+        if self.calls.count("snap") == 1:
+            self.block_read(ReadBlockMode.PARTIAL)
+        return super().snap(no_cancel=no_cancel)
+
+
+def test_a_server_stop_mid_read_preserves_the_received_pages(
+    mock_paperless: MagicMock,
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A stop during a page read cancels the scan, and the page already received is kept.
+
+    The stop's abort reaches the job's scan child, which cancels the blocked
+    read; the job ends by shutdown, with page 1 preserved in ``failed/``,
+    and the stop reports the worker stopped.
+    """
+    monkeypatch.setattr(worker_module, "STOP_JOIN_SECONDS", _SHORT_STOP_JOIN_SECONDS)
+    monkeypatch.setattr(
+        scan_child_mod, "CANCEL_GRACE_SECONDS", _SHORT_CANCEL_GRACE_SECONDS
+    )
+    caplog.set_level(logging.INFO, logger="saneless.worker")
+    dev = _BlocksAfterTheFirstPage(pages=3)
+    dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+    monkeypatch.setattr(
+        scan_session_mod, "sane", FakeSaneModule(device=dev, devices=[_FEEDER_DEVICE])
+    )
+    settings = default_settings
+    settings.profiles["adf"] = ProfileConfig(source="Automatic Document Feeder")
+    store = JobStore()
+    worker = ScanWorker(SaneBackend(), mock_paperless, settings, store)
+    try:
+        worker.start()
+        job = store.create_job("adf", "Stopped Mid Read")
+        worker.submit(job)
+        assert dev.read_started.wait(_PASS_B_GATE_CEILING)
+        stopped = worker.stop()
+        finished = _get(store, job.id)
+    finally:
+        dev.release_read()
+        worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+        store.close()
+
+    assert stopped is True
+    assert finished.state is JobState.ERROR
+    assert finished.error is not None
+    assert finished.error.startswith(f"{RESTART_REASON}. ")
+    assert "preserved at " in finished.error
+    assert finished.error_category is None
+    preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+    assert len(preserved) == 1
+    assert preserved[0].name in finished.error
+    ended = f"Job {finished.id} ended by shutdown"
+    assert len(_worker_records(caplog, logging.INFO, ended)) == 1
+    mock_paperless.upload_document.assert_not_called()

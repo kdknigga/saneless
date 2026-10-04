@@ -1479,6 +1479,8 @@ def test_the_stuck_worker_warning_names_the_preservation_extension(
         and "did not stop within" in record.getMessage()
     ]
     assert len(warnings) == 1
+    assert f"up to {worker_module.scan_child_join_seconds():g} s" in warnings[0]
+    assert "child process" in warnings[0]
     assert f"up to {worker_module.PRESERVATION_JOIN_SECONDS:g} s" in warnings[0]
     assert "preserv" in warnings[0]
 

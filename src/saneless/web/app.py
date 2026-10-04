@@ -48,7 +48,12 @@ from saneless.vocabulary import (
     render_check_step,
     scan_button_label,
 )
-from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
+from saneless.worker import (
+    PRESERVATION_JOIN_SECONDS,
+    STOP_JOIN_SECONDS,
+    ScanWorker,
+    scan_child_join_seconds,
+)
 from saneless.workspace import sweep_orphans
 
 from .cache import CachedMetadataLookup, MetadataCache
@@ -201,8 +206,10 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
 
     The two sequential joins spend one ``STOP_JOIN_SECONDS`` between them, not
     one each, because a container's stop grace period is sized on that number.
-    The worker's join alone may extend by ``PRESERVATION_JOIN_SECONDS`` while a
-    stopped scan's pages are kept; the refresher then gets only a poll.
+    The worker's join alone may extend: by the scan child's cancel grace plus
+    a reaping margin while a job's scan child is being stopped, and by
+    ``PRESERVATION_JOIN_SECONDS`` while a stopped scan's pages are kept.  The
+    refresher then gets only a poll.
     """
     refresher.request_stop()
     deadline = time.monotonic() + STOP_JOIN_SECONDS
@@ -450,7 +457,7 @@ def _assemble_app(
         A failed startup stops whichever thread it started, closes the
         Paperless client and the job store, and re-raises.
         ``lifecycle.started`` tells ``serve`` whether to close the scanner: it
-        is also true when a failed startup left a thread that may be in SANE.
+        is also true when a failed startup left a thread that may still scan.
         Shutdown closes the client, the store and the scanner only when both
         threads confirm they stopped, and logs a failing close without raising.
         """
@@ -471,8 +478,8 @@ def _assemble_app(
             released = _release_after_failed_start(
                 worker, refresher, job_store, paperless
             )
-            # A thread still running may be inside SANE, so the lifespan keeps
-            # the scanner rather than let serve shut it down.
+            # A thread still running may still be scanning, so the lifespan
+            # keeps the scanner rather than let serve close it under the job.
             lifecycle.started = not released
             raise
         lifecycle.started = True
@@ -480,10 +487,10 @@ def _assemble_app(
         yield
         worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
         if not (worker_stopped and refresher_stopped):
-            # A stuck thread may still use the store, the client or SANE, and
-            # sane_exit() with a SANE call outstanding risks a segfault.  The
-            # abandoned job is left for the next startup's recovery, since
-            # writing it here would race its own final write.
+            # A stuck thread may still use the store, the client or the
+            # scanner, so none of them is closed under it.  The abandoned job
+            # is left for the next startup's recovery, since writing it here
+            # would race its own final write.
             stuck = " and ".join(
                 name
                 for name, stopped in (
@@ -494,18 +501,21 @@ def _assemble_app(
             )
             logger.warning(
                 "%s did not stop within %s s (the scan worker's join is "
-                "extended by up to %g s while a stopped scan's pages are being "
-                "preserved); leaving the job store, Paperless client and scanner "
-                "open for process exit (current job: %s)",
+                "extended by up to %g s while a scan's child process is being "
+                "stopped, and by up to %g s while a stopped scan's pages are "
+                "being preserved); leaving the job store, Paperless client and "
+                "scanner open for process exit (current job: %s)",
                 stuck,
                 STOP_JOIN_SECONDS,
+                scan_child_join_seconds(),
                 PRESERVATION_JOIN_SECONDS,
                 worker.current_job_id,
             )
             return
         with contextlib.ExitStack() as closing:
-            # Last in, first out: the client closes first and the scanner last,
-            # since closing it shuts SANE down for the whole process.
+            # Last in, first out: the client closes first and the scanner last.
+            # No SANE runs in this process; closing the scanner ends a scan
+            # child a job left running, if any.
             closing.callback(_close_logged, "scanner", scanner.close)
             closing.callback(_close_logged, "job store", job_store.close)
             closing.callback(_close_logged, "Paperless client", paperless.close)
