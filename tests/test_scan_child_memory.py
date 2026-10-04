@@ -12,7 +12,9 @@ against a stand-in child process started by the real launcher, and measure
 the parent's peak with ``tracemalloc``.  Only allocations ``tracemalloc``
 can see are counted: Pillow unpacks an RGB page into memory of its own,
 which ``tracemalloc`` does not trace, so the bound is on the receive
-buffer and on everything the session allocates around it.
+buffer and on everything the session allocates around it.  A copy Pillow
+makes of a grey page is caught instead by checking the image the sink gets
+still shares the receive buffer.
 """
 
 from __future__ import annotations
@@ -23,14 +25,17 @@ from typing import TYPE_CHECKING, Final
 import pytest
 
 import saneless.scanner.scan_child as scan_child_mod
-from saneless.scanner.base import PageRecord, PageSink, ScanSettings
+from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
 from saneless.scanner.scan_child import ScanChildSession
 from saneless.scanner.scan_protocol import PAGE_BANDS
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from PIL import Image
+
+    from saneless.scanner.scan_protocol import PageHeader
 
 # An A4 page at 300 dpi, in pixels.
 _A4_300_DPI: Final = (2480, 3508)
@@ -146,31 +151,25 @@ class _KeepingSink(PageSink):
         )
 
 
-@pytest.mark.parametrize(
-    "mode", [pytest.param("L", id="L"), pytest.param("RGB", id="RGB")]
-)
-def test_a_scan_pass_holds_one_copy_of_a_page(
+def _large_pass(
     mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+) -> tuple[ScanBatch, _KeepingSink, int]:
     """
-    A whole pass of one A4 300 dpi page costs the parent about one page.
+    Run a 1 x 1 pass to start the child, then trace a pass of one A4 page.
 
-    The first pass, of a 1 x 1 page, starts the child and sees it ready, so
-    neither the child's start nor anything this interpreter loads on first
-    use is counted.  Tracing covers only the second pass.
+    The first pass starts the child and sees it ready, so neither the
+    child's start nor anything this interpreter loads on first use is
+    counted.  Tracing covers only the second pass.
 
-    Args:
-        mode: The page's image mode.
-        monkeypatch: Points the session at the stand-in and sets its mode.
-        tmp_path: Holds the stand-in script.
+    Returns:
+        The second pass's batch, the sink holding both pages, and the traced
+        peak of the second pass, in bytes.
 
     """
     child = tmp_path / "stand_in_scan_child.py"
     child.write_text(_STAND_IN, encoding="utf-8")
     monkeypatch.setattr(scan_child_mod, "_CHILD_FILE", child)
     monkeypatch.setenv("SCAN_TEST_MODE", mode)
-    width, height = _A4_300_DPI
-    nbytes = width * height * PAGE_BANDS[mode]
     sink = _KeepingSink(tmp_path)
 
     with ScanChildSession(lambda: scan_child_mod.start_scan_child("")) as session:
@@ -182,9 +181,67 @@ def test_a_scan_pass_holds_one_copy_of_a_page(
             peak = tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
+    return batch, sink, peak
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param("L", id="L"), pytest.param("RGB", id="RGB")]
+)
+def test_a_scan_pass_holds_one_copy_of_a_page(
+    mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A whole pass of one A4 300 dpi page costs the parent about one page.
+
+    A grey page reaches the sink still wrapping the buffer it was received
+    into: Pillow marks an image that shares a buffer read-only, so a copy,
+    which tracemalloc cannot see because Pillow makes it, still fails here.
+
+    Args:
+        mode: The page's image mode.
+        monkeypatch: Points the session at the stand-in and sets its mode.
+        tmp_path: Holds the stand-in script.
+
+    """
+    width, height = _A4_300_DPI
+    nbytes = width * height * PAGE_BANDS[mode]
+
+    batch, sink, peak = _large_pass(mode, monkeypatch, tmp_path)
 
     assert [record.sequence for record in batch.pages] == [2]
     assert [(image.mode, image.size) for image in sink.images[1:]] == [
         (mode, _A4_300_DPI)
     ]
     assert peak / nbytes <= _ONE_COPY_BOUND, f"peak {peak / nbytes:.2f} pages"
+    if mode == "L":
+        assert sink.images[1].readonly, "the grey page is a copy, not the buffer"
+
+
+def test_a_grey_page_copied_after_it_is_received_is_caught(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The read-only check catches the copy the traced peak cannot.
+
+    A copy of a grey page made after it is received is Pillow's memory, so
+    the peak stays within one page; only the shared-buffer check sees it.
+
+    Args:
+        monkeypatch: Makes the session copy each received page.
+        tmp_path: Holds the stand-in script.
+
+    """
+    receive = scan_child_mod.receive_page
+
+    def receive_then_copy(
+        fd: int, header: PageHeader, wait: Callable[[], None]
+    ) -> Image.Image:
+        return receive(fd, header, wait).copy()
+
+    monkeypatch.setattr(scan_child_mod, "receive_page", receive_then_copy)
+    width, height = _A4_300_DPI
+
+    _, sink, peak = _large_pass("L", monkeypatch, tmp_path)
+
+    assert peak / (width * height) <= _ONE_COPY_BOUND
+    assert not sink.images[1].readonly
