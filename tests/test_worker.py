@@ -8469,8 +8469,9 @@ class TestProgressWriteFailures:
 
 
 # How long the stop-join double's pass takes to end once its abort is set:
-# longer than the shortened ordinary join, well inside the extension.
-_STOPPED_CHILD_SECONDS = 0.4
+# longer than the shortened ordinary join by 0.8 s, so a join that overshoots
+# on a loaded runner still ends first, and well inside the extension.
+_STOPPED_CHILD_SECONDS = 1.0
 
 # The shortened ordinary join and cancel grace the stop-join tests use.
 _SHORT_STOP_JOIN_SECONDS = 0.2
