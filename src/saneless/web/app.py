@@ -237,7 +237,7 @@ def _build_check_machinery(
         # The worker creates its scanner gate once, so this returns the same
         # lock on every call; it is a callable only to match scan_active.
         scanner_gate=lambda: worker.scanner_gate,
-        # The same fact _checks_context renders as scan_active, read from the
+        # The same fact strip_view.checks_context renders as scan_active, read from the
         # same place, so the strip's words and its colour cannot disagree.
         scan_active=lambda: worker.current_job_id is not None,
     )

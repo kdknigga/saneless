@@ -145,8 +145,8 @@ def owns_detail(presented: str | None, recorded: str | None) -> bool:
     """
     Report whether a presented token may see a job's title, preview and text.
 
-    This is deliberately not the flip prompt's ownership rule in ``routes.py``
-    (``_is_owner``).  There a NULL recorded token means anyone may answer, so
+    This is deliberately not the flip prompt's ownership rule
+    (``owner.is_owner``).  There a NULL recorded token means anyone may answer, so
     a manual-duplex job in flight across an upgrade stays answerable.  Here a
     NULL recorded token means nobody may see the detail: such a row was
     written before owner tokens existed, or records a refused submit, and no

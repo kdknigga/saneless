@@ -405,13 +405,13 @@ class CheckRefresher:
         contend for a lock a probe holds -- the probe can be inside a
         ``getaddrinfo`` that Linux retries for two minutes, and a request
         thread parked behind it is a page that never arrives.  It is the same
-        rule ``_checks_context`` already applies to the scanner gate, where it
+        rule ``strip_view.checks_context`` already applies to the scanner gate, where it
         reads the worker's job record rather than trying the gate.
 
         The answer is a snapshot that may be false the instant it is returned,
         and the only thing it decides is whether the page asks once more.  A
         stale ``True`` costs one extra cache read.  A stale ``False`` is
-        harmless only because ``_checks_context`` reads this before it reads
+        harmless only because ``strip_view.checks_context`` reads this before it reads
         the cache: a probe that stored before the flag went false has stored
         before the cache read too, so that same body carries its results.  Read
         the other way round, a probe landing between the two reads leaves a
@@ -490,7 +490,7 @@ class CheckRefresher:
         reach a household member as "a scan is running".
 
         ``skip_scanner`` comes from the worker's own record of a job in flight,
-        the same fact ``_checks_context`` renders as ``scan_active``, so the
+        the same fact ``strip_view.checks_context`` renders as ``scan_active``, so the
         strip's words and its colour cannot disagree.  The scanner gate is
         *passed* to ``run_checks`` rather than held around it, because only the
         scanner check enters libsane and the Paperless budget and the two

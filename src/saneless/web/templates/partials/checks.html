@@ -21,7 +21,7 @@
       ends the poll by carrying no trigger, so a 286 would be a second
       mechanism for the same thing.
    2. The strip asks only while something in flight will change the answer, and
-      never otherwise.  There are two such things, and the route (`_checks_context`)
+      never otherwise.  There are two such things, and `strip_view.checks_context`
       is where both are read.  A cold cache is the first: no results yet, so a
       probe is coming.  A probe holding the refresher's single-flight lock is the
       second: results exist, but this render is of the pre-probe entry and the

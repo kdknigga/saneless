@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.mutant
 
-_ROUTES = "src/saneless/web/routes.py"
+_OWNER = "src/saneless/web/owner.py"
 _STATUS_TEMPLATE = "src/saneless/web/templates/partials/status.html"
 
 
@@ -28,7 +28,7 @@ def test_owner_cookie_entropy_test_kills_a_constant_token(tmp_path: Path) -> Non
         tmp_path,
         "tests/test_web.py::TestOwnerCookie::"
         "test_owner_cookie_carries_at_least_32_bytes_of_entropy",
-        [Edit(_ROUTES, "secrets.token_urlsafe(32)", '"a" * 43')],
+        [Edit(_OWNER, "secrets.token_urlsafe(32)", '"a" * 43')],
     )
 
 

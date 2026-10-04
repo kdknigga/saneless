@@ -5,17 +5,14 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
-import math
 import secrets
 import uuid
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from functools import partial
-from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
+from typing import TYPE_CHECKING, Annotated, Final, assert_never
 from urllib.parse import urlencode
 
-import httpx2
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BeforeValidator
@@ -28,22 +25,12 @@ from pydantic_core import PydanticCustomError
 from starlette.responses import HTMLResponse, Response
 
 from saneless.checks import (
-    CHECKING_GLYPH,
-    CHECKING_MESSAGE,
-    CHECKING_STATE_CLASS,
-    CHECKING_STATE_LABEL,
-    POLL_ATTEMPT_CAP,
-    POLL_GAVE_UP_LINE,
     POLL_PROBE_ATTEMPT_CAP,
-    POLL_STILL_CHECKING_LINE,
-    CheckKey,
 )
 from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
-from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
-from saneless.scan_metadata import metadata_ids, resolve_scan_metadata
+from saneless.scan_metadata import resolve_scan_metadata
 from saneless.scanner.base import SourceKind, classify_source
-from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -75,21 +62,15 @@ from saneless.vocabulary import (
     flip_heading,
     last_scan_detail,
     last_scan_line,
-    local_time,
     non_owner_wait_line,
     page_title,
     pass_heading,
     pass_prompt_copy,
     progress_label,
     scan_hold_reason,
-    stale_default_correspondent_label,
-    stale_default_tag_label,
-    unlisted_correspondent_label,
-    unlisted_tag_label,
     worker_health_detail,
 )
-from saneless.web import cache as web_cache
-from saneless.web.cache import MetadataUnavailableError
+from saneless.web import metadata_view, owner, strip_view
 from saneless.web.errors import (
     RETRY_AFTER_SECONDS,
     TITLE_CONTROL_TYPE,
@@ -107,15 +88,11 @@ from saneless.web.services import PaperlessTestAnswer, services
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
 
     from saneless.config import ProfileConfig, Settings
     from saneless.job import Job, JobStore
-    from saneless.paperless import PaperlessClient
     from saneless.vocabulary import PassPrompt, PassPromptCopy
-    from saneless.web.cache import CachedList, MetadataCache
-    from saneless.web.checks_cache import CachedChecks
-    from saneless.web.services import Services
     from saneless.worker import ScanWorker
 
 __all__ = ["router", "scan_is_blocked"]
@@ -160,7 +137,7 @@ the value is a substring test against names the operator chose, so anything
 longer cannot be a filter and is either a mistake or an attempt to make the
 server do work for nothing.  ``Query(max_length=...)`` turns it into a 422
 before the handler body runs, which is the same "validate at the boundary"
-shape ``MetadataResource`` uses for ``resource``.
+shape ``metadata_view.MetadataResource`` uses for ``resource``.
 """
 
 LISTS_LOADING_MARKER: Final = "(lists loading)"
@@ -188,39 +165,6 @@ a profile named exactly this in quotes would have its page-marked submits
 taken as given, as before.
 """
 
-_REQUEST_FETCH_TIMEOUT: Final = httpx2.Timeout(
-    PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS
-)
-"""
-The budget for a list fetched to answer a request: 2 s to connect, 5 s to read.
-
-A page or a click must never wait on the client's own 30 s per page.  On a cold
-cache with paperless-ngx slow or down that would hold the tag list, the
-correspondent select and a profile change open for half a minute or more, and
-the page is only told what the lists hold once they answer.  The status strip's
-probe already decides whether paperless-ngx is answering with these two
-numbers, so they are the codebase's one measure of "answering", and every list
-route fetches with them: the tag list and its filter, the correspondent
-options, both refreshes, both profile-change swaps, the lazy list load and
-the retry of a list that could not be loaded.  A list that does not answer
-within them is reported as not loaded, and is asked again once the cache's
-short memory of the failure has run out.
-"""
-
-METADATA_RETRY_FLOOR_SECONDS: Final = 5
-"""
-The shortest interval at which a list that could not be loaded asks again.
-
-The retry follows the cache's memory of a failure, which is never longer than
-``paperless_cache_ttl_seconds`` and is nothing at all with the cache disabled.
-Without a floor, a short or zero TTL would have every open page ask
-paperless-ngx for both lists about once a second for as long as it is down or
-refusing one of them: unauthenticated, unbounded upstream traffic, each request
-holding a worker thread for up to the connect budget.  Five seconds still lets
-a page left open recover soon after paperless-ngx is back.  Read at call time,
-not bound where it is used.
-"""
-
 CHECK_AGAIN_WAIT_SECONDS: Final = 2.5
 """
 The most seconds Check again waits for the probe it handed to the refresher.
@@ -234,774 +178,6 @@ manual-refresh floor admits waits at all, so a loop of clicks holds at most
 one waiting worker thread per floor interval.  Read at call time, not bound
 where it is used.
 """
-
-# The only metadata resources the cache holds.  A runtime alias, not a
-# TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
-# query parameter: anything else is a 422 instead of reaching the cache.
-MetadataResource = Literal["tags", "correspondents"]
-
-# The cookie naming the browser that started a scan.  Every attribute it
-# is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
-# no script file in this application at all; ``SameSite=Lax`` so the browser
-# withholds it on any cross-site POST; ``Max-Age`` of one year, so a browser
-# keeps seeing its own scans' titles and previews after it restarts; and
-# deliberately no ``Secure``, because the appliance is served over plain HTTP
-# on a LAN and that flag would silently stop the cookie being sent rather than
-# harden it.
-#
-# The cookie is re-set on every accepted submit, with the value the browser
-# presented or a fresh one when it presented none.  That renews the year each
-# time, and it is how a session cookie set by an older release gains the
-# lifetime: its token comes back unchanged, now persistent.
-#
-# The token's position, recorded here so a later reader does not mistake this
-# for something it is not: the token is a footgun guard for the flip prompt,
-# not an authentication mechanism.  ``CrossOriginGuard`` allows a POST that
-# carries neither ``Sec-Fetch-Site`` nor ``Origin``, so a scripted client that
-# sends a guessed cookie of its own can answer a flip.  That is accepted on a
-# trusted LAN, not overlooked.  What the token stops is the household member
-# standing at the same appliance pressing Continue on a stack they did not
-# load, which is the failure the token exists to close.
-OWNER_COOKIE: Final = "saneless_owner"
-
-# One year in seconds: the owner cookie's lifetime, renewed on every accepted
-# submit.
-OWNER_COOKIE_MAX_AGE: Final = 365 * 24 * 60 * 60
-
-
-def _set_owner_cookie(response: Response, owner: str) -> None:
-    """
-    Set the owner cookie on a response, with the attributes documented above.
-
-    The one place the cookie is written, so the response a scan submit sends
-    carries the same cookie whichever of its responses goes out.
-
-    Args:
-        response: The response to set the cookie on.
-        owner: The owner token the accepted job recorded.
-
-    """
-    response.set_cookie(
-        OWNER_COOKIE,
-        owner,
-        max_age=OWNER_COOKIE_MAX_AGE,
-        httponly=True,
-        samesite="lax",
-        path="/",
-    )
-
-
-def _presented_owner(request: Request) -> str | None:
-    """
-    Return the owner token this request carries, or None when it carries none.
-
-    A blank or whitespace-only value counts as none.  A browser holding one has
-    no usable identity, and treating it as a token would make every such
-    browser the same owner as every other.
-
-    Args:
-        request: The incoming request.
-
-    Returns:
-        The token, or None.
-
-    """
-    presented = request.cookies.get(OWNER_COOKIE, "").strip()
-    return presented or None
-
-
-def _is_owner(presented: str | None, recorded: str | None) -> bool:
-    """
-    Report whether a presented token speaks for the job that recorded one.
-
-    A NULL recorded token means the job is unowned and everyone may answer it.
-    Every row written before owner tokens existed has one, including a
-    manual-duplex job that was in flight across an upgrade, and a strict rule
-    would leave such a job un-continuable until the manual-duplex flip timeout
-    fired it away.  Nothing creates a NULL-token job any more, so the exception
-    has a closed lifetime.
-
-    The comparison goes through ``secrets.compare_digest`` so no timing
-    difference can be read off it.  Both sides are encoded first:
-    the presented value arrives as text out of a header and ``compare_digest``
-    refuses a non-ASCII ``str``, while it compares bytes of any two lengths
-    safely.
-
-    Args:
-        presented: The token this request carries, or None.
-        recorded: The token stored on the job row, or None when unowned.
-
-    Returns:
-        Whether this request may answer for the job.
-
-    """
-    if recorded is None:
-        return True
-    if presented is None:
-        return False
-    return secrets.compare_digest(presented.encode(), recorded.encode())
-
-
-def _owner_answers(presented: str | None, job: Job | None) -> bool:
-    """
-    Report whether this request may answer the named job's prompt.
-
-    One rule for both kinds of wait: the manual-duplex flip prompt and every
-    multi-page prompt.  An unknown job id answers False: there is nothing to
-    own, and the worker would have dropped the answer anyway.  The outcome is logged as a match or
-    a mismatch and never as a value -- the token is not allowed into a log
-    line any more than into the markup.
-
-    Args:
-        presented: The token this request carries, or None.
-        job: The job the answer names, or None when no such row exists.
-
-    Returns:
-        Whether the answer should be passed to the worker.
-
-    """
-    if job is None:
-        return False
-    matched = _is_owner(presented, job.owner_token)
-    logger.debug(
-        "Answer for job %s: owner %s",
-        job.id,
-        "matched" if matched else "did not match",
-    )
-    return matched
-
-
-# The freshness line's variants, composed here rather than in the
-# template: the strip's templates own no vocabulary, and a page that assembled
-# its own prose would be a second place for the copy to drift.  The dash is
-# U+2014 with spaces on both sides.
-_PAUSED_PREFIX: Final = "Paused during scan — "
-_COLD_PAUSED_LINE: Final = f"{_PAUSED_PREFIX}not checked yet."
-
-
-@dataclass(frozen=True, slots=True)
-class _CheckingRow:
-    """
-    One cold-start placeholder row, before any probe has happened.
-
-    It is not a :class:`~saneless.checks.CheckResult` because "we have not
-    looked yet" is not one of the three ``CheckState`` members, and inventing a
-    fourth would owe an exit-code rule to ``saneless doctor`` for a state the
-    CLI cannot ever be in -- it probes synchronously and always has an answer.
-    So the row carries the class, glyph and screen-reader word directly, and
-    every one of them is a constant imported from ``saneless.checks``: the
-    template still authors none of them.
-
-    Only ``key`` varies, so one row per ``CheckKey`` is built once at import.
-
-    Attributes:
-        key: Which check this row is standing in for.
-        state_class: The muted colour class the glyph is drawn in.
-        glyph: The neutral cold-start marker.
-        state_label: The word a screen reader hears in the glyph's place.
-        message: The cold-start copy.
-
-    """
-
-    key: CheckKey
-    state_class: str = CHECKING_STATE_CLASS
-    glyph: str = CHECKING_GLYPH
-    state_label: str = CHECKING_STATE_LABEL
-    message: str = CHECKING_MESSAGE
-
-
-# One placeholder per CheckKey, in member order, so a cold strip still renders
-# six *named* rows rather than an empty list that reads as "nothing to report".
-_CHECKING_ROWS: Final = tuple(_CheckingRow(key=key) for key in CheckKey)
-
-
-def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
-    """
-    Compose the one sentence under the rows, for each situation.
-
-    Two axes produce the variants: whether any results exist yet, and
-    whether a scan is holding the scanner.  The paused wording is why the
-    checks can be skipped during a scan at all -- a strip that silently showed a
-    half-hour-old Scanner row during a scan would be lying by omission, and one
-    that blanked would throw away the rows that are still true.
-
-    The timestamp goes through the shared ``local_time`` filter, which is the
-    same object ``saneless doctor``'s table uses, so the two surfaces cannot
-    disagree about the zone or the format.
-
-    Args:
-        cached: The cache snapshot this render is showing.
-        scan_active: Whether the worker currently has a job in flight.
-
-    Returns:
-        The exact sentence for this situation.
-
-    """
-    if cached.results is None or cached.checked_at is None:
-        return _COLD_PAUSED_LINE if scan_active else CHECKING_MESSAGE
-    stamp = local_time(cached.checked_at)
-    if scan_active:
-        return f"{_PAUSED_PREFIX}last checked {stamp}."
-    return f"Last checked {stamp}."
-
-
-def _poll_line(
-    cached: CachedChecks,
-    *,
-    scan_active: bool,
-    gave_up: bool,
-    still_checking: bool,
-) -> str:
-    """
-    Pick the sentence under the rows once the poll's own endings are counted.
-
-    ``_freshness_line`` answers "how fresh is what is on the page", which is
-    the question whenever the poll is still an ordinary one.  Two endings
-    replace it, and neither is about freshness at all.
-
-    A chain that ran out of attempts with nothing in flight says so and points
-    at the ``Check again`` button, which is the one way forward left.  A chain
-    that is still asking because a probe demonstrably holds the single-flight
-    lock says the first check is still running instead: the button that
-    ``POLL_GAVE_UP_LINE`` names starts the very probe that is already running,
-    so naming it there would be advice that cannot help.  Once the
-    larger cap is reached the give-up line comes back even over a probe that is
-    still held, because the chain has stopped: the button is again the only
-    thing that can put an answer on the page, and a lock a dead thread holds
-    stays held forever.  The two flags are mutually exclusive by construction
-    -- ``still_checking`` is false whenever ``gave_up`` is true -- so the order
-    here does not decide between them.
-
-    Args:
-        cached: The cache snapshot this render is showing.
-        scan_active: Whether the worker currently has a job in flight.
-        gave_up: Whether the chain ended with nothing in flight and nothing
-            ever checked.
-        still_checking: Whether the chain is past ``POLL_ATTEMPT_CAP`` on a
-            cold cache with a probe demonstrably in flight.
-
-    Returns:
-        The exact sentence this render puts under the rows.
-
-    """
-    if gave_up:
-        return POLL_GAVE_UP_LINE
-    if still_checking:
-        return POLL_STILL_CHECKING_LINE
-    return _freshness_line(cached, scan_active=scan_active)
-
-
-def _checks_context(
-    svc: Services, *, attempt: int = 0, scan_active: bool | None = None
-) -> dict[str, object]:
-    """
-    Build the context ``partials/checks.html`` renders from, without probing.
-
-    This reads the cache and never probes.  Probing inside a request handler is
-    what an unplugged scanner host would make hang -- a sane-net connect that
-    Linux retries six times costs roughly two minutes inside a blocking C call,
-    and a page that waited for it would be a page that never arrives.  The
-    background refresher is what fills the cache; this only reads what is
-    already there.
-
-    ``checks`` is ``None`` on a cold cache, and that is the primary fact the
-    template branches on: no results means the placeholder rows are drawn,
-    results means the real ones.
-
-    ``poll_attempt`` is the second.  It is the number the *next* request should
-    carry, or ``None`` when there is to be no next request -- either because
-    there is nothing left to wait for, which is the cold-start ending and still
-    the one that matters, or because the applicable cap has been reached, which
-    is how a chain ends when results never arrive.  The template emits its
-    request attributes only when this is set, so "should the browser ask
-    again" is decided here and never in the markup.
-
-    There are two caps, and which one applies is decided by the same
-    ``probe_in_flight`` read the disjunct below uses.  With nothing
-    in flight the bound is ``POLL_ATTEMPT_CAP`` -- ten attempts, about twenty
-    seconds -- which is the case that cap was sized for: a refresher thread
-    that has died and a tab left open in front of it.  While a checker
-    demonstrably holds the single-flight lock the bound is
-    ``POLL_PROBE_ATTEMPT_CAP`` instead, about three minutes, because the worst
-    case this application's own probe can cost is the socket pre-probe, plus
-    the listing child's deadline (``LISTING_DEADLINE_SECONDS``, 30 s), plus
-    unbounded name resolution, and a chain that stopped at twenty seconds
-    never collected the answer it was waiting for.  The three-minute cap still
-    covers that sum.
-    The larger window is still a cap: ``Lock.locked()`` stays true forever if
-    the holder dies.
-
-    "Nothing left to wait for" is two facts, not one.
-    An empty cache is the cold start.  A probe in flight is the case where
-    results *do* exist but the answer on the page is about to be superseded: the
-    probe has not stored yet, so this render is of the pre-probe entry, and with
-    only the first fact nothing on the page was ever going to fetch the result
-    the probe lands a second later.  The strip was refetched by another click,
-    the terminal-state reload, or a page load -- so the Check again button could
-    visibly do nothing.  What the disjunct costs: a render landing during a
-    background probe issues a small, capped number of extra cache reads before
-    it settles.  Each is a cache read and never a probe, and the count is
-    bounded by ``POLL_PROBE_ATTEMPT_CAP``.
-    ``probe_in_flight`` is a ``locked()`` read and two counter reads, never an
-    acquire, so no request thread can be parked behind the probe it is asking
-    about.  It is also true for a Check again probe the refresher has been
-    asked for and not yet finished, which is what keeps a click answered as
-    pending asking for its result.
-
-    ``gave_up`` means "this cold chain has stopped", and it is measured against
-    the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
-    still requires a cold cache, because its line says the checks have not run
-    yet and that would be a lie printed beside rows that did run -- so a
-    settling poll that runs out of attempts leaves the normal last-checked line
-    alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
-    probe in flight has *not* stopped: it keeps asking up to
-    ``POLL_PROBE_ATTEMPT_CAP`` and shows ``POLL_STILL_CHECKING_LINE`` in place
-    of the cold-start ``Checking…`` line.  The give-up line is
-    withheld there because it points at the ``Check again`` button, and a click
-    on that button while a probe holds the lock collapses into the probe
-    already running -- advice that cannot help.  At the larger cap it comes
-    back, because by then the chain really has stopped and the button really is
-    the only way forward.  At whichever cap ends the chain on a cold cache the
-    freshness line is replaced rather than augmented: there is no freshness to
-    report, because nothing has ever been checked.
-
-    Args:
-        svc: The app's services, for the check cache and the worker.
-        attempt: Which attempt produced this render.  Zero for a page render
-            and for the out-of-band strip, both of which start a fresh chain;
-            the browser carries the rest back in the query string.
-        scan_active: Whether a scan holds the scanner, when the caller knows
-            better than the worker's record; None reads that record.  A scan
-            submit passes True: it builds this before its job exists, so the
-            record still says idle, yet the strip it carries is due to say
-            the checks are paused.
-
-    Returns:
-        ``checks``, ``checking_rows``, ``freshness_line``, ``scan_active`` and
-        ``poll_attempt``.
-
-    """
-    # Read once, so the two decisions below cannot disagree about it.  This is
-    # `Lock.locked()`: an observation, never an acquire.  It is read before the
-    # cache so that a probe finishing between the two reads is seen as in
-    # flight, which asks once more and collects what it stored.
-    probe_in_flight = svc.refresher.probe_in_flight
-    cached: CachedChecks = svc.checks.current()
-    # The worker's own record of a job in flight, not the scanner gate: reading
-    # the gate would mean acquiring it, and a render is not allowed to contend
-    # for the lock a live scan holds.
-    scanning: bool = (
-        svc.worker.current_job_id is not None if scan_active is None else scan_active
-    )
-    # Which cap applies is the probe's decision, and it is taken once from the
-    # one read above so the line and the trigger cannot disagree about it.
-    applicable_cap = POLL_PROBE_ATTEMPT_CAP if probe_in_flight else POLL_ATTEMPT_CAP
-    cold = cached.results is None
-    gave_up = cold and attempt >= applicable_cap
-    still_checking = (
-        cold and probe_in_flight and not gave_up and attempt >= POLL_ATTEMPT_CAP
-    )
-    keep_asking = cold or probe_in_flight
-    return {
-        "checks": cached.results,
-        "checking_rows": _CHECKING_ROWS,
-        "freshness_line": _poll_line(
-            cached,
-            scan_active=scanning,
-            gave_up=gave_up,
-            still_checking=still_checking,
-        ),
-        "scan_active": scanning,
-        "poll_attempt": (
-            attempt + 1 if keep_asking and attempt < applicable_cap else None
-        ),
-    }
-
-
-def _checks_fallback_context() -> dict[str, object]:
-    """
-    Build the strip the route falls back to when its own render raises.
-
-    Every value here is a developer-authored constant, and that is the whole
-    point: this body is rendered on a page the whole LAN can read, so no part
-    of the exception that produced it may reach the context (ASVS 4.0.3 V7.4.1).  The
-    exception goes to ``logger.exception`` instead.
-
-    ``checks`` is ``None`` and ``checking_rows`` is the cold-start six, so the
-    strip shows six *named* rows rather than an empty list that would read as
-    "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, and not
-    because nothing has been checked: the guard around this body covers the
-    whole render, so a raise from the worker's job lookup, the refresher's
-    lock or the clock produces it on an appliance whose cache may well hold
-    six true rows.  It is chosen because the render that would have read the
-    cache is the one that failed, so this body asserts nothing about the cache
-    beyond the fact that it could not be shown -- and the line names the
-    ``Check again`` button that is still on the page, which is the one way
-    forward left.  ``scan_active`` is ``False`` for the same
-    reason: the render that would have read the worker is the one that failed.
-    ``poll_attempt`` is ``None``, and that is what ends the chain: the template
-    emits its request attributes only when it is set, so the body this context
-    renders carries no trigger and the browser stops asking.
-
-    Returns:
-        The same five keys ``_checks_context`` returns.
-
-    """
-    return {
-        "checks": None,
-        "checking_rows": _CHECKING_ROWS,
-        "freshness_line": POLL_GAVE_UP_LINE,
-        "scan_active": False,
-        "poll_attempt": None,
-    }
-
-
-def _lock_wait(timeout: httpx2.Timeout) -> float:
-    """
-    Say how long a request waits its turn to fetch, given its fetch budget.
-
-    A request queued behind another request's fetch of the same list waits at
-    most as long as that fetch may take to connect and read, then answers the
-    list unavailable.  Every list fetch made to answer a request has a budget,
-    so no request waits as long as it takes.
-
-    Args:
-        timeout: The request's fetch budget.
-
-    Returns:
-        The seconds to wait for the cache's per-key lock.
-
-    """
-    return (timeout.connect or 0.0) + (timeout.read or 0.0)
-
-
-# How the web tier logs an exception from the Paperless client, here, in
-# paperless_test and in web/cache.py: the client-exception rule.  A
-# PaperlessError or ConfigError is logged by its message, which the client
-# builds from fixed words, the credential-free display URL and a token-redacted
-# reason.  Anything else on those paths is logged by class name only and
-# without a traceback, because third-party exception text can carry a URL, a
-# header or a token.  Tracebacks remain only for failures of saneless's own
-# store and templates, which never receive a client exception.
-def _cached_list_or_none(
-    cache: MetadataCache,
-    paperless: PaperlessClient,
-    resource: MetadataResource,
-    *,
-    timeout: httpx2.Timeout,
-) -> CachedList | None:
-    """
-    Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
-
-    The fetch goes through the cache's single-flight ``get_or_fetch_list``, so
-    concurrent requests for the same resource make one Paperless call.  When
-    a refresh fails, the cache serves the last list fetched successfully,
-    marked as not current; only when there has never been one does the error
-    reach this function, which logs its cause and answers None.  None and an
-    empty list are different facts: paperless-ngx that has no tags can prove a
-    ticked id gone, and one that could not be asked cannot.  Nor can the last
-    good copy, which predates anything created or deleted since.  The page
-    says which it is: an empty list is "no tags yet", None is "could not be
-    loaded".
-
-    The cache remembers a failure with no last good copy for a short while.
-    A request inside that window, or one that waited longer than its budget
-    for another request's fetch, gets ``MetadataUnavailableError`` without a
-    fetch, and answers None without logging: the failure was logged once,
-    when it happened.
-
-    Args:
-        cache: Metadata cache instance.
-        paperless: Paperless-ngx API client.
-        resource: Resource name ('tags' or 'correspondents').
-        timeout: The fetch budget on a miss, which also bounds the wait for
-            another request's fetch.
-
-    Returns:
-        The list, fresh or the last good one, with whether it is current, or
-        None when neither exists.
-
-    """
-    getter = paperless.get_tags if resource == "tags" else paperless.get_correspondents
-    fetch = partial(getter, timeout=timeout)
-    try:
-        return cache.get_or_fetch_list(
-            resource, fetch, lock_timeout=_lock_wait(timeout)
-        )
-    except MetadataUnavailableError:
-        return None
-    except (PaperlessError, ConfigError) as exc:
-        logger.warning(
-            "Failed to fetch %s from paperless-ngx, answering unavailable: %s",
-            resource,
-            describe(exc),
-        )
-    except Exception as exc:
-        logger.warning(
-            "Failed to fetch %s from paperless-ngx, answering unavailable: %s",
-            resource,
-            type(exc).__name__,
-        )
-    return None
-
-
-def _unnamed_rows(
-    ticked: list[int],
-    known_ids: frozenset[int] | None,
-    *,
-    proven: bool,
-    stale_label: Callable[[int], str],
-    unlisted_label: Callable[[int], str],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """
-    Split the ticked ids the list does not name into stale and unlisted rows.
-
-    A list read from paperless-ngx just now that lacks an id proves it gone,
-    so that id is stale and its label says it will be skipped.  With no list
-    at all nothing is proved, so every ticked id is unlisted and labelled by
-    number alone.  Nor does the last good copy prove anything, served while
-    paperless-ngx cannot be reached: the scan will send the id unchecked, and
-    the id may be newer than the copy, so an id it lacks is unlisted too.
-    Either way the row stays ticked: the untouched submit has to carry what
-    the form shows, and the scan decides what to drop.
-
-    Args:
-        ticked: The ticked ids, in order and without repeats.
-        known_ids: The ids the list holds, or None when it is unknown.
-        proven: Whether the list is current, and so can prove an id gone.
-        stale_label: Labels an id a current list lacks.
-        unlisted_label: Labels an id nothing can prove gone.
-
-    Returns:
-        The stale rows and the unlisted rows, each ``{"id", "label"}``.
-
-    """
-    if known_ids is None:
-        return [], [{"id": item, "label": unlisted_label(item)} for item in ticked]
-    missing = [item for item in ticked if item not in known_ids]
-    if not proven:
-        return [], [{"id": item, "label": unlisted_label(item)} for item in missing]
-    return [{"id": item, "label": stale_label(item)} for item in missing], []
-
-
-def _no_tag_list() -> dict[str, object]:
-    """
-    Return the tag list's context with no list in it and nothing ticked.
-
-    The key set is ``_tag_list_context``'s, emptied.  A hidden list renders
-    nothing from it, and the page, which loads its lists after it renders,
-    shows a loading line in their place.  Both spread it with ``**``, so a
-    missing key would leave an undefined name in a template.
-
-    Returns:
-        The emptied context: no rows, nothing ticked, and no verdict on
-        whether the list could be loaded, because nobody asked.
-
-    """
-    return {
-        "stale": [],
-        "unlisted": [],
-        "pinned": [],
-        "tags": [],
-        "selected_tags": set(),
-        "any_tags": False,
-        "tags_unavailable": False,
-        "tags_retry_seconds": None,
-    }
-
-
-def _no_correspondent_options(*, shown: bool) -> dict[str, object]:
-    """
-    Return the correspondent options' context with no list and no choice.
-
-    The key set is ``_correspondent_options_context``'s, emptied, for the
-    same two callers as ``_no_tag_list``: a hidden control, and the page,
-    whose select holds only the option that means none until the list
-    arrives.
-
-    Args:
-        shown: Whether the control is on the page.  It rides along so the
-            partials leave out the help line a hidden control does not have.
-
-    Returns:
-        The emptied context.
-
-    """
-    return {
-        "correspondents": [],
-        "selected_correspondent": None,
-        "extra_option": None,
-        "correspondents_unavailable": False,
-        "correspondents_retry_seconds": None,
-        "show_correspondent": shown,
-    }
-
-
-def _tag_list_context(
-    svc: Services,
-    *,
-    q: str,
-    selected: list[int],
-    timeout: httpx2.Timeout,
-) -> dict[str, object]:
-    """
-    Build the tag checkbox list's context: the filtered list and pinned ticks.
-
-    Two lists, not one, and that is the whole design.  The filter
-    request carries the currently ticked ids with it -- ``hx-include`` over a
-    checkbox list gathers only the boxes that are checked -- so this function
-    can re-render every one of them ticked, and pin the ones the filter
-    excludes *above* the filtered list.  A tick therefore cannot leave the DOM,
-    and a tick that cannot leave the DOM cannot be silently dropped from the
-    next submit.  A tag that is both ticked and matched is rendered by the
-    filtered loop alone, so it appears once rather than twice.
-
-    A ticked id the list does not name is kept the same way, as a stale or an
-    unlisted row pinned first (see ``_unnamed_rows``).  That is what lets the
-    page open on a profile's default tags even when one of them has since
-    been deleted, or paperless-ngx cannot be reached.
-
-    ``q`` is a Python-side substring test over the already-cached list and
-    nothing else (ASVS 4.0.3 V5.1.1).  It is never interpolated into a paperless-ngx
-    query URL -- the cache holds the whole list, so there is nothing to ask
-    upstream and the filter costs no request at all -- and it is
-    deliberately absent from the context this returns, so it cannot be echoed
-    back into the page.  Its length is already bounded by the route's
-    ``max_length`` before this runs.
-
-    Args:
-        svc: The app's services, for the metadata cache and Paperless client.
-        q: The filter text, matched case-insensitively against tag names.
-        selected: The tag ids the request reports as currently ticked.
-        timeout: The fetch budget on a cache miss.
-
-    Returns:
-        The context ``partials/tags.html`` renders: the stale and unlisted
-        ticks, the pinned ticks, the filtered list, the ticked ids, whether
-        any tag exists at all, whether the list could not be loaded, and how
-        often it then asks again.
-
-    """
-    # With ``[web] show_tags`` off the tag markup is never emitted, so
-    # a fetch here buys nothing and costs a paperless-ngx round trip on every
-    # cold-cache page load -- and the flag that would hide the list is the same
-    # flag that decides whether the data can ever be seen.  The guard sits in
-    # this function rather than in ``index`` so it covers every call site,
-    # including the filter, refresh and profile-change routes, which have the
-    # same reason to skip.  The key set is the normal path's, emptied (see
-    # ``_no_tag_list``).
-    if not svc.settings.web.show_tags:
-        return _no_tag_list()
-    cached = _cached_list_or_none(svc.cache, svc.paperless, "tags", timeout=timeout)
-    listed = cached.rows if cached is not None else None
-    # The same rule the pre-scan check applies, so the page and the scan
-    # agree on which ids paperless-ngx still has.
-    known_ids = metadata_ids(listed)
-    everything = listed if listed is not None and known_ids is not None else []
-    ticked = list(dict.fromkeys(selected))
-    stale, unlisted = _unnamed_rows(
-        ticked,
-        known_ids,
-        proven=cached is not None and cached.current,
-        stale_label=stale_default_tag_label,
-        unlisted_label=unlisted_tag_label,
-    )
-    needle = q.casefold()
-    matched = [
-        tag for tag in everything if needle in str(tag.get("name", "")).casefold()
-    ]
-    matched_ids = {tag.get("id") for tag in matched}
-    pinned = [
-        tag
-        for tag in everything
-        if tag.get("id") in ticked and tag.get("id") not in matched_ids
-    ]
-    return {
-        "stale": stale,
-        "unlisted": unlisted,
-        "pinned": pinned,
-        "tags": matched,
-        # Not ``selected``: the index context already uses that name for the
-        # profile the page opens on, and an include shares its parent's
-        # context, so the two would collide on the full-page render.
-        "selected_tags": set(ticked),
-        # Which empty state to render when both lists are empty: "paperless-ngx
-        # has no tags" and "your filter matched none of them" are different
-        # facts and only one of them is the reader's to fix.
-        "any_tags": bool(everything),
-        # A third fact, and not an empty state at all: paperless-ngx could not
-        # be asked and there is no last good copy.  The list says so instead
-        # of claiming there are no tags, and still shows the ticked ids.
-        "tags_unavailable": known_ids is None,
-        # How often the list, rendered unavailable, asks whether it can be
-        # loaded now (see ``probe_metadata``).  Named for the list, because
-        # the lazy list load spreads both lists' contexts into one.
-        "tags_retry_seconds": _metadata_retry_seconds(
-            svc.settings.output.paperless_cache_ttl_seconds
-        ),
-    }
-
-
-def _correspondent_options_context(
-    svc: Services, selected: int | None, *, timeout: httpx2.Timeout
-) -> dict[str, object]:
-    """
-    Build the correspondent options' context, with one of them chosen.
-
-    The full page, the profile-change swap and the refresh all render the
-    options through this, so each shows the same choice the same way.  A
-    chosen id the list does not name becomes one extra option, selected,
-    labelled stale or unlisted by the rule the tag list uses: the untouched
-    submit carries it, and the scan decides whether it is dropped.
-
-    Args:
-        svc: The app's services, for the metadata cache and Paperless client.
-        selected: The correspondent id to show chosen, or None for none.
-        timeout: The fetch budget on a cache miss.
-
-    Returns:
-        The context ``partials/correspondents.html`` renders: the list, the
-        chosen id, the extra option or None, whether the list could not be
-        loaded and how often it then asks again, and whether the control is
-        shown at all.
-
-    """
-    # With ``[web] show_correspondent`` off the select is never emitted, so a
-    # fetch buys nothing, and it is a token-bearing request for data nobody
-    # can be shown.  The guard sits here, as the tag list's does, so it covers
-    # every caller: the options, the refresh, the profile change and the
-    # lazy list load.  The keys are the normal path's, emptied (see
-    # ``_no_correspondent_options``).
-    if not svc.settings.web.show_correspondent:
-        return _no_correspondent_options(shown=False)
-    cached = _cached_list_or_none(
-        svc.cache, svc.paperless, "correspondents", timeout=timeout
-    )
-    listed = cached.rows if cached is not None else None
-    known_ids = metadata_ids(listed)
-    correspondents = listed if listed is not None and known_ids is not None else []
-    extra_option: dict[str, object] | None = None
-    if selected is not None:
-        stale, unlisted = _unnamed_rows(
-            [selected],
-            known_ids,
-            proven=cached is not None and cached.current,
-            stale_label=stale_default_correspondent_label,
-            unlisted_label=unlisted_correspondent_label,
-        )
-        extra_option = next(iter(stale + unlisted), None)
-    return {
-        "correspondents": correspondents,
-        "selected_correspondent": selected,
-        "extra_option": extra_option,
-        # Read by the help line under the select, which says the list could
-        # not be loaded; a select cannot hold a sentence.
-        "correspondents_unavailable": known_ids is None,
-        "correspondents_retry_seconds": _metadata_retry_seconds(
-            svc.settings.output.paperless_cache_ttl_seconds
-        ),
-        "show_correspondent": True,
-    }
 
 
 def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | None:
@@ -1280,7 +456,7 @@ def _status_facts(
         claimed=claimed,
         claimed_pass=claimed_pass,
         followed_job_id=followed_job_id,
-        owner_token=_presented_owner(request),
+        owner_token=owner.presented_owner(request),
         scan_blocked=_scan_block(settings) is not None,
     )
 
@@ -1339,7 +515,7 @@ def _status_context(
     same reason ``refresh_checks`` is: a route added later must not be able to
     acquire or lose the gate by forgetting about it.  The partial reads the
     flag and never the token, so the value itself has no path into the
-    markup.  It is computed from the stored row with ``_is_owner``, not from
+    markup.  It is computed from the stored row with ``owner.is_owner``, not from
     the view's rule: a job that recorded no owner may be answered by anyone,
     while its title and preview are nobody's.
 
@@ -1405,7 +581,7 @@ def _status_context(
         if job is not None
         else None
     )
-    is_owner = job is not None and _is_owner(facts.owner_token, job.owner_token)
+    is_owner = job is not None and owner.is_owner(facts.owner_token, job.owner_token)
     queued = _is_queued(worker, job)
     block = _scan_block(facts.settings)
     deadline = _wait_deadline(worker, job)
@@ -2255,7 +1431,7 @@ def _history_views(request: Request) -> list[JobView]:
 
     """
     svc = services(request)
-    presented = _presented_owner(request)
+    presented = owner.presented_owner(request)
     return [
         build_job_view(job, presented=presented, settings=svc.settings)
         for job in svc.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
@@ -2316,7 +1492,7 @@ def index(request: Request) -> Response:
         _status_facts(
             request,
             followed_job_id=_owned_active_job_id(
-                svc.worker, svc.job_store, _presented_owner(request)
+                svc.worker, svc.job_store, owner.presented_owner(request)
             ),
         ),
     )
@@ -2354,8 +1530,8 @@ def index(request: Request) -> Response:
                 and opening_option.manual_duplex,
                 ticked=False,
             ),
-            **_no_tag_list(),
-            **_no_correspondent_options(shown=show_correspondent),
+            **metadata_view.no_tag_list(),
+            **metadata_view.no_correspondent_options(shown=show_correspondent),
             # The loading lines where the lists go, one per shown list.
             "tags_loading": show_tags,
             # What both profile markers say until the lazy list load replaces
@@ -2377,7 +1553,7 @@ def index(request: Request) -> Response:
             ),
             **status,
             **last_scan,
-            **_checks_context(svc),
+            **strip_view.checks_context(svc),
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary.
             "title_max_length": TITLE_MAX_LENGTH,
@@ -2441,7 +1617,7 @@ def _paperless_test_error(exc: BaseException) -> PaperlessTestAnswer:
     A failure while running the test is a failure inside saneless, so it is a
     server error rather than a bad gateway: an answer paperless-ngx gave is
     reported as a 200 status instead.  Class name only, by the
-    client-exception rule above _cached_list_or_none.
+    client-exception rule above ``metadata_view.cached_list_or_none``.
 
     Args:
         exc: What stopped the test from producing a status.
@@ -2476,7 +1652,7 @@ def paperless_test(request: Request) -> JSONResponse:
     in flight a caller with a previous answer gets that answer at once rather
     than holding a worker thread behind it.
 
-    The probe runs on the status strip's budget, ``_REQUEST_FETCH_TIMEOUT``
+    The probe runs on the status strip's budget, ``metadata_view.REQUEST_FETCH_TIMEOUT``
     (2 s to connect, 5 s to read), not the client's own 30 s default, so
     against an unreachable paperless-ngx it ends within seconds.  Only the
     very first callers, before any answer exists, wait for the probe, two at
@@ -2492,7 +1668,9 @@ def paperless_test(request: Request) -> JSONResponse:
 
     def probe() -> PaperlessTestAnswer:
         try:
-            status = svc.paperless.test_connection(timeout=_REQUEST_FETCH_TIMEOUT)
+            status = svc.paperless.test_connection(
+                timeout=metadata_view.REQUEST_FETCH_TIMEOUT
+            )
         except Exception as exc:
             return _paperless_test_error(exc)
         return PaperlessTestAnswer(status_code=200, body={"status": str(status)})
@@ -3047,25 +2225,19 @@ def start_scan(
         written = _record_refused_submit(svc.job_store, form, error=error)
         raise RequestRejected(rejection, job_id=written)
 
-    # The mint rule: a token is minted on the first submit from a browser
-    # and reused for every later job from it, so two tabs on one device do not
-    # disown each other.  It is recorded on the row either way, and an
-    # accepted submit sends it back as a cookie either way, so the lifetime is
-    # renewed.
-    presented = _presented_owner(request)
-    owner = presented or secrets.token_urlsafe(32)
+    owner_token = owner.token_for(owner.presented_owner(request))
     # Ahead of the row, not merely ahead of the submit: a failure between
     # the two would leave a PENDING row that no worker will ever run.  Built
     # as a scan in progress, because it is rendered only for an accepted
     # submit, and by then the scanner is this job's or a queued-ahead one's:
     # read from the worker here, before the job exists, it would say idle.
-    checks = _checks_context(svc, scan_active=True)
+    checks = strip_view.checks_context(svc, scan_active=True)
     job = svc.job_store.create_job(
         profile=form.profile,
         title=form.title,
         tags=form.tags,
         correspondent=form.correspondent,
-        owner_token=owner,
+        owner_token=owner_token,
     )
     result = svc.worker.submit(job, ScanOptions(multi_page=choice.multi_page))
     match result:
@@ -3098,7 +2270,7 @@ def start_scan(
                             # minted one when the browser presented none: the
                             # cookie carrying it has not reached the browser
                             # yet, so the request cannot present it.
-                            owner_token=owner,
+                            owner_token=owner_token,
                         ),
                     ),
                 )
@@ -3124,9 +2296,9 @@ def start_scan(
                 fallback = HTMLResponse(
                     status_code=200, content=_queued_status_fallback(job.id)
                 )
-                _set_owner_cookie(fallback, owner)
+                owner.set_owner_cookie(fallback, owner_token)
                 return fallback
-            _set_owner_cookie(response, owner)
+            owner.set_owner_cookie(response, owner_token)
             return response
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
@@ -3275,14 +2447,14 @@ def get_checks(
     rather than refused: the ``Query`` bound that used to make it a 422 is
     gone, and the clamp into ``0..POLL_PROBE_ATTEMPT_CAP`` runs before anything
     else reads the value.  The property that bound was defending is unchanged
-    -- a crafted number still never reaches ``_checks_context`` and is still
+    -- a crafted number still never reaches ``strip_view.checks_context`` and is still
     never rendered into the visible body, because only the clamped number is
     used and only the clamped number goes into the next request's URL.  What
     changed is the failure mode: past the cap the clamp lands on the cap, which
     is the give-up body, so an out-of-range counter ends the chain quietly,
     which is what the strip wanted all along.  A failure inside the watcher
     stamp or the context build is caught and rendered as
-    ``_checks_fallback_context``.  The ``TemplateResponse`` call stays outside
+    ``strip_view.checks_fallback_context``.  The ``TemplateResponse`` call stays outside
     the guard, so there is exactly one render path and one status code.
 
     Args:
@@ -3304,10 +2476,10 @@ def get_checks(
     counted = min(max(attempt, 0), POLL_PROBE_ATTEMPT_CAP)
     try:
         svc.refresher.note_watcher()
-        context = _checks_context(svc, attempt=counted)
+        context = strip_view.checks_context(svc, attempt=counted)
     except Exception:
         logger.exception("Failed to render the status strip")
-        context = _checks_fallback_context()
+        context = strip_view.checks_fallback_context()
     return svc.templates.TemplateResponse(
         request,
         "partials/checks.html",
@@ -3352,7 +2524,7 @@ def refresh_checks(request: Request) -> Response:
     collapse, so a collapse is a fact rather than a guess; on a collapse the
     claim goes back, because a collapse issued no Paperless request, no saned
     dial and no filesystem write and so bought none of the traffic the floor
-    exists to bound; and ``_checks_context`` sees the same lock still held and
+    exists to bound; and ``strip_view.checks_context`` sees the same lock still held and
     emits a trigger, so the page collects the answer on its own.
 
     The grant given back is identified rather than assumed.  The claim reports
@@ -3374,12 +2546,12 @@ def refresh_checks(request: Request) -> Response:
     is running, for each.
 
     That render is guarded the way ``get_checks``'s is, and only the render.
-    ``_checks_context`` raising here used to be a 500, and because the button
+    ``strip_view.checks_context`` raising here used to be a 500, and because the button
     aims at ``#checks-body`` that 500 arrived carrying the strip's own
     ``HX-Target`` -- which, until the exemption was narrowed to a GET,
     meant the error body was written over the strip, taking every row and
     the only button that could bring them back.  Now a failure inside the
-    strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
+    strip's rendering ends as ``strip_view.checks_fallback_context`` at 200 on this route
     too, so the strip and the button stay on the page.  Everything before the
     render -- the watcher stamp, the claim, the probe request -- is the click's
     action rather than the strip's drawing, and stays outside the guard on
@@ -3430,10 +2602,10 @@ def refresh_checks(request: Request) -> Response:
     ):
         svc.checks.release_manual_claim(claim)
     try:
-        context = _checks_context(svc)
+        context = strip_view.checks_context(svc)
     except Exception:
         logger.exception("Failed to render the status strip")
-        context = _checks_fallback_context()
+        context = strip_view.checks_fallback_context()
     return svc.templates.TemplateResponse(
         request,
         "partials/checks.html",
@@ -3460,7 +2632,7 @@ def get_tags(
     The response is the whole swap target, wrapper included, because the filter
     swaps it ``outerHTML``.  Both parameters arrive from the same
     ``hx-include`` and are what makes the swap lossless: see
-    ``_tag_list_context`` for why the selection has to ride along, and why
+    ``metadata_view.tag_list_context`` for why the selection has to ride along, and why
     ``q`` reaches neither paperless-ngx nor the response body.
 
     Args:
@@ -3474,7 +2646,9 @@ def get_tags(
     return svc.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        _tag_list_context(svc, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
+        metadata_view.tag_list_context(
+            svc, q=q, selected=tags, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
+        ),
     )
 
 
@@ -3529,8 +2703,8 @@ def get_correspondents(
     return svc.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        _correspondent_options_context(
-            svc, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
+        metadata_view.correspondent_options_context(
+            svc, correspondent, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
         ),
     )
 
@@ -3626,7 +2800,7 @@ def get_profile_tags(request: Request, profile: str) -> Response:
     which keeps its tick: a profile's defaults are what an untouched form has
     to mean, so after a change the form must show the new profile's answer
     rather than a mix of two.  A default paperless-ngx no longer has is
-    ticked with its note (see ``_tag_list_context``).
+    ticked with its note (see ``metadata_view.tag_list_context``).
 
     The profile is validated exactly as ``get_multi_page_field`` validates
     it: one locked lookup, and an unknown name is a 422 before any fetch.
@@ -3652,11 +2826,11 @@ def get_profile_tags(request: Request, profile: str) -> Response:
         request,
         "partials/tags.html",
         {
-            **_tag_list_context(
+            **metadata_view.tag_list_context(
                 svc,
                 q="",
                 selected=list(found.default_tags),
-                timeout=_REQUEST_FETCH_TIMEOUT,
+                timeout=metadata_view.REQUEST_FETCH_TIMEOUT,
             ),
             # The list's profile marker rides along out-of-band, so the scan
             # can tell whose defaults the ticks are (see ``start_scan``).
@@ -3694,43 +2868,13 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
         request,
         "partials/correspondent_select.html",
         {
-            **_correspondent_options_context(
+            **metadata_view.correspondent_options_context(
                 svc,
                 found.default_correspondent,
-                timeout=_REQUEST_FETCH_TIMEOUT,
+                timeout=metadata_view.REQUEST_FETCH_TIMEOUT,
             ),
             "follows_profile": profile,
         },
-    )
-
-
-def _metadata_retry_seconds(ttl: float) -> int:
-    """
-    Say how often a list that could not be loaded asks again, in seconds.
-
-    No sooner than the cache forgets the failure: the negative TTL, or the
-    cache's own TTL when that is shorter.  The retry replaces itself with
-    every answer, so it asks again this long after the last answer landed
-    (see ``partials/list_retry.html``).  The cache remembers a failure from
-    when the failed fetch ended, before that answer, so the next ask is past
-    the memory its own last fetch left, and asks paperless-ngx unless
-    another request asked meanwhile.  Rounded up to whole seconds for htmx's
-    trigger, and never under ``METADATA_RETRY_FLOOR_SECONDS``, so a short or
-    disabled cache cannot make every open page ask paperless-ngx once a
-    second.  A floor longer than the memory only leaves the next ask further
-    past it.  Both constants are read here, at call time, not bound when the
-    module loads.
-
-    Args:
-        ttl: The configured ``paperless_cache_ttl_seconds``.
-
-    Returns:
-        The interval at which a list rendered unavailable asks again.
-
-    """
-    return max(
-        METADATA_RETRY_FLOOR_SECONDS,
-        math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)),
     )
 
 
@@ -3766,7 +2910,7 @@ def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
             _status_facts(
                 request,
                 followed_job_id=_owned_active_job_id(
-                    svc.worker, svc.job_store, _presented_owner(request)
+                    svc.worker, svc.job_store, owner.presented_owner(request)
                 ),
             ),
         )
@@ -3840,11 +2984,11 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
             " lists with no profile's defaults"
         )
         ticked, chosen, follows = [], None, None
-    tag_list = _tag_list_context(
-        svc, q="", selected=ticked, timeout=_REQUEST_FETCH_TIMEOUT
+    tag_list = metadata_view.tag_list_context(
+        svc, q="", selected=ticked, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
     )
-    options = _correspondent_options_context(
-        svc, chosen, timeout=_REQUEST_FETCH_TIMEOUT
+    options = metadata_view.correspondent_options_context(
+        svc, chosen, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
     )
     job, scan_blocked = _metadata_scan_state(request)
     return svc.templates.TemplateResponse(
@@ -3863,14 +3007,16 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
 
 
 @router.get("/api/metadata/probe")
-def probe_metadata(request: Request, resource: MetadataResource) -> Response:
+def probe_metadata(
+    request: Request, resource: metadata_view.MetadataResource
+) -> Response:
     """
     Say whether a list that could not be loaded can be loaded now.
 
     A list rendered unavailable carries a hidden retry that asks here, for
     as long as that rendering is on the page.  The answer is a 200 whose
     body is a fresh copy of the retry, which replaces the one that asked and
-    nothing else, so the retry asks again ``_metadata_retry_seconds`` after
+    nothing else, so the retry asks again ``metadata_view.metadata_retry_seconds`` after
     this answer lands (see ``partials/list_retry.html``).  When the list can
     be loaded, the answer also fires ``<resource>-recovered``, and the
     page's own recovery element for that list asks for it again, carrying
@@ -3923,8 +3069,11 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
     if not shown:
         return Response(status_code=204)
     loaded = (
-        _cached_list_or_none(
-            svc.cache, svc.paperless, resource, timeout=_REQUEST_FETCH_TIMEOUT
+        metadata_view.cached_list_or_none(
+            svc.cache,
+            svc.paperless,
+            resource,
+            timeout=metadata_view.REQUEST_FETCH_TIMEOUT,
         )
         is not None
     )
@@ -3933,7 +3082,7 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
         "partials/list_retry.html",
         {
             "retry_resource": resource,
-            "retry_seconds": _metadata_retry_seconds(
+            "retry_seconds": metadata_view.metadata_retry_seconds(
                 svc.settings.output.paperless_cache_ttl_seconds
             ),
         },
@@ -3944,7 +3093,7 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
 @router.post("/api/cache/invalidate")
 def invalidate_cache(
     request: Request,
-    resource: MetadataResource,
+    resource: metadata_view.MetadataResource,
     q: Annotated[str, Form(max_length=TAG_FILTER_MAX_LENGTH)] = "",
     tags: list[PaperlessId] = _TAGS_FORM_DEFAULT,
     correspondent: Annotated[PaperlessId | None, Form()] = None,
@@ -3999,14 +3148,16 @@ def invalidate_cache(
         return svc.templates.TemplateResponse(
             request,
             "partials/tags.html",
-            _tag_list_context(svc, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
+            metadata_view.tag_list_context(
+                svc, q=q, selected=tags, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
+            ),
         )
 
     return svc.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        _correspondent_options_context(
-            svc, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
+        metadata_view.correspondent_options_context(
+            svc, correspondent, timeout=metadata_view.REQUEST_FETCH_TIMEOUT
         ),
     )
 
@@ -4056,9 +3207,9 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     scan's progress is read from next.
     """
     svc = services(request)
-    presented = _presented_owner(request)
+    presented = owner.presented_owner(request)
     claimed = False
-    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+    if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.continue_flip(job_id)
     _, context = _with_poll(
         request,
@@ -4108,9 +3259,9 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     enabled focuses it.  A dropped Abort asks for nothing.
     """
     svc = services(request)
-    presented = _presented_owner(request)
+    presented = owner.presented_owner(request)
     claimed = False
-    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+    if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.abort_flip(job_id)
     _, context = _with_poll(
         request,
@@ -4185,9 +3336,9 @@ def answer_multi_page(
 
     """
     svc = services(request)
-    presented = _presented_owner(request)
+    presented = owner.presented_owner(request)
     claimed = False
-    if _owner_answers(presented, svc.job_store.get_job(job_id)):
+    if owner.owner_answers(presented, svc.job_store.get_job(job_id)):
         claimed = svc.worker.answer_pass(job_id, prompt, answer)
     _, context = _with_poll(
         request,
