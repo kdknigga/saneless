@@ -1167,8 +1167,7 @@ class _PipelineRun:
     inside a single ``try``.  That one handler is the whole of saneless's
     promise that a scanned page is either delivered or kept: nothing between
     two steps, no status update and no new step added later, can fall outside
-    it, because there is no "between" left.  It replaced four separate guard
-    windows whose gaps were exactly where pages used to be lost.
+    it, because there is no "between" left.
 
     Before each step the run records its ``stage`` on ``artefacts``, and each
     step records what it produced (the spooled passes, the unfiltered
@@ -1176,15 +1175,8 @@ class _PipelineRun:
     thing there is to keep.  ``preservation.preserve_most_finished`` decides
     what that is.
 
-    Every observer the request carries -- the status, thumbnail and
-    pass-count callbacks -- is called through ``_observe``, which logs a
-    failure and carries on.  An observer is somebody watching the run, so its
-    fault can never end one.
-
-    A dataclass for its constructor alone: the run needs eleven values, and a
-    hand-written ``__init__`` taking them would break ruff's ``PLR0913``
-    argument limit, which this project neither raises nor suppresses.  Every
-    one is keyword-only.
+    Every observer the request carries is called through ``_observe``, so an
+    observer's fault can never end the run.
 
     Attributes:
         scanner: The scanner backend.
@@ -1247,9 +1239,7 @@ class _PipelineRun:
         """
         The directory inside the workspace that holds the page files.
 
-        ``JobWorkspace`` creates it with the workspace.  A subdirectory rather
-        than the workspace itself, so the assembled PDFs are not written among
-        the pages.
+        A subdirectory, so the assembled PDFs are not written among the pages.
 
         Returns:
             The spool directory.
@@ -1262,15 +1252,10 @@ class _PipelineRun:
         Run the scan, keeping the most finished artefact if anything fails.
 
         This is the one preservation handler in the pipeline.  A failure at
-        any point is handed to ``preservation.preserve_most_finished`` along
-        with how far the run got, and the one sentence it returns -- naming
-        what was kept and where, or that nothing could be -- is attached to
-        the failure as a note.  The failure is then re-raised as itself: the
-        same object, with its own type, attributes and traceback, so a
-        ``TypeError`` from our own code is still a ``TypeError`` and a
-        ``PaperlessTimeoutError`` is still that and not a plain
-        ``PaperlessError``.  ``failure_text`` is how every surface renders the
-        failure with its note.
+        any point is handed to ``preservation.preserve_most_finished`` with how
+        far the run got, and the sentence it returns is attached as a note.
+        The failure is then re-raised as itself, with its own type, attributes
+        and traceback.
 
         Returns:
             How the run resolved.
@@ -1283,22 +1268,16 @@ class _PipelineRun:
             Exception: Any other failure, re-raised as itself with the note.
 
         """
-        # Every arm settles the run before anything else, so a signal arriving
-        # while the pages are kept, or while the workspace is removed, cannot
-        # abandon either half way.  A signal still pending as the failure
-        # arrived lands at the settling call's own entry, before the run is
-        # settled, and so is raised: each arm's first call is therefore inside
-        # a try that absorbs it.  Nothing between the except clause matching
-        # and that call gives a signal handler a chance to run.
+        # Every arm settles the run first, so a signal cannot abandon keeping
+        # the pages or removing the workspace half way.  A signal pending as the
+        # failure arrived lands at the settling call's entry and is raised, so
+        # each arm's first call sits inside a try that absorbs it.
         try:
             return self._run()
         except ScanCancelledError:
-            # A cancel keeps nothing, and it is checked first on purpose.
-            # ScanCancelledError is an ordinary Exception -- a direct
-            # SanelessError child rather than a ScanError -- so the handler
-            # below would otherwise file a scan the operator chose to abandon
-            # into a directory saneless never prunes.  Nobody asked for those
-            # pages to be kept, so they are not.
+            # A cancel keeps nothing, so it is checked first: ScanCancelledError
+            # is an ordinary Exception, and the handler below would file a scan
+            # the operator abandoned into failed/, which saneless never prunes.
             try:
                 self._settle()
             except ScanInterrupted as late:
@@ -1312,9 +1291,6 @@ class _PipelineRun:
                 self._settle()
             except ScanInterrupted as late:
                 self._absorb(late)
-            # The ledger knows what each pass spooled, and each record the
-            # dpi it was read back at; the artefacts are what the
-            # preservation reads.
             self.artefacts.passes = self.ledger.spooled()
             self.artefacts.unreadable_sheets = self.ledger.unreadable_sheets
             report = self._preserve()
@@ -1342,9 +1318,7 @@ class _PipelineRun:
                         f"it could not be locked: move them into failed/ "
                         f"yourself"
                     )
-            # A bare raise, never a rebuilt exception: the original object,
-            # its type, attributes and traceback all survive, and
-            # classify_error sees what really happened.
+            # A bare raise, so classify_error sees the original exception.
             raise
         except BaseException:
             # KeyboardInterrupt, above all: Ctrl-C is the operator's cancel,
@@ -1365,13 +1339,9 @@ class _PipelineRun:
         """
         Let the run's own outcome stand over a signal that landed as it settled.
 
-        The signal handler ignores both signals before it raises, so no
-        second one can follow this, and the run is settled here after all.
-        Setting it again is safe because ``Settled`` holds no lock that the
-        interrupted attempt could have left taken.
-
-        Args:
-            late: The interruption raised as the run settled.
+        The signal handler ignores both signals before it raises, so no second
+        one can follow.  Setting it again is safe because ``Settled`` holds no
+        lock the interrupted attempt could have left taken.
 
         """
         logger.info(
@@ -1433,11 +1403,8 @@ class _PipelineRun:
             self.device_id,
         )
         acquired = self._acquire()
-        # A match with assert_never, not a dict or an isinstance chain, on
-        # purpose: a variant missing from a dict draws no diagnostic from
-        # either ty or pyrefly, while the same omission in a match is caught by
-        # both, at edit time, before a new result type can fall silently
-        # through an else.
+        # A match with assert_never, not a dict: ty and pyrefly catch a variant
+        # missing from a match at edit time, and draw no diagnostic for a dict.
         match acquired:
             case ScanBatch():
                 return self._finish_document(acquired)
@@ -1513,19 +1480,7 @@ class _PipelineRun:
     def _sink(
         self, label: str, thumbnail: Callable[[str], None] | None
     ) -> SpooledPageSink:
-        """
-        Build the sink one acquisition pass spools into.
-
-        Args:
-            label: The pass's file-name prefix, ``_SPOOL_LABEL_A`` or
-                ``_SPOOL_LABEL_B``.
-            thumbnail: What the sink calls with the first page's thumbnail, or
-                None.
-
-        Returns:
-            A sink over this run's spool directory.
-
-        """
+        """Build the sink one acquisition pass spools into, under ``label``."""
         return SpooledPageSink(
             directory=self.spool_dir,
             pass_label=label,
@@ -1537,28 +1492,16 @@ class _PipelineRun:
         """
         Perform a simplex / hardware duplex / flatbed scan.
 
-        The one pass spools under the ``a`` label, the same label a manual-duplex
-        job's fronts use, so a spool directory reads the same way whichever route
-        produced it.
-
-        The thumbnail is not generated here. It rides on the sink and fires while
-        the first page is being spooled, which is both cheaper -- the page is in
-        memory at that moment, rather than needing a second decode afterwards --
-        and visibly earlier, since the strip appears during acquisition instead of
-        after the last sheet.
-
-        Returns:
-            The batch the device produced: its page records, the resolution it
-            actually used, and how many fed sheets it could not read.
+        The thumbnail rides on the sink and fires while the first page is
+        still in memory, so no page is decoded twice.
 
         Raises:
             ScanError: ``No pages were scanned`` if the backend returned no pages.
 
         """
         sink = self._sink(_SPOOL_LABEL_A, self._thumbnail_observer())
-        # Registered before the pass runs, not after it returns: the whole point is
-        # the case where it never returns, and a fault part-way through has to find
-        # the sink that has been collecting pages all along.
+        # Registered before the pass runs, so a fault part-way through finds the
+        # sink that has been collecting its pages.
         self.ledger.register(preservation.PARTIAL_SUFFIX, sink)
         batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
         _require_pages(batch)
@@ -1575,21 +1518,9 @@ class _PipelineRun:
         ``flip.timeout``, so a forgotten flip prompt fails this job instead of
         parking the single worker thread forever.
 
-        Each pass gets its own sink, labelled ``a`` for the fronts and ``b`` for
-        the backs, so the two passes spool into names that can be told apart while
-        sharing one directory. That is for debuggability only: document order comes
-        from the record list, never from those names. Only pass A's sink
-        carries the thumbnail callback, so the strip shows the first front and
-        fires exactly once per job.
-
-        Both sinks register themselves with the ledger before their pass
-        starts, so every ending below that is not the operator's own decision
-        keeps whatever reached the spool: a fault in either pass, an empty
-        pass B, a flip-wait timeout and a broken flip prompt all leave pass A's
-        fronts -- and any backs already fed -- as the two separately named
-        partial PDFs the mismatch recovery also produces. The exception itself
-        is unchanged here; ``execute``'s guard is what attaches the count and
-        the destination to it.
+        Both sinks register with the ledger before their pass starts, so every
+        ending that is not the operator's own decision keeps whatever reached
+        the spool, as the two halves the mismatch recovery also produces.
 
         Args:
             flip: The flip coordinator and the timeout bounding its wait.
@@ -1618,15 +1549,11 @@ class _PipelineRun:
                 FlipOutcome member.
 
         """
-        # Pass A: scan fronts.  The thumbnail callback rides on this sink, which
-        # fires it while pass A is still running rather than after it returns
-        # -- the page is in memory at that moment, and re-opening a 26 MB
-        # page later to make a 300 px strip would be a second decode.
+        # Pass A: scan fronts.  Only this sink carries the thumbnail callback, so
+        # the strip shows the first front.
         front_sink = self._sink(_SPOOL_LABEL_A, self._thumbnail_observer())
-        # Registered before the pass runs, under the same ``(fronts)`` name the
-        # mismatch recovery gives this half, so every way pass A's sheets can be
-        # lost from here on keeps them.  Registering afterwards would miss
-        # the case the registration exists for: a fault part-way through pass A.
+        # Registered before the pass runs, under the name the mismatch recovery
+        # gives this half, so a fault part-way through pass A keeps its sheets.
         self.ledger.register(preservation.FRONTS_SUFFIX, front_sink)
         front_batch = self.scanner.scan_pages(
             self.device_id, self.scan_settings, front_sink
@@ -1636,18 +1563,14 @@ class _PipelineRun:
         _require_pages(front_batch)
         front_pages = front_batch.pages
         logger.info("Pass A: scanned %d front page(s)", len(front_pages))
-        # Before AWAITING_FLIP, and so before SCANNING_REVERSE: an observer that
-        # re-renders on either of those events must already hold the number, or the
-        # render it triggers shows the count one transition late.
+        # Before AWAITING_FLIP: an observer that re-renders on that event must
+        # already hold the number, or it shows the count one transition late.
         _note_pass_count(self.request, SCAN_LABEL_FRONT, len(front_pages))
 
         # A capped fronts pass ends the job here, with the fronts, and nobody is
-        # asked to flip. The feeder took one sheet past the cap and threw it
-        # away, so that sheet already lies in the output tray on the fronts.
-        # Turned over, the stack would feed that sheet's back first: it belongs
-        # to no kept front, and every back after it would pair with the front
-        # one sheet away. The fronts go out as the document, and
-        # _finish_document adds the sentence saying the backs were not scanned.
+        # asked to flip.  The sheet fed past the cap already lies in the output
+        # tray, so the flipped stack would feed its back first and pair every
+        # back after it with the wrong front.
         if (front_cap := front_batch.cap_reached) is not None:
             logger.warning(
                 "Pass A stopped at its %d-sheet cap; not asking for a flip, "
@@ -1659,14 +1582,10 @@ class _PipelineRun:
 
         self._notify(PipelineEvent.AWAITING_FLIP)
         outcome = flip.coordinator.wait_for_flip(flip.timeout)
-        # A match with assert_never rather than an if-chain: a fourth FlipOutcome
-        # member then fails ty and pyrefly at edit time instead of falling through
-        # into pass B.  An explicit abort -- web Abort, n, Ctrl-D, Ctrl-C -- is a
-        # cancellation, not a scanner failure.  A broken prompt (an ABORTED that
-        # carries an abort_cause) and a timeout are failures, because nobody chose
-        # to stop.  A server stop is its own answer, INTERRUPTED, and never
-        # arrives as a cancel: it raises ScanInterrupted, which the guard in
-        # ``execute`` answers by keeping the fronts.
+        # An explicit abort is a cancellation.  A broken prompt (an ABORTED that
+        # carries an abort_cause) and a timeout are failures, because nobody
+        # chose to stop, and a server stop raises ScanInterrupted: both keep the
+        # fronts.
         match outcome:
             case FlipOutcome.CONTINUED:
                 pass
@@ -1675,15 +1594,10 @@ class _PipelineRun:
                 if cause is not None:
                     msg = f"Flip prompt failed: {describe(cause)}"
                     raise ScanError(msg, next_step=_BROKEN_PROMPT_NEXT_STEP) from cause
-                # The one ending here that keeps NOTHING, and the asymmetry is
-                # policy rather than oversight: pass A's fronts are preserved
-                # after a flip timeout or a broken prompt precisely because nobody
-                # chose to stop, and are deliberately not preserved here because
-                # somebody did.  ``failed/`` is never pruned automatically, so
-                # filing an abandoned scan into it would leave the operator tidying
-                # up after a decision they already made.  ``execute``'s guard
-                # lets this exception through untouched, by type; do not turn it
-                # into a ScanError to "simplify" the handler.
+                # The one ending here that keeps nothing, because somebody chose
+                # to stop, and ``failed/`` is never pruned automatically.
+                # ``execute``'s guard lets this through by type; do not turn it
+                # into a ScanError.
                 msg = "Manual duplex scan cancelled at the flip prompt"
                 raise ScanCancelledError(msg)
             case FlipOutcome.TIMED_OUT:
@@ -1703,9 +1617,8 @@ class _PipelineRun:
                     ),
                 )
             case FlipOutcome.INTERRUPTED:
-                # The server is stopping.  That is nobody's decision to throw
-                # the scan away, so it is an interruption rather than a
-                # cancel, with no signal behind it.
+                # Nobody's decision to throw the scan away, so an interruption
+                # rather than a cancel.
                 msg = "The server is stopping"
                 raise ScanInterrupted(msg)
             case _:
@@ -1715,10 +1628,8 @@ class _PipelineRun:
         # fired it, and the strip is meant to show the first front.
         self._notify(PipelineEvent.SCANNING_REVERSE)
         back_sink = self._sink(_SPOOL_LABEL_B, None)
-        # Registered under ``(backs)``, again before the pass runs.  The two halves
-        # are a single document between them, so a failure on either has to keep
-        # both -- the same rule, and the same two names, that the mismatch recovery
-        # already applies.
+        # Registered under ``(backs)`` before the pass runs: the two halves are one
+        # document, so a failure on either keeps both.
         self.ledger.register(preservation.BACKS_SUFFIX, back_sink)
         back_batch = self.scanner.scan_pages(
             self.device_id, self.scan_settings, back_sink
@@ -1735,28 +1646,18 @@ class _PipelineRun:
             raise ScanError(msg)
         back_pages = back_batch.pages
         logger.info("Pass B: scanned %d back page(s)", len(back_pages))
-        # Announced for symmetry and for the log-like observers that want both
-        # halves; the worker deliberately ignores it, because by the time it lands
-        # the run is a moment away from its ScanResult and replacing the front
-        # count would change the number under the operator's eyes.
+        # The worker ignores this one: the run is a moment from its ScanResult,
+        # and replacing the front count would change the number on screen.
         _note_pass_count(self.request, SCAN_LABEL_BACK, len(back_pages))
 
         resolution = duplex.duplex_resolution(front_batch, back_batch)
         # Summed, not picked: a sheet lost on either pass is a sheet lost.
         rejected = front_batch.pages_rejected + back_batch.pages_rejected
 
-        # Interleaving pairs the pages by position, and position is proof of
-        # pairing only while every sheet was read on both passes.  A sheet lost on
-        # either pass shifts every later page of that pass by one, and when each
-        # pass loses a different sheet the counts still agree -- so a lost sheet
-        # sends the halves out separately even when the counts match.  Nothing
-        # tries to pair the pages by physical sheet instead: the scanner reports
-        # that a sheet was skipped, not which one.
-        #
-        # A capped backs pass is split for the same reason, counts or not: it
-        # fed a sheet past the cap that the fronts pass never fed, so the stack
-        # it scanned is not the one pass A saw. Only the backs pass can be
-        # capped here; a capped fronts pass returned before the flip.
+        # Position proves pairing only while every sheet was read on both passes:
+        # when each pass loses a different sheet the counts still agree, so a lost
+        # sheet splits the halves even when the counts match.  A capped backs pass
+        # is split too, because it fed a sheet the fronts pass never fed.
         #
         # Compare the raw counts BEFORE empty-page detection: filtering first
         # could drop a blank back and turn two matching passes into a mismatch.
@@ -1773,11 +1674,8 @@ class _PipelineRun:
 
         interleaved = duplex.interleave_duplex(front_pages, back_pages)
         logger.info("Interleaved %d total pages", len(interleaved))
-        # The SANE backend resolves a feeder for manual duplex and never puts
-        # its Auto source in place of one there, so this is None from it. It
-        # is carried anyway: ScanBatch lets any backend report a substitution,
-        # and dropping the field here would lose that warning without a word.
-        # Both passes run with the same settings, so pass A's stands for both.
+        # Both passes run with the same settings, so pass A's substitution
+        # stands for both.
         return ScanBatch(
             pages=tuple(interleaved),
             actual_resolution=resolution,
@@ -1796,38 +1694,17 @@ class _PipelineRun:
         answers in time finishes the document with what it has, but warned,
         because nobody said it was complete.
 
-        Every pass spools under its own label -- ``a-00001``, ``a-00002``, and
-        so on -- because a sink numbers its files from 1, so a label shared
-        between passes would have each pass overwrite the one before.  The
-        labels also sort into scan order, which is the order the startup
-        sweep rebuilds a crashed run's pages in.
+        Every pass spools under its own label (``a-00001``, ``a-00002``, ...),
+        because a sink numbers its files from 1.  The labels sort into scan
+        order, which is the order the startup sweep rebuilds a crashed run in.
 
-        Everything this runs is inside ``execute``'s one guard, and the loop
-        keeps the guard informed rather than opening a window of its own.  An
-        accepted pass joins ``artefacts.document`` straight away, while the
-        stage is still ``ACQUIRING``, and a pass in flight stays registered
-        with the ledger, so a failure or an interruption at any point keeps
-        the accepted pages as one PDF and the pass in flight beside it.
+        An accepted pass joins ``artefacts.document`` at once and a pass in
+        flight stays registered with the ledger, so a failure at any point
+        keeps the accepted pages and the pass in flight beside them.
 
-        Only the first page's sink carries the thumbnail observer, and only
-        while no page is kept, so the job's preview stays the document's first
-        page and no later pass replaces it.  When that first page changes --
-        skipped as blank, or thrown away with its pass -- the preview is made
-        again from the first page kept (``_refresh_preview``).
-
-        Two things end the document without the operator: the page cap, once
-        a pass takes the kept pages to it, and a prompt nobody answers.  A
-        pass the scanner fails while a page is kept goes back to the operator
-        instead of failing the job, with the failed pass thrown away.
-
-        Blank pages are the operator's decision here, asked once per pass and
-        only for a pass that has one, while a single-pass scan removes them on
-        its own.  The operator is standing at the scanner between passes, so
-        a page that only looks blank -- a faint form, a signature page -- can
-        be kept, skipped, or scanned again, rather than silently lost.  For
-        the same reason no blank-page filter runs over the finished document:
-        a page kept on purpose must never be removed afterwards, and a
-        document of pages kept on purpose must never be failed as all blank.
+        Blank pages are the operator's decision, asked once per pass, so no
+        blank-page filter runs over the finished document: a page kept on
+        purpose must never be removed afterwards.
 
         Args:
             context: The pass coordinator, and the timeout on every prompt.
@@ -1854,9 +1731,6 @@ class _PipelineRun:
             # Asked here, outside the pass's try, so a prompt that broke can
             # never be taken for another scanner fault.
             answer = self._ask(context, prompt)
-            # A match with assert_never rather than an if-chain, so a new
-            # PassAnswer member fails ty and pyrefly here at edit time instead
-            # of falling through into another pass.
             match answer:
                 case PassAnswer.NEXT:
                     continue
@@ -1919,11 +1793,9 @@ class _PipelineRun:
         """
         while True:
             if document.started > 0 and context.coordinator.stopping:
-                # The answer that asked for this pass was claimed before the
-                # stop, so the prompt could not carry the stop to the run.
-                # Starting the pass anyway would outlast the bounded stop and
-                # lose the accepted document, which the guard only keeps if
-                # the run ends here.
+                # The answer asking for this pass was claimed before the stop.
+                # Starting the pass would outlast the bounded stop and lose the
+                # accepted document, which the guard keeps only if the run ends.
                 msg = "The server is stopping"
                 raise ScanInterrupted(msg)
             scanned = self._scan_pass(document, document.start_pass())
@@ -1932,12 +1804,9 @@ class _PipelineRun:
             decision = self._settle_blanks(context, document, *scanned)
             if decision is not PassAnswer.RESCAN:
                 break
-        # A pass that stopped at its own cap left a sheet in the feeder that
-        # was fed and thrown away, so the document ends here.  Its sentence
-        # already says to scan the rest as a new document, so the document
-        # cap below would only say that again and is not checked.  The pass
-        # just accepted is the last one: Re-scan at the blank prompt never
-        # accepts it, and no next-pass prompt follows a capped one.
+        # A pass that stopped at its own cap threw a fed sheet away, so the
+        # document ends here.  Its sentence already says to scan the rest as a
+        # new document, so the document cap is not checked.
         pass_cap = _pass_cap_warning(document.passes[-1].cap, document.kept)
         self._keep_cap_for_failure(document.passes[-1].cap)
         if decision is PassAnswer.TIMED_OUT or pass_cap is not None:
@@ -1963,15 +1832,12 @@ class _PipelineRun:
         """
         Scan one pass of a multi-page document, and leave it undecided.
 
-        The pass stays registered with the ledger as a pass in flight until it
-        is accepted or thrown away, so a stop while its blank pages are being
-        asked about keeps it beside the document.
+        The pass stays registered with the ledger until it is accepted or
+        thrown away, so a stop while its blank pages are asked about keeps it.
 
-        A pass that fails with a fault the operator can do something about,
-        while a page is kept, is thrown away -- its page files deleted, and
-        none of it counted -- and its failure is returned instead of raised.
-        Only the pass itself is inside the ``try``: no prompt is ever asked
-        from inside it.
+        A pass that fails with a fault the operator can put right, while a
+        page is kept, is thrown away and its failure returned instead of
+        raised.  No prompt is ever asked from inside the ``try``.
 
         Args:
             document: The document the pass is for.
@@ -1993,17 +1859,14 @@ class _PipelineRun:
             self._notify(PipelineEvent.SCANNING)
         thumbnail = self._thumbnail_observer() if document.kept == 0 else None
         sink = self._sink(f"{_SPOOL_LABEL_A}-{pass_number:05d}", thumbnail)
-        # Registered before the pass runs, as every pass is: a fault part-way
-        # through it has to find the sink that has been collecting its pages.
+        # Registered before the pass runs, as every pass is.
         self.ledger.register(preservation.PARTIAL_SUFFIX, sink)
         try:
             if pass_number > 1:
                 # A scanner host restarted during a long wait between passes
-                # would otherwise leave SANE holding a stale control
-                # connection, and every later pass would fail with an I/O
-                # error.  This is the restart made at the top of every job,
-                # made again before each later pass, when no device handle is
-                # open: scan_pages closes the device at the end of every pass.
+                # leaves SANE holding a stale control connection, and every
+                # later pass fails with an I/O error.  No device handle is open
+                # here: scan_pages closes the device at the end of every pass.
                 self.scanner.reinitialise()
             batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
             _require_pages(batch)
@@ -2151,15 +2014,6 @@ class _PipelineRun:
 
         Finish is always offered, because a pass only comes back to the
         operator while a page is kept.
-
-        Args:
-            context: The timeout every prompt carries.
-            document: The document so far.
-            failure: What the failed pass raised, whose text the prompt shows.
-
-        Returns:
-            The numbered prompt.
-
         """
         return PassPrompt(
             number=document.number_prompt(),
@@ -2182,11 +2036,7 @@ class _PipelineRun:
 
         Every page of the pass joins the document, skipped ones included, so
         a failed run keeps them all.  A skipped page is recorded by its
-        position in the document, which is how the finished document leaves
-        it out and how it is reported as removed.
-
-        The ledger stops tracking the pass, because its pages now belong to the
-        document; tracking them in both places would keep them twice.
+        position in the document.
 
         Args:
             document: The document the pass joins.
@@ -2214,9 +2064,8 @@ class _PipelineRun:
         self.ledger.unreadable_sheets += batch.pages_rejected
         self.artefacts.document = tuple(document.records)
         self.ledger.forget(sink)
-        # Numbered as the pass was started, thrown-away passes included, the
-        # same way the failed-pass line and the spool label number it.  The
-        # pass accepted here is always the one started last.
+        # The pass accepted here is always the one started last, so it carries
+        # the number its spool label and any failed-pass line use.
         logger.info(
             "Multi-page pass %d: scanned %d page(s), skipped %d; %d kept so far",
             document.started,
@@ -2260,21 +2109,10 @@ class _PipelineRun:
         """
         Remake the job's preview when the document's first kept page has changed.
 
-        The preview is made as a pass's first page is spooled, before anyone
-        has decided about that page, so it can end up showing a page the
-        document does not hold: one skipped as blank, or one from a pass
-        thrown away.  After every change to the document it is made again
-        from the first kept page, if that is not already the page it shows.
-        That reopens one spooled page, which is why it happens only when the
-        first page has changed.  With no page kept the preview is left alone:
-        the next pass, starting on an empty document, makes a new one.
-
-        Best-effort, as the preview is everywhere: a page that cannot be
-        reopened is logged and the scan goes on.
-
-        Args:
-            document: The document as it now stands.
-
+        The preview is made as a pass's first page is spooled, before anyone has
+        decided about that page, so it can show one skipped as blank or thrown
+        away.  Remaking it reopens a spooled page, so it happens only when the
+        first kept page changed; a page that cannot be reopened is logged.
         """
         if self.request.thumbnail_callback is None:
             return
@@ -2302,14 +2140,6 @@ class _PipelineRun:
 
         Finish is offered only while a page is kept, so a document of no pages
         can never be finished by a press.
-
-        Args:
-            context: The timeout every prompt carries.
-            document: The document so far, whose last pass the prompt reports.
-
-        Returns:
-            The numbered prompt.
-
         """
         offered = {PassAnswer.NEXT, PassAnswer.RESCAN, PassAnswer.ABORT}
         if document.kept > 0:
@@ -2329,15 +2159,8 @@ class _PipelineRun:
         """
         Announce the wait, put ``prompt`` to the operator, and end the run if told.
 
-        The waiting event is reported before the coordinator is asked, so the
-        job says what it is waiting on for the whole of the wait.
-
         Never call this inside a ``try`` that wraps a scan: a prompt that broke
         must not be mistaken for a scanner fault.
-
-        Args:
-            context: The coordinator to ask.
-            prompt: The question, and the only answers it accepts.
 
         Returns:
             The answer, when it is one the caller acts on: a member of
@@ -2362,21 +2185,14 @@ class _PipelineRun:
             if cause is not None:
                 msg = f"Multi-page prompt failed: {describe(cause)}"
                 raise ScanError(msg, next_step=_BROKEN_PROMPT_NEXT_STEP) from cause
-            # The one ending that keeps NOTHING, and the asymmetry is policy
-            # rather than oversight: the pages are kept after a timeout, a
-            # broken prompt or a stop precisely because nobody chose to stop,
-            # and are deliberately not kept here because somebody did.
-            # ``failed/`` is never pruned automatically, so filing an abandoned
-            # scan into it would leave the operator tidying up after a
-            # decision they already made.  ``execute``'s guard lets this
-            # exception through untouched, by type; do not turn it into a
-            # ScanError to "simplify" the handler.
+            # The one ending that keeps nothing, because somebody chose to
+            # stop, and ``failed/`` is never pruned automatically.  ``execute``'s
+            # guard lets this through by type; do not turn it into a ScanError.
             msg = "Multi-page scan cancelled at the prompt"
             raise ScanCancelledError(msg)
         if answer is PassAnswer.INTERRUPTED:
-            # The server is stopping.  That is nobody's decision to throw the
-            # scan away, so it is an interruption rather than a cancel, and
-            # the guard keeps every accepted page.
+            # Nobody's decision to throw the scan away, so an interruption
+            # rather than a cancel, and the guard keeps every accepted page.
             msg = "The server is stopping"
             raise ScanInterrupted(msg)
         return answer
@@ -2385,20 +2201,9 @@ class _PipelineRun:
         """
         Say that a manual duplex job's backs were not scanned, if they were not.
 
-        Decided here, from the run and the batch, rather than carried on a
-        field of its own: on a manual duplex run the one batch that reaches
-        ``_finish_document`` with a cap is the fronts pass, because a capped
-        backs pass is always delivered as two halves. A field on the run or
-        the batch would be a second record of what the flip context and the
-        cap already say.
-
-        Args:
-            cap: The cap the delivered batch reached, or None.
-
-        Returns:
-            The warning text on a manual duplex run whose fronts pass was
-            capped, otherwise None.
-
+        On a manual duplex run the one batch that reaches ``_finish_document``
+        with a cap is the fronts pass, because a capped backs pass is always
+        delivered as two halves.
         """
         if self.flip is None or cap is None:
             return None
@@ -2410,15 +2215,9 @@ class _PipelineRun:
         """
         Keep a capped pass's sentence for any failure after it, if it was capped.
 
-        The warning a finished run carries is worded only once the pages are
-        delivered, so a failure in between -- a blank-page verdict, assembly
-        or delivery -- would otherwise lose which sheet was fed and not kept.
-        On a manual duplex run the capped pass is the fronts pass, so the
-        backs were not scanned either, and that is kept too.
-
-        Args:
-            cap: The cap the pass reached, or None when it ended on its own.
-
+        The finished run's warning is worded only once the pages are delivered,
+        so a failure in between would otherwise lose which sheet was fed and not
+        kept.  On a manual duplex run the backs were not scanned either.
         """
         if cap is None:
             return
@@ -2450,20 +2249,12 @@ class _PipelineRun:
         self.artefacts.stage = preservation.RunStage.FILTERING
         self.artefacts.document = tuple(records)
         rejected_warning = _rejected_pages_warning(batch.pages_rejected)
-        # What the backend measured about the pass, each worded once: a
-        # flatbed request the scanner's Auto source took through the feeder
-        # here, and a pass that stopped at its cap, with the pages before it
-        # kept, once the blank pages are out.
         substitution_warning = _substitution_warning(batch.substituted_source)
         self._keep_cap_for_failure(batch.cap_reached)
 
-        # There is no per-page EXIF strip here, and one would have nothing to
-        # act on.  python-sane builds each page with ``Image.frombuffer``,
-        # which carries no EXIF, and the pages are files the spool wrote:
-        # Pillow writes EXIF into a PNG or a JPEG only when it is passed as
-        # the ``exif`` argument, which neither the spool's PNG save nor the
-        # thumbnail's JPEG save ever does.  An orientation tag that img2pdf
-        # or a browser would act on therefore cannot reach either file.
+        # No per-page EXIF strip is needed: python-sane's ``Image.frombuffer``
+        # pages carry no EXIF, and Pillow writes it only when passed ``exif``,
+        # which neither the spool's PNG save nor the thumbnail's JPEG save does.
         filtered = _drop_blank_pages(records, self.profile)
         # A cap's sentence counts the pages uploaded, after blank removal, as
         # a multi-page document's does, so it agrees with pages_uploaded.
@@ -2472,12 +2263,9 @@ class _PipelineRun:
             self._backs_not_scanned(batch.cap_reached),
         )
 
-        # Each page is laid out at the dpi on its own record: the resolution
-        # the device read back, not the one the profile asked for. SANE
-        # substitutes silently -- measured, a request for 5000 comes back as
-        # 1200 -- and the read-back value is the same one the backend's crop
-        # arithmetic used, so the cropped shape and the declared page size
-        # cannot disagree.
+        # Each page is laid out at the dpi the device read back, not the one
+        # the profile asked for: SANE substitutes silently (measured, 5000
+        # comes back as 1200), and the backend's crop used the read-back value.
         pdf_path = self._assemble(filtered.kept)
         outcome, warning = self._deliver_document(pdf_path)
 
@@ -2523,9 +2311,8 @@ class _PipelineRun:
 
         """
         records = tuple(document.records)
-        # Recorded before anything can raise, so a failure from here on --
-        # the zero-kept verdict included -- keeps the whole document as one
-        # PDF, in scan order, and never a pass beside it.
+        # Recorded before anything can raise, so a failure from here on keeps
+        # the whole document as one PDF, in scan order.
         self.artefacts.stage = preservation.RunStage.FILTERING
         self.artefacts.document = records
         if document.kept == 0:
@@ -2535,8 +2322,7 @@ class _PipelineRun:
             )
             raise AllPagesBlankError(msg)
         removed = tuple(sorted(document.removed))
-        # A set for the membership test: a document can run to several
-        # hundred pages, and a tuple would be searched once per page.
+        # A set: a document can run to several hundred pages.
         skipped = frozenset(removed)
         kept = [
             record
@@ -2568,20 +2354,12 @@ class _PipelineRun:
 
     def _assemble(self, records: Sequence[PageRecord]) -> Path:
         """
-        Assemble the document's PDF inside the workspace.
+        Assemble the document's PDF inside the workspace, and return its path.
 
         Refused before a byte is written when the disk cannot hold the singles
         and the output beside the spool.  A refusal or an assembly failure
         leaves the stage at ASSEMBLING, where the guard keeps the page files:
         building another PDF would fail the same way.
-
-        Args:
-            records: The pages to assemble, in document order, each laid out
-                at its own read-back dpi.
-
-        Returns:
-            The assembled PDF, still inside the workspace.
-
         """
         self.artefacts.stage = preservation.RunStage.ASSEMBLING
         self._notify(PipelineEvent.ASSEMBLING)
@@ -2609,15 +2387,11 @@ class _PipelineRun:
             What the upload did.
 
         """
-        # From the moment the upload returns paperless-ngx has the document,
-        # or will from its consume folder: if the run fails later -- the
-        # poll, the other half of a mismatch, a signal -- the kept copy must
-        # say so, or following the usual advice to upload it would make a
-        # duplicate.  An interruption while the request is on its way is the
-        # same risk unconfirmed: paperless-ngx may have created the document
-        # before the answer was cut off, and so is an upload that was sent
-        # whole and got no usable answer.  The record is made inside the try,
-        # so a signal landing between the two is still caught.
+        # Once the upload returns paperless-ngx has the document, so the kept
+        # copy of a later failure must say so, or uploading it again makes a
+        # duplicate; an interruption in flight or a send with no usable answer
+        # is the same risk, unconfirmed.  The record is made inside the try, so
+        # a signal landing between the two is still caught.
         try:
             upload = self.paperless.upload_document(
                 pdf_path, title, self.request.tags, self.request.correspondent
@@ -2635,20 +2409,12 @@ class _PipelineRun:
         """
         Wait for an upload's consume task, when it reached the API.
 
-        Only an ApiDelivery has a task id; a document that only reached the
-        consume directory has no task to wait for.  ``poll_task`` raises on
-        every failed task, so returning means the document is in
-        paperless-ngx: filed, or refused because paperless-ngx already held
-        it.
-
-        Args:
-            upload: What the upload did.
-            half: The half of a split duplex job this upload was, for the
-                duplicate warning, or None for a whole scan.
+        ``poll_task`` raises on every failed task, so returning means the
+        document is in paperless-ngx: filed, or refused as a duplicate.  ``half``
+        names the half of a split duplex job for the duplicate warning.
 
         Returns:
-            The duplicate warning when paperless-ngx refused the upload as a
-            duplicate, otherwise None.
+            The duplicate warning, or None.
 
         """
         match upload:
@@ -2694,9 +2460,6 @@ class _PipelineRun:
             case ApiDelivery():
                 return ScanOutcome.SUCCESS, duplicate
             case FolderDelivery(path=path):
-                # A state alone would leave the user to work out for
-                # themselves why the title and tags they chose never appeared
-                # in paperless-ngx.
                 return ScanOutcome.FALLBACK, _consume_dir_warning(path)
             case _:
                 assert_never(upload)
@@ -2705,33 +2468,18 @@ class _PipelineRun:
         """
         Deliver both halves of a mismatched manual-duplex run as two PDFs.
 
-        Instead of discarding scanned data, fronts and backs are assembled into
-        separate PDFs and both are uploaded for manual review.  The ``(backs)``
-        PDF is in sheet order, the reverse of the order pass B produced its
-        pages.  Its page N is the back of the ``(fronts)`` PDF's page N only
-        when both passes fed every sheet exactly once, which a mismatch says
-        they did not: from the sheet that was skipped, missed, fed twice or
-        fed past the backs pass's cap on, the two halves drift apart, which is
-        why they are not interleaved.
+        The ``(backs)`` PDF is in sheet order, the reverse of pass B's.  The
+        halves are not interleaved because, from the sheet that was skipped,
+        fed twice or fed past the cap, they drift apart.
 
-        The two halves are one document between them, so a failure on either
-        keeps both: an assembly failure keeps every page file of both passes,
-        and an upload or poll failure keeps both PDFs.  They get visibly
-        distinct names, both carrying the job id, so they cannot overwrite
-        each other on the way into ``failed/``.
+        The two halves are one document, so a failure on either keeps both,
+        under distinct names that both carry the job id.  Once paperless-ngx
+        has taken the ``(fronts)`` half a rescan would file it twice, so a
+        later failure is raised as an unconfirmed filing naming both halves.
 
-        Once paperless-ngx has taken the ``(fronts)`` half, a failure is no
-        longer "not sent": a rescan would file that half twice.  So a failure
-        of the ``(backs)`` upload or of either poll is raised as an
-        unconfirmed filing that names the half which arrived and the half
-        which failed.  A duplicate refusal of either half is no failure at
-        all: that half is in paperless-ngx, and its sentence joins the
-        warning.
-
-        The blank-page filter does not run here, on purpose, so
-        ``pages_removed`` is simply 0 and no position is named as removed.  A
-        mismatched run is an anomaly sent to a person for manual review, and a
-        blank back side is evidence about why the two passes disagreed.
+        The blank-page filter does not run here, on purpose: a mismatched run
+        goes to a person for review, and a blank back side is evidence about
+        why the two passes disagreed.
 
         Args:
             mismatch: Both passes, whose records carry the resolution each
@@ -2759,10 +2507,9 @@ class _PipelineRun:
         # first.  Reversed here, as ``duplex.interleave_duplex`` does, the (backs)
         # PDF runs in the same sheet order as the (fronts) PDF.
         backs = list(reversed(mismatch.backs))
-        # One composition per half, used for the PDF's own /Title and the
-        # upload, so the two cannot drift apart.  The file name carries the
-        # half as a part segment of its own instead: inside the title slug it
-        # would be cut off a long title, and the halves would share one name.
+        # The file name carries the half as a part segment of its own: inside
+        # the title slug it would be cut off a long title, and the halves would
+        # share one name.
         fronts_title = half_title(self.request.title, preservation.FRONTS_SUFFIX)
         backs_title = half_title(self.request.title, preservation.BACKS_SUFFIX)
 
@@ -2803,18 +2550,14 @@ class _PipelineRun:
         self.artefacts.stage = preservation.RunStage.DELIVERING
         self._notify(PipelineEvent.UPLOADING)
         fronts_result = self._upload(fronts_pdf, fronts_title)
-        # From here one half is in paperless-ngx, so whatever fails is named
-        # against the half that arrived.  ``halves`` is (delivered, failed)
-        # should the next step raise: the backs upload and the backs poll
-        # fail the (backs) half, the fronts poll the (fronts) one, whose
-        # backs were accepted by then.  ScanInterrupted is a BaseException
-        # and passes through unchanged.
+        # From here one half is in paperless-ngx.  ``halves`` is (delivered,
+        # failed) should the next step raise.  ScanInterrupted is a
+        # BaseException and passes through unchanged.
         halves = (preservation.FRONTS_SUFFIX, preservation.BACKS_SUFFIX)
         try:
             backs_result = self._upload(backs_pdf, backs_title)
             # Both halves that reach the API are polled: a half that failed
-            # consumption is not a half that was delivered, and this path is
-            # the one most likely to be holding a document the user needs.
+            # consumption was not delivered.
             halves = (preservation.BACKS_SUFFIX, preservation.FRONTS_SUFFIX)
             fronts_duplicate = self._poll(fronts_result, preservation.FRONTS_SUFFIX)
             halves = (preservation.FRONTS_SUFFIX, preservation.BACKS_SUFFIX)
@@ -2830,11 +2573,8 @@ class _PipelineRun:
         mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
         mismatch_warning = duplex.duplex_mismatch_warning(mismatch)
         logger.warning(mismatch_warning)
-        # A cap and a substitution are events of their own, not the reason
-        # the halves were split, so each is joined in its own sentence. The
-        # backs pass is the only one a mismatch can carry a cap from, and its
-        # sentence counts every page uploaded, across both halves, so that it
-        # agrees with pages_uploaded below.
+        # The cap sentence counts every page uploaded, across both halves, so
+        # that it agrees with pages_uploaded below.
         warning = _join_warnings(
             mismatch_warning,
             fronts_duplicate,
@@ -2846,17 +2586,14 @@ class _PipelineRun:
         logger.info(
             "Pipeline complete for %r (duplex mismatch recovery)", self.request.title
         )
-        # _MAX_ADF_PAGES applies to each scan_pages call, so to each pass: each
-        # pass can feed up to that many sheets.
         return ScanResult(
             outcome=ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK,
             pages_scanned=mismatch_pages,
             pages_removed=0,
             pages_uploaded=mismatch_pages,
             # Not joined with _rejected_pages_warning: a lost sheet is already the
-            # reason the mismatch sentence gives, and saying the count twice in
-            # one message reads as two separate losses. The cap and the
-            # substitution above are joined because they are not that reason.
+            # reason the mismatch sentence gives, and saying it twice reads as two
+            # separate losses.
             warning=warning,
         )
 
@@ -2872,27 +2609,19 @@ def run_pipeline(
 
     First, before the scanner is touched, checks the request's tag and
     correspondent ids against paperless-ngx
-    (:func:`saneless.scan_metadata.check_scan_metadata`): an id missing from
-    its lists even after one refetch is dropped, and the run's warning names
-    it, so the delivered scan is a warned success.  When paperless-ngx cannot
-    be asked, the ids go unchecked and the upload decides.  A request with no
-    ids asks nothing.
+    (:func:`saneless.scan_metadata.check_scan_metadata`): an id missing even
+    after one refetch is dropped and named in the run's warning.  When
+    paperless-ngx cannot be asked, the ids go unchecked and the upload decides.
 
-    Then scans pages from the configured device, assembles them into a PDF,
-    uploads to paperless-ngx, and polls for task completion. The run works in
-    its own locked workspace under ``output.tmp_dir``, named after the job,
-    which is removed when the run ends, however it ends.
+    Then scans pages, assembles them into a PDF, uploads it to paperless-ngx
+    and polls for its task, in a locked workspace under ``output.tmp_dir``
+    that is removed when the run ends.
 
-    What deliberately escapes that removal is whatever a failure leaves worth
-    keeping. One guard spans the whole run, from the first scanning event to
-    delivery, and on any failure keeps the most finished artefact the run
-    produced in ``settings.output.failed_dir``: each spooled pass as a PDF
-    during acquisition, the unfiltered document as one PDF after it, the page
-    files if assembly failed, the assembled PDF(s) if delivery failed. A
-    sentence naming what was kept, and where, is attached to the failure as a
-    note (``exceptions.failure_text`` renders it); the failure itself is
-    re-raised unchanged. An operator's cancel keeps nothing, because the
-    operator chose to stop and ``failed/`` is never pruned.
+    One guard spans the whole run and on any failure keeps the most finished
+    artefact in ``settings.output.failed_dir``, attaching a sentence naming
+    what was kept as a note (``exceptions.failure_text`` renders it); the
+    failure itself is re-raised unchanged.  An operator's cancel keeps
+    nothing, because ``failed/`` is never pruned.
 
     Status, thumbnail and pass-count observers are best-effort: an observer
     that raises is logged at WARNING and the run carries on.
@@ -2955,22 +2684,16 @@ def run_pipeline(
     # The one place saneless decides a scan is manual duplex, and it reads
     # profile.duplex -- never source, which is a pure SANE value.
     #
-    # _flip_context refuses a manual-duplex request that has no flip
-    # coordinator, and where it is called matters: it must come before
-    # _resolve_device, which calls get_devices() when scanner.device is empty,
-    # so a request that cannot run never touches the device.  Refusing inside
-    # _scan_manual_duplex would be too late -- that method scans pass A
-    # first, so it would use up a full feeder pass before failing.  The
-    # multi-page refusals come first and for the same reason.
+    # The refusals come before _resolve_device, which calls get_devices() when
+    # scanner.device is empty, so a request that cannot run never touches the
+    # device.  Refusing inside _scan_manual_duplex would use up pass A first.
     multi_page = _multi_page_context(request, profile, settings)
     manual_duplex = profile.duplex == "manual"
     flip = _flip_context(request, settings) if manual_duplex else None
 
-    # After the refusals, which need no network, and before _resolve_device,
-    # the first scanner contact: an id paperless-ngx no longer has is dropped
-    # before any paper moves, and the run files the document without it.  The
-    # web worker's lookup reads the pickers' cache first; the CLI's reads the
-    # client once.
+    # After the refusals, which need no network, and before the first scanner
+    # contact, so an id paperless-ngx no longer has is dropped before any
+    # paper moves.
     checked, dropped = check_scan_metadata(
         ScanMetadata(tuple(request.tags or ()), request.correspondent),
         request.metadata_lookup or ClientMetadataLookup(paperless),
@@ -2990,17 +2713,14 @@ def run_pipeline(
         mode=profile.mode,
         auto_source_mode=profile.auto_source_mode,
         # The single conversion point from the profile to the scanner's
-        # settings. Do not add a second: the scanner package takes the
-        # profile's duplex Literal as a plain value and never sees
-        # ProfileConfig or the job vocabulary.
+        # settings: the scanner package never sees ProfileConfig.
         duplex=profile.duplex,
         paper_size=profile.paper_size,
     )
 
     # The guard runs INSIDE the workspace, because the workspace's exit
-    # removes the spool: anything that has to outlive the job -- a preserved
-    # scan -- must be moved out before then, and a guard placed outside this
-    # block would run when the pages were already gone.
+    # removes the spool: a guard outside this block would run when the pages
+    # were already gone.
     with _open_workspace(
         settings.output.tmp_dir, settings.output.min_free_space_mb, request
     ) as workspace:
