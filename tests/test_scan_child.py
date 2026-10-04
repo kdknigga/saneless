@@ -16,6 +16,7 @@ is, and blocks at a chosen stage with ``signal.pause()``.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import logging
 import os
@@ -951,4 +952,57 @@ def test_an_exit_failure_does_not_replace_the_error_in_flight(
 
     assert raised.value is original
     assert scan_child_stopped_error(ScanStage.EXIT, None) in " ".join(_warnings(caplog))
+    _assert_reaped(files.pid())
+
+
+# The reply pipe capacity saneless asks for: a page then crosses in a few
+# large reads instead of one per 64 KiB, the kernel's default.
+_WIDE_PIPE_BYTES = 1 << 20
+
+
+def test_a_started_childs_reply_pipe_is_widened(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reply pipe holds 1 MiB or more on saneless's end once the child starts."""
+    files = _stand_in(monkeypatch, tmp_path)
+    child = scan_child_mod.start_scan_child("")
+    try:
+        capacity = fcntl.fcntl(child.reply_fd, fcntl.F_GETPIPE_SZ)
+    finally:
+        child.kill_and_reap()
+        child.close()
+
+    assert capacity >= _WIDE_PIPE_BYTES
+    _assert_reaped(files.pid())
+
+
+def test_a_refused_pipe_size_keeps_the_default_and_the_pass_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A kernel that refuses the larger pipe costs speed, never the scan.
+
+    Unprivileged processes may not exceed ``/proc/sys/fs/pipe-max-size`` or
+    their pipe quota; the pipe then keeps its default size.
+    """
+    real = fcntl.fcntl
+    asked: list[int] = []
+
+    def refuse(fd: int, cmd: int, arg: int = 0) -> int:
+        if cmd == fcntl.F_SETPIPE_SZ:
+            asked.append(arg)
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real(fd, cmd, arg)
+
+    monkeypatch.setattr(fcntl, "fcntl", refuse)
+    _shorten_deadlines(monkeypatch)
+    files = _stand_in(monkeypatch, tmp_path)
+    sink = _RecordingSink(tmp_path)
+
+    with ScanChildSession(_Starts()) as session:
+        batch = session.scan_pass(_DEVICE, _SETTINGS, sink)
+
+    assert asked == [_WIDE_PIPE_BYTES]
+    assert batch.pages == tuple(sink.records)
+    assert len(sink.pages) == 2
     _assert_reaped(files.pid())
