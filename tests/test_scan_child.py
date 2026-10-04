@@ -27,9 +27,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
-import saneless.scanner.scan_child as scan_child_mod
-from saneless.scanner.scan_child import ChildProcess, ScanChildSession
 
+import saneless.scanner.scan_child as scan_child_mod
 from saneless.exceptions import (
     ConfigError,
     DiskSpaceError,
@@ -46,6 +45,7 @@ from saneless.scanner.base import (
     ScanBatch,
     ScanSettings,
 )
+from saneless.scanner.scan_child import ChildProcess, ScanChildSession
 from saneless.vocabulary import (
     ScanStage,
     page_timeout_error,
@@ -726,11 +726,11 @@ def test_an_abort_mid_read_returns_within_the_grace(
 
     assert str(raised.value) == "The server is stopping"
     assert raised.value.signum is None
+    _assert_reaped(files.pid())
     assert set_at
     assert ended - set_at[0] < 1.0
     assert "cancel" in files.ops()
     assert session.children_killed == killed
-    _assert_reaped(files.pid())
 
 
 def _interrupt_main_thread_once(files: _StandIn) -> threading.Thread:
