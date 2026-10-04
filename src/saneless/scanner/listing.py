@@ -1,10 +1,11 @@
 """
-List scanners in a short-lived child process that can be killed.
+List scanners, and read a scanner's options, in a child process that can be killed.
 
 libsane can kill the whole process while listing after a saned restart, and a
 listing can hang for minutes inside a blocking C call, so every listing runs
 in a child that has a deadline and is killed and reaped before the listing
-returns.  See docs/explanation/decisions/0002-listing-in-a-child-process.md.
+returns.  A capabilities read, which opens a device and reads its options,
+runs in the same child under the same deadline.  See docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
 The child is started by ``child_launch.start_child``, which every SANE child
 shares.  The device id travels on stdin, never in argv, which any local user
@@ -89,9 +90,28 @@ _CHILD_FILE: Final = Path(__file__).with_name("_listing_child.py")
 _NO_ANSWER: Final = "The scanner library returned no answer while listing scanners"
 _NOT_STARTED: Final = "The scanner library could not be started to list scanners"
 
-_REPLY_KEYS: Final = frozenset({"devices", "list_error", "opened", "open_error"})
+_REPLY_KEYS: Final = frozenset(
+    {
+        "devices",
+        "list_error",
+        "opened",
+        "open_error",
+        "options",
+        "options_error",
+        "init_error",
+    }
+)
 _ERROR_KEYS: Final = frozenset({"type", "message"})
 _DEVICE_FIELDS: Final = 4
+
+# One option is ``[name, kind, values]``: the kind of its constraint, and the
+# constraint's members.  An unconstrained option has no values.
+_OPTION_FIELDS: Final = 3
+_OPTION_KINDS: Final = frozenset({"list", "range", "none"})
+_UNCONSTRAINED: Final = "none"
+
+type OptionValue = str | int | float
+type OptionEntry = tuple[str | None, str, tuple[OptionValue, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +122,13 @@ class ListingRequest:
     Attributes:
         open: A device id to open and close when the listing does not include
             it, or ``None`` to only list.
+        capabilities: A device id whose options to read instead of listing,
+            or ``None`` for a listing.
 
     """
 
     open: str | None = None
+    capabilities: str | None = None
 
     def to_line(self, alarm: int) -> bytes:
         """
@@ -118,7 +141,8 @@ class ListingRequest:
             The request, newline-terminated.
 
         """
-        return json.dumps({"open": self.open, "alarm": alarm}).encode() + b"\n"
+        line = {"open": self.open, "capabilities": self.capabilities, "alarm": alarm}
+        return json.dumps(line).encode() + b"\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +171,14 @@ class ListingReply:
             then empty.
         opened: Whether the requested open worked, or ``None`` when no open
             was attempted.
-        open_error: Why the requested open failed; only present when
-            ``opened`` is ``False``.
+        open_error: Why the requested open failed: beside ``opened`` set to
+            ``False`` for a listing, or alone for a capabilities read.
+        options: One ``(name, kind, values)`` entry per option a capabilities
+            read found, in the device's order, or ``None`` when no options
+            were read.  ``kind`` is ``"list"``, ``"range"`` or ``"none"``.
+        options_error: Why reading the options of an opened device failed.
+        init_error: Why python-sane could not be imported or SANE would not
+            start; the request's own failure keys are reported beside it.
 
     """
 
@@ -156,6 +186,9 @@ class ListingReply:
     list_error: ChildError | None = None
     opened: bool | None = None
     open_error: ChildError | None = None
+    options: tuple[OptionEntry, ...] | None = None
+    options_error: ChildError | None = None
+    init_error: ChildError | None = None
 
     @classmethod
     def from_stdout(cls, out: bytes) -> ListingReply:
@@ -219,15 +252,54 @@ class ListingReply:
             opened = value
         open_error: ChildError | None = None
         if "open_error" in payload:
-            if opened is not False:
+            # A listing's failed open says ``opened: false``; a capabilities
+            # read's failed open has no ``opened`` at all.
+            if opened is True:
                 raise ListingNoAnswerError(_NO_ANSWER)
             open_error = _child_error(payload["open_error"])
+        options, options_error = _capabilities(payload)
+        init_error = (
+            _child_error(payload["init_error"]) if "init_error" in payload else None
+        )
         return cls(
             devices=tuple(_device(device) for device in devices),
             list_error=list_error,
             opened=opened,
             open_error=open_error,
+            options=options,
+            options_error=options_error,
+            init_error=init_error,
         )
+
+
+def _capabilities(
+    payload: dict[str, object],
+) -> tuple[tuple[OptionEntry, ...] | None, ChildError | None]:
+    """
+    Validate a capabilities read's result: its options, or why they failed.
+
+    The two keys exclude each other, and neither sits beside an open or a
+    listing's open result: a capabilities read does nothing else.
+
+    Returns:
+        The options, or ``None``; and the error, or ``None``.
+
+    Raises:
+        ListingNoAnswerError: The keys are combined, or an entry is off-schema.
+
+    """
+    if "options" not in payload and "options_error" not in payload:
+        return None, None
+    if not payload.keys().isdisjoint({"opened", "open_error"}) or (
+        "options" in payload and "options_error" in payload
+    ):
+        raise ListingNoAnswerError(_NO_ANSWER)
+    if "options_error" in payload:
+        return None, _child_error(payload["options_error"])
+    entries = payload["options"]
+    if not isinstance(entries, list):
+        raise ListingNoAnswerError(_NO_ANSWER)
+    return tuple(_option(entry) for entry in entries), None
 
 
 def _device(value: object) -> tuple[str, str, str, str]:
@@ -244,6 +316,37 @@ def _device(value: object) -> tuple[str, str, str, str]:
     if len(value) != _DEVICE_FIELDS or len(fields) != _DEVICE_FIELDS:
         raise ListingNoAnswerError(_NO_ANSWER)
     return (fields[0], fields[1], fields[2], fields[3])
+
+
+def _option(value: object) -> OptionEntry:
+    """
+    Validate one option entry: ``[name, kind, values]``.
+
+    The name is a string or ``None`` (a group heading's); the kind is one of
+    the three constraint kinds; the values are strings or numbers, never
+    booleans, and an unconstrained option has none.
+
+    Raises:
+        ListingNoAnswerError: The entry is any other shape.
+
+    """
+    if not isinstance(value, list) or len(value) != _OPTION_FIELDS:
+        raise ListingNoAnswerError(_NO_ANSWER)
+    name, kind, values = value
+    if name is not None and not isinstance(name, str):
+        raise ListingNoAnswerError(_NO_ANSWER)
+    if not isinstance(kind, str) or kind not in _OPTION_KINDS:
+        raise ListingNoAnswerError(_NO_ANSWER)
+    if not isinstance(values, list):
+        raise ListingNoAnswerError(_NO_ANSWER)
+    members = tuple(
+        member
+        for member in values
+        if isinstance(member, str | int | float) and not isinstance(member, bool)
+    )
+    if len(members) != len(values) or (kind == _UNCONSTRAINED and members):
+        raise ListingNoAnswerError(_NO_ANSWER)
+    return (name, kind, members)
 
 
 def _child_error(value: object) -> ChildError:
@@ -288,7 +391,8 @@ def run_listing_child(
     hide.
 
     Args:
-        request: What to ask the child for beyond the listing.
+        request: What to ask the child for beyond the listing, or instead of
+            it.
         configured_host: The ``scanner.host`` setting, possibly empty.
         abort: Set by another thread to stop the listing part way, or
             ``None`` for a listing only the deadline ends.

@@ -29,11 +29,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 import saneless
+from saneless import thread_unwinder
 from saneless.scanner import _listing_child
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from types import ModuleType
 
 _CHILD_PATH = Path(saneless.__file__).parent / "scanner" / "_listing_child.py"
@@ -56,18 +57,16 @@ _ALLOWED_IMPORTS = frozenset(
         "typing",
         "collections.abc",
         "saneless.scanner._child_stdio",
-        "saneless.thread_unwinder",
     }
 )
 
-# The saneless modules loading the child may pull in: the reply-pipe helper,
-# the thread-unwinder loader, and the two packages above them, whose
-# ``__init__`` files import nothing.
+# The saneless modules loading the child may pull in: the reply-pipe helper
+# and the two packages above it, whose ``__init__`` files import nothing.  The
+# thread-unwinder loader is not one of them: ``main`` imports it late.
 _SANELESS_MODULES_LOADED = [
     "saneless",
     "saneless.scanner",
     "saneless.scanner._child_stdio",
-    "saneless.thread_unwinder",
 ]
 
 
@@ -164,7 +163,7 @@ class _OptionsDevice:
 
     def __init__(
         self,
-        options: list[tuple[object, ...]],
+        options: Sequence[tuple[object, ...]],
         *,
         options_error: Exception | None = None,
         closing_error: Exception | None = None,
@@ -608,13 +607,24 @@ def test_main_reports_a_missing_python_sane_as_init_error(
     )
 
     reply = json.loads(reply_channel.getvalue())
+    error = reply.get("init_error")
     assert status == 0
-    assert reply["init_error"]["type"] == "ModuleNotFoundError"
-    assert reply == {
-        "devices": [],
-        "list_error": reply["init_error"],
-        "init_error": reply["init_error"],
-    }
+    assert reply == {"devices": [], "list_error": error, "init_error": error}
+    assert error["type"] == "ModuleNotFoundError"
+
+
+def test_the_child_loads_the_unwinder_through_saneless_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child's late import reaches saneless's own unwinder loader."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        thread_unwinder, "load_thread_unwinder", lambda: calls.append("loaded")
+    )
+
+    _listing_child.load_thread_unwinder()
+
+    assert calls == ["loaded"]
 
 
 def test_main_loads_the_unwinder_before_python_sane(
