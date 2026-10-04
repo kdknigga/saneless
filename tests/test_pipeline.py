@@ -26,6 +26,7 @@ import pikepdf
 import pytest
 from PIL import Image, ImageColor, ImageDraw
 
+import saneless.duplex as duplex_module
 import saneless.flip as flip_module
 import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
@@ -131,6 +132,7 @@ from tests.multi_page_support import ScriptedPassCoordinator
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+    from types import ModuleType
     from typing import BinaryIO
 
     from saneless.config import Settings
@@ -7388,16 +7390,27 @@ class TestTitleLogEscaping:
             assert word in message
 
     @pytest.mark.source_structure
-    def test_no_logger_call_quotes_a_percent_s_placeholder(self) -> None:
+    @pytest.mark.parametrize(
+        "module",
+        [pipeline_module, duplex_module, flip_module, preservation_module],
+        ids=["pipeline", "duplex", "flip", "preservation"],
+    )
+    def test_no_logger_call_quotes_a_percent_s_placeholder(
+        self, module: ModuleType
+    ) -> None:
         """
-        No ``logger`` call in the pipeline formats input into a quoted ``'%s'``.
+        No ``logger`` call in these modules quotes a ``'%s'`` placeholder.
 
         A source-level guard rather than a behaviour one: it catches a new
         call site that quotes its own placeholder, which no per-call test
         would notice. Only the format constants of logger calls are read, so
         a comment or docstring can neither satisfy nor break it.
+
+        Args:
+            module: The pipeline or one of the modules holding the code it runs.
+
         """
-        source = Path(pipeline_module.__file__).read_text(encoding="utf-8")
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
 
         assert _quoted_percent_s_logger_calls(source) == []
 
