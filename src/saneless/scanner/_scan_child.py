@@ -22,9 +22,12 @@ child.  ``restart`` restarts SANE (``restarted``); ``exit``, and ``stop`` or
 feeder is reported as a non-fatal ``error`` and the child stays ready; any
 other failure is a fatal ``error`` and the child ends.
 
-The reply channel is private: before anything else runs, the child moves the
-parent's stdout pipe to a descriptor of its own and points fd 1 at stderr, so
-a backend's C stdio cannot write into a frame.  One lock serialises every
+The reply channel is private: before the thread unwinder, python-sane or any
+SANE call is loaded or run, the child moves the parent's stdout pipe to a
+descriptor of its own and points fd 1 at stderr, so a backend's C stdio
+cannot write into a frame.  The modules this file imports at load time
+(saneless's own, and Pillow) run first, while fd 1 is still the pipe; none of
+them writes to stdout or opens a descriptor when imported.  One lock serialises every
 write to it.  A page whose pixels fail part way leaves the channel mid-page,
 where any later frame would be read as pixels, so nothing more is written to
 it.
