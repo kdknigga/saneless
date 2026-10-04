@@ -6,6 +6,7 @@ import ast
 import dataclasses
 import gc
 import importlib
+import importlib.util
 import inspect
 import logging
 import math
@@ -17,6 +18,7 @@ import threading
 import time
 import types
 import weakref
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, cast
 
@@ -6305,7 +6307,6 @@ class TestSaneBoundary:
         self, module: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A missing python-sane is a one-line ConfigError with the install hint."""
-        monkeypatch.setattr(scan_session_mod, "sane", None)
         monkeypatch.setitem(sys.modules, module, None)
 
         with pytest.raises(ConfigError) as exc_info:
@@ -6332,23 +6333,26 @@ class TestSaneBoundary:
             "No module named 'sane'"
         )
 
-    def test_require_sane_does_not_load_the_library(
+    def test_require_sane_looks_up_both_modules_without_loading_them(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        An installed python-sane passes even when loading it would fail.
+        python-sane and its extension are each looked up by spec, and passed.
 
-        Loading python-sane loads libsane, which is a child's job; a missing
-        ``libsane.so`` is found by the first child instead.
+        Looking a module up finds it without running it; loading python-sane
+        loads libsane, which is a child's job.
         """
+        looked_up: list[str] = []
 
-        def _load() -> NoReturn:
-            msg = "require_sane loaded python-sane"
-            raise AssertionError(msg)
+        def found(name: str, package: str | None = None) -> ModuleSpec:
+            del package
+            looked_up.append(name)
+            return ModuleSpec(name, loader=None)
 
-        monkeypatch.setattr(scan_session_mod, "_ensure_sane", _load)
+        monkeypatch.setattr(importlib.util, "find_spec", found)
 
         assert sane_backend_mod.require_sane() is None
+        assert looked_up == ["sane", "_sane"]
 
     def test_an_unloadable_libsane_is_reported_by_the_first_scan(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
@@ -6395,16 +6399,6 @@ class TestSaneBoundary:
         assert "configuration file" not in next_step
         assert "config file" not in next_step
         assert "restart" not in next_step.lower()
-
-    def test_require_sane_keeps_an_already_loaded_module(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """With sane already bound, require_sane() returns and replaces nothing."""
-        module = FakeSaneModule()
-        monkeypatch.setattr(scan_session_mod, "sane", module)
-
-        assert sane_backend_mod.require_sane() is None
-        assert scan_session_mod.sane is module
 
     def test_ensure_sane_returns_the_patched_module(
         self, monkeypatch: pytest.MonkeyPatch
