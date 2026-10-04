@@ -506,8 +506,6 @@ def _status_token(request: Request, context: Mapping[str, object]) -> str:
     """
     Hash what a status poll would show this viewer, as the poll's ``seen`` token.
 
-    Hash what a status poll would show this viewer, as the poll's ``seen`` token.
-
     The rendered bytes are hashed, not a chosen set of facts, so every change
     the viewer can see moves the token.  It hashes the canonical *poll*
     rendering, never the calling route's own: an action's extras would make its
