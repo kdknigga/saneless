@@ -6,11 +6,11 @@ Accepted, 2026-10-03.
 
 ## Context
 
-The scan worker's configured profiles change while the server runs: start-up profile generation swaps in a generated set, and a reload can replace them. Request threads and the worker thread read them concurrently, and some readers, such as the pipeline on the worker thread, take the mapping once and use it without holding the lock.
+The scan worker's configured profiles change at most once while the server runs, when start-up profile generation swaps in a generated set. Request threads and the worker thread read them concurrently, and some readers, such as the pipeline on the worker thread, take the mapping once and use it without holding the lock.
 
 ## Decision
 
-`saneless.worker` rebinds the profiles in exactly one place. It copies the new set into a fresh dict, refuses a set without a `default` profile, and assigns the new dict under the profiles lock, with an optional check on the current settings run under the same lock.
+`saneless.worker` rebinds the profiles in exactly one place, `ScanWorker._set_profiles`, and start-up profile generation is its only caller. It copies the new set into a fresh dict, refuses a set without a `default` profile, and assigns the new dict under the profiles lock.
 
 The invariant: the profiles mapping is replaced wholesale under the lock and never mutated in place, so a reader outside the lock sees either the old or the new mapping.
 
