@@ -915,7 +915,7 @@ class _SelfClosingCommands(io.FileIO):
         return line
 
 
-class _ThreadChild:
+class ThreadChild:
     """
     A ``ChildProcess`` whose process is the scan child's ``main`` on a thread.
 
@@ -927,8 +927,16 @@ class _ThreadChild:
     the child's control thread and any write it is blocked in, and failing
     the test if ``main`` still does not return.
 
+    A real child that has ended stays a zombie until it is reaped, by a
+    ``poll`` or ``wait`` that returns its status or by ``kill_and_reap``, so
+    this child records when the code under test reaps it in one of those
+    ways.  A child whose pipes were closed but which was never reaped has
+    ended here, as a real one would have, but was never reaped.
+
     Attributes:
         exits: Every status the child asked its process to exit with.
+        reaped: Whether a ``poll``, ``wait`` or ``kill_and_reap`` has
+            returned the child's status.
 
     """
 
@@ -937,6 +945,7 @@ class _ThreadChild:
         command_read, self._command_fd = os.pipe()
         self._reply_fd, reply_write = os.pipe()
         self.exits: list[int] = []
+        self.reaped = False
         self._status: list[int] = []
         self._closed: set[int] = set()
         runtime = ChildRuntime(
@@ -991,6 +1000,7 @@ class _ThreadChild:
         """
         if self._thread.is_alive():
             return None
+        self.reaped = True
         return self._status[0] if self._status else 1
 
     def wait(self, timeout: float) -> int | None:
@@ -1024,6 +1034,7 @@ class _ThreadChild:
         if self._thread.is_alive():
             msg = "the in-process scan child did not end when it was killed"
             raise AssertionError(msg)
+        self.reaped = True
         return -signal.SIGKILL if exited is None else exited
 
     def close(self) -> None:
@@ -1047,7 +1058,7 @@ class ScanChildSeam:
     def __init__(self) -> None:
         """Start with no children recorded."""
         self.launches: list[str] = []
-        self.children: list[_ThreadChild] = []
+        self.children: list[ThreadChild] = []
 
 
 @pytest.fixture(autouse=True)
@@ -1078,9 +1089,11 @@ def scan_child_seam(
     Tests marked ``sane_hardware`` exist to drive real libsane, and are left
     alone.
 
-    Every child the seam started must have ended by the end of the test, as
-    a real one must be reaped before the scanner gate is released: one still
-    running fails the test, after it is ended and its pipes are closed.
+    Every child the seam started must have been reaped by the code under
+    test by the end of the test, as a real one must be reaped before the
+    scanner gate is released.  That is read before the seam touches any
+    child itself, since its own ``poll`` would count as the reap; a child
+    never reaped fails the test, after it is ended and its pipes are closed.
 
     Args:
         monkeypatch: Undoes the replacement after the test.
@@ -1090,7 +1103,7 @@ def scan_child_seam(
         The record of every scan child the seam started.
 
     Raises:
-        AssertionError: A child was still running when the test ended.
+        AssertionError: A child was never reaped by the code under test.
 
     """
     seam = ScanChildSeam()
@@ -1108,7 +1121,7 @@ def scan_child_seam(
         )
         if not library_patched:
             raise AssertionError(_NO_REAL_LIBSANE)
-        child = _ThreadChild()
+        child = ThreadChild()
         seam.children.append(child)
         return child
 
@@ -1116,13 +1129,12 @@ def scan_child_seam(
         sane_backend_mod, "_launch_scan_child", launch_in_process, raising=False
     )
     yield seam
-    unreaped = [child for child in seam.children if child.poll() is None]
+    unreaped = [child for child in seam.children if not child.reaped]
     for child in seam.children:
-        if child in unreaped:
-            child.kill_and_reap()
+        child.kill_and_reap()
         child.close()
     if unreaped:
-        msg = f"{len(unreaped)} scan child(ren) left running by the test"
+        msg = f"{len(unreaped)} scan child(ren) never reaped by the code under test"
         raise AssertionError(msg)
 
 

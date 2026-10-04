@@ -28,6 +28,7 @@ from PIL import Image, ImageDraw
 import saneless
 import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
+import saneless.scanner._scan_child as scan_child_main
 import saneless.scanner.base as scanner_base
 import saneless.scanner.options as options_mod
 import saneless.scanner.page_budget as page_budget_mod
@@ -62,6 +63,7 @@ from saneless.scanner.base import (
 from saneless.scanner.listing import ListingReply, ListingRequest
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.scanner.scan_child import ScanChildSession
+from saneless.scanner.scan_protocol import LENGTH_PREFIX, Configured
 from saneless.scanner.scan_session import GeometryUnit
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
@@ -69,6 +71,7 @@ from saneless.vocabulary import (
     PYTHON_SANE_INSTALL_NEXT_STEP,
     ScanStage,
     python_sane_missing_message,
+    scan_child_no_answer_error,
     scan_page_description,
 )
 from tests.conftest import (
@@ -92,8 +95,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
 
-    from saneless.scanner.scan_child import ChildProcess
-    from tests.conftest import ListingSeam, ScanChildSeam
+    from saneless.scanner.scan_protocol import Frame
+    from tests.conftest import ListingSeam, ScanChildSeam, ThreadChild
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
@@ -571,18 +574,21 @@ class TestSaneBackendConstruction:
         assert fake_sane_module.init_call_count == 0
 
 
-def _child_ended(child: ChildProcess) -> bool:
+def _child_ended(child: ThreadChild) -> bool:
     """
-    Tell whether an in-process scan child has exited and been reaped.
+    Tell whether the code under test has reaped an in-process scan child.
+
+    The child's own record is read, not ``poll``, which would reap it here.
 
     Args:
         child: A child the seam started.
 
     Returns:
-        Whether its main has returned.
+        Whether a ``poll``, ``wait`` or kill of the session's returned its
+        status.
 
     """
-    return child.poll() is not None
+    return child.reaped
 
 
 class TestScanSession:
@@ -662,6 +668,41 @@ class TestScanSession:
             backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
         assert len(scan_child_seam.children) == 1
+        assert _child_ended(scan_child_seam.children[0])
+
+    def test_a_child_that_sends_an_unreadable_reply_is_killed_and_reaped(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """
+        A reply off the schema kills the still-running child, which is reaped.
+
+        The child goes on with its pass after the bad reply, so the session
+        must kill it, not only close its pipes, and reap it before the error
+        reaches the caller.
+        """
+        _ = fake_sane_module
+        real_encode = scan_child_main.encode_frame
+
+        def garbled_configured(frame: Frame) -> bytes:
+            if isinstance(frame, Configured):
+                body = b"not a frame"
+                return LENGTH_PREFIX.pack(len(body)) + body
+            return real_encode(frame)
+
+        monkeypatch.setattr(scan_child_main, "encode_frame", garbled_configured)
+        session = ScanChildSession(lambda: sane_backend_mod._launch_scan_child(""))
+
+        with pytest.raises(ScanError) as failed:
+            session.scan_pass("test:0", _flatbed_settings(), page_sink)
+
+        assert str(failed.value) == scan_child_no_answer_error(
+            ScanStage.CONFIGURE, None
+        )
+        assert session.children_killed == 1
         assert _child_ended(scan_child_seam.children[0])
 
     def test_a_nested_session_is_refused(
