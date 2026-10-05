@@ -6,19 +6,20 @@ Install saneless directly on a Linux host with a SANE-compatible scanner.
 
 - A Linux system (Debian/Ubuntu, Fedora/RHEL/Rocky, Arch, or Alpine)
 - Python 3.14 or later
+- Git: pip fetches saneless from its GitHub repository, and runs `git` to do it
 - A SANE-compatible scanner accessible via `saned` on the network or locally via USB
 - A running paperless-ngx instance with an API token: paperless-ngx 2.16 or later, which speaks API version 9 or 10. An older paperless-ngx refuses every upload with `406`, and the status strip reports `incompatible_version`
 
-## Step 1: Install SANE development headers
+## Step 1: Install Git and the SANE development headers
 
-saneless depends on `python-sane`, which compiles against SANE's C library. Install the development headers for your distribution:
+saneless depends on `python-sane`, which compiles against SANE's C library, and is installed from GitHub, which needs `git`. Install both for your distribution:
 
 | Distribution | Command |
 |---|---|
-| Debian / Ubuntu | `sudo apt-get install libsane-dev` |
-| Fedora / RHEL / Rocky | `sudo dnf install sane-backends-devel` |
-| Arch | `sudo pacman -S sane` |
-| Alpine | `apk add sane-dev` |
+| Debian / Ubuntu | `sudo apt-get install git libsane-dev` |
+| Fedora / RHEL / Rocky | `sudo dnf install git sane-backends-devel` |
+| Arch | `sudo pacman -S git sane` |
+| Alpine | `apk add git sane-dev` |
 
 ## Step 2: Install saneless
 

@@ -26,7 +26,7 @@ sudo dnf install sane-backends-devel
 ## Install
 
 saneless is not yet published on PyPI, so this installs the current default
-branch from GitHub:
+branch from GitHub, which needs `git` as well as the SANE package above:
 
 ```bash
 pip install git+https://github.com/kdknigga/saneless
