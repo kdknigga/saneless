@@ -23,6 +23,7 @@ files. The two are equal in every supported deployment.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 from typing import TYPE_CHECKING
 
@@ -72,7 +73,7 @@ def _refusal(path: Path, key: str, problem: str) -> ConfigError:
     msg = (
         f"{key} {path} {problem}, so another local user could read or replace "
         f"the scans kept there. Use a directory you own that nobody else can "
-        f"write to: run `chmod 700 {path}` if it is yours, remove it so saneless "
+        f"write to: run `chmod 700 {shlex.quote(str(path))}` if it is yours, remove it so saneless "
         f"creates it privately, or set {key} to another directory."
     )
     return ConfigError(
@@ -158,7 +159,7 @@ def ensure_private_dir(path: Path, *, key: str) -> None:
     except OSError as exc:
         msg = (
             f"{key} {path} could not be created: {describe(exc)}. Create it "
-            f"yourself with `mkdir -m 700 {path}`, or set {key} to another "
+            f"yourself with `mkdir -m 700 {shlex.quote(str(path))}`, or set {key} to another "
             f"directory."
         )
         raise ConfigError(
