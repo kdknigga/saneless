@@ -311,3 +311,31 @@ class TestCheckPrivateDir:
         assert next_step is not None
         assert _KEY in next_step
         assert str(target) not in next_step
+
+
+class TestFixItCommandsQuoteThePath:
+    """A fix-it command in a refusal is safe to paste whatever the path holds."""
+
+    def test_a_refusal_quotes_a_path_with_a_space_in_its_chmod(
+        self, tmp_path: Path
+    ) -> None:
+        """``chmod 700`` gets the path as one shell word, not two."""
+        target = tmp_path / "my scans"
+        _world_writable(target)
+        with pytest.raises(ConfigError) as caught:
+            check_private_dir(target, key=_KEY)
+        assert f"chmod 700 '{target}'" in str(caught.value)
+
+    def test_a_failed_creation_quotes_a_path_with_a_space_in_its_mkdir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``mkdir -m 700`` gets the path as one shell word, not two."""
+        target = tmp_path / "my scans"
+
+        def refuse(_path: Path) -> None:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(private_dirs_module, "make_private_dir", refuse)
+        with pytest.raises(ConfigError) as caught:
+            ensure_private_dir(target, key=_KEY)
+        assert f"mkdir -m 700 '{target}'" in str(caught.value)

@@ -124,6 +124,20 @@ def _runtime_saneless_imports(source: str) -> list[str]:
             [],
             id="type-checking-only",
         ),
+        pytest.param(
+            "import typing\n"
+            "if typing.TYPE_CHECKING:\n"
+            "    from saneless.config import Settings\n",
+            [],
+            id="typing-dot-type-checking",
+        ),
+        pytest.param(
+            "import flags\n"
+            "if flags.TYPE_CHECKING:\n"
+            "    from saneless.config import Settings\n",
+            ["saneless.config"],
+            id="another-modules-type-checking-runs",
+        ),
     ],
 )
 def test_the_import_reader_finds_runtime_imports_only(
