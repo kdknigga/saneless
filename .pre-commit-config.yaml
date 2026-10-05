@@ -46,7 +46,10 @@ repos:
         stages: [pre-commit, pre-merge-commit, pre-push]
       - id: debug-statements
         stages: [pre-commit, pre-merge-commit, pre-push]
+      # Without a credentials file (CI, a fresh checkout) the hook exits 2 instead
+      # of scanning; the flag keeps it scanning for keys either way.
       - id: detect-aws-credentials
+        args: [--allow-missing-credentials]
         stages: [pre-commit, pre-merge-commit, pre-push]
       - id: detect-private-key
         stages: [pre-commit, pre-merge-commit, pre-push]
