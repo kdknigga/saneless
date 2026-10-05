@@ -245,7 +245,7 @@ the scanner. The line gives the import's own reason and names the package to ins
 2. Reinstall saneless so python-sane is built against it.
 
 `saneless jobs` and `--help` on any command do not need python-sane and keep working. See
-[Install on Bare Metal](install-bare-metal.md#step-1-install-sane-development-headers).
+[Install on Bare Metal](install-bare-metal.md#step-1-install-git-and-the-sane-development-headers).
 
 ## Paperless errors (exit 3)
 

@@ -108,7 +108,7 @@ The SANE development headers are missing. Install the package for your distribut
 
 **saneless says python-sane cannot be imported**
 
-`scan`, `devices`, `auto-profiles` and `serve` each exit with code 2 at once, printing a line with the reason the import failed and an install hint naming the missing SANE development package, then a `Try:` line saying to install it and reinstall saneless. python-sane is missing, or it cannot load the SANE library. Install the package from [Step 1](#step-1-install-sane-development-headers) and reinstall saneless. `saneless jobs` and `--help` keep working meanwhile.
+`scan`, `devices`, `auto-profiles` and `serve` each exit with code 2 at once, printing a line with the reason the import failed and an install hint naming the missing SANE development package, then a `Try:` line saying to install it and reinstall saneless. python-sane is missing, or it cannot load the SANE library. Install the package from [Step 1](#step-1-install-git-and-the-sane-development-headers) and reinstall saneless. `saneless jobs` and `--help` keep working meanwhile.
 
 **"No scanners found"**
 
