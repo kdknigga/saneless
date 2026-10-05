@@ -38,7 +38,12 @@ def _is_type_checking_guard(node: ast.If) -> bool:
     test = node.test
     if isinstance(test, ast.Name):
         return test.id == "TYPE_CHECKING"
-    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    return (
+        isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name)
+        and test.value.id == "typing"
+    )
 
 
 def _runtime_saneless_imports(source: str) -> list[str]:
