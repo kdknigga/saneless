@@ -7,7 +7,7 @@
 
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     # The container port is fixed at 8080; output.web_port does not move it. If
     # 8080 is taken on the host, change the LEFT half -- "8888:8080".
     ports:

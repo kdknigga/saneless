@@ -1122,7 +1122,7 @@ wheels = [
 
 [[package]]
 name = "saneless"
-version = "0.2.0rc6"
+version = "0.2.0rc7"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

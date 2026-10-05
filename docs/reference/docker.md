@@ -6,7 +6,7 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 
 | Property | Value |
 |----------|-------|
-| Image | `ghcr.io/kdknigga/saneless:0.2.0-rc.6` |
+| Image | `ghcr.io/kdknigga/saneless:0.2.0-rc.7` |
 | Base | `python:3.14-slim` |
 | Entrypoint | `saneless` |
 | Default command | `serve` |
@@ -55,7 +55,7 @@ gets depends on whether it is a final release or a release candidate:
 | Tag | Example | Published for | Moves? |
 |-----|---------|---------------|--------|
 | `X.Y.Z` | `0.2.0` | every final release | Never. It always names that release. |
-| `X.Y.Z-rc.N` | `0.2.0-rc.6` | every release candidate | Never. It always names that candidate. |
+| `X.Y.Z-rc.N` | `0.2.0-rc.7` | every release candidate | Never. It always names that candidate. |
 | `X.Y` | `0.2` | final releases only | Yes. It moves to each new patch release of that minor version. |
 | `latest` | `latest` | final releases only | Yes. It moves to the newest final release. |
 
@@ -305,7 +305,7 @@ Keep the token in `config/saneless.toml` and out of the compose
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -343,7 +343,7 @@ the container's own host, or another one:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -378,7 +378,7 @@ Mount the file read-only over the image's own copy:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -408,7 +408,7 @@ avahi-daemon to ask. Prefer the explicit `device` line.
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     stop_grace_period: 90s
     ports:
       - "8080:8080"

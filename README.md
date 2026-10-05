@@ -56,7 +56,7 @@ docker run -d --name saneless -p 8080:8080 \
   -v "$(pwd)/config:/etc/saneless" \
   -v saneless-data:/var/lib/saneless \
   -e SANELESS_SCANNER__HOST=192.168.1.50 \
-  ghcr.io/kdknigga/saneless:0.2.0-rc.6
+  ghcr.io/kdknigga/saneless:0.2.0-rc.7
 ```
 
 - The container reads `/etc/saneless/saneless.toml` from the mounted `config` directory. Keep the directory writable by UID 1000, the user the container runs as, so saneless can save the profiles it generates there.
