@@ -1,20 +1,24 @@
 """
 Tests for PDF assembly module.
 
-``assemble_pdf`` takes ``PageRecord``s now, not images: the spool has already
+``assemble_pdf`` takes ``PageRecord``s, not images: the spool has already
 written every page as a PNG, and that file is what img2pdf embeds, losslessly
-and with no second encode (D-03). So the pages these tests assemble are spooled
+and with no second encode. So the pages these tests assemble are spooled
 through a real ``SpooledPageSink`` into a real directory, and the assertions
 about what assembly left behind are scoped to the *output* directory -- which
 is deliberately not the spool, because the spooled pages are supposed to
 survive assembly untouched.
 """
 
+import errno
+import logging
 import os
 import re
-import struct
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -24,7 +28,7 @@ import pytest
 from PIL import Image
 
 import saneless.pdf as pdf_mod
-from saneless.exceptions import PdfError
+from saneless.exceptions import DiskSpaceError, PdfError
 from saneless.paper_sizes import crop_to_paper_size
 from saneless.pdf import (
     assemble_pdf,
@@ -33,9 +37,11 @@ from saneless.pdf import (
 )
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.spool import SpooledPageSink
+from saneless.vocabulary import ErrorCategory, classify_error
+from tests.golden_support import embedded_streams, png_idat
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from saneless.scanner.base import PageRecord
 
@@ -54,6 +60,11 @@ HOSTILE_TITLES = [
     "~/.ssh/authorized_keys",
 ]
 
+# The document title every assembly here is given, for the tests that are not
+# about the title itself.  ``assemble_pdf`` requires one: it is written into
+# the PDF's ``/Info`` dictionary.
+_TITLE = "Assembly test"
+
 JOB_A = "aaaaaaaa-1111-2222-3333-444444444444"
 JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
 
@@ -62,11 +73,6 @@ JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
 # anywhere the suite can run, and it is still a real check rather than a
 # disabled one.
 _TEST_RESERVE_MB = 1
-
-# A PNG file opens with an 8-byte signature; chunks follow it, each one a
-# 4-byte length, a 4-byte type, that many payload bytes and a 4-byte CRC.
-_PNG_SIGNATURE_LENGTH = 8
-_PNG_CHUNK_OVERHEAD = 12
 
 # Every error class img2pdf 0.6.3 defines.  Each is a direct ``Exception``
 # subclass with no shared base, which is why the boundary cannot catch a tuple.
@@ -103,9 +109,9 @@ def _rounded_media_box(page: pikepdf.Page) -> list[int]:
     """
     Read a page's MediaBox as four whole points.
 
-    Rounding is not incidental: the true A4-at-300-DPI box is 595.2 x 841.92,
-    and 595.2 x 841.68 for what ``crop_to_paper_size`` actually produces, so an
-    exact comparison against 595 x 842 would never hold.
+    Rounding is not incidental: A4 itself is 595.28 x 841.89 points, and the
+    2480 x 3508 raster ``crop_to_paper_size`` produces at 300 DPI lays out as
+    595.2 x 841.92, so an exact comparison against 595 x 842 would never hold.
 
     Args:
         page: The page whose MediaBox to read.
@@ -116,29 +122,6 @@ def _rounded_media_box(page: pikepdf.Page) -> list[int]:
     """
     box = pikepdf.Rectangle(page.mediabox)
     return [round(box.llx), round(box.lly), round(box.urx), round(box.ury)]
-
-
-def _embedded_streams(pdf_path: Path) -> list[bytes]:
-    """
-    Read each PDF page's single embedded image stream, in page order.
-
-    Raw rather than decoded: img2pdf passes a suitable PNG's compressed pixel
-    data straight through, so the raw stream is directly comparable with the
-    spooled PNG's own IDAT payload.
-
-    Args:
-        pdf_path: The assembled PDF to read.
-
-    Returns:
-        One raw stream per page, in the order the pages appear.
-
-    """
-    streams: list[bytes] = []
-    with pikepdf.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            (image,) = pikepdf.Page(page).get_images().values()
-            streams.append(image.read_raw_bytes())
-    return streams
 
 
 def _media_boxes(pdf_path: Path) -> list[tuple[float, float, float, float]]:
@@ -159,35 +142,6 @@ def _media_boxes(pdf_path: Path) -> list[tuple[float, float, float, float]]:
     with pikepdf.open(pdf_path) as pdf:
         boxes = [pikepdf.Rectangle(page.mediabox) for page in pdf.pages]
     return [(box.llx, box.lly, box.urx, box.ury) for box in boxes]
-
-
-def _png_idat_payload(png_path: Path) -> bytes:
-    """
-    Concatenate a PNG's IDAT chunk payloads -- the compressed pixel data.
-
-    This is the strongest available statement of D-03's "the spooled PNG is
-    exactly what img2pdf embeds": for a non-interlaced, non-alpha PNG img2pdf
-    copies the IDAT payload into the PDF stream untouched, so this byte string
-    must come back out of the assembled PDF verbatim. Decoding either side
-    would only prove the two images look alike, which a re-encode would also
-    satisfy.
-
-    Args:
-        png_path: The spooled page to read.
-
-    Returns:
-        Every IDAT payload in the file, concatenated in file order.
-
-    """
-    raw = png_path.read_bytes()
-    payload = bytearray()
-    offset = _PNG_SIGNATURE_LENGTH
-    while offset < len(raw):
-        (length,) = struct.unpack(">I", raw[offset : offset + 4])
-        if raw[offset + 4 : offset + 8] == b"IDAT":
-            payload += raw[offset + 8 : offset + 8 + length]
-        offset += length + _PNG_CHUNK_OVERHEAD
-    return bytes(payload)
 
 
 def _recording_convert(calls: list[dict[str, object]]) -> Callable[..., object]:
@@ -249,6 +203,30 @@ class _FailingJob:
         raise pikepdf.PdfError(msg)
 
 
+_FAR_FROM_UTC_ZONE = "Pacific/Kiritimati"
+_FAR_FROM_UTC_OFFSET_SECONDS = 14 * 3600
+
+
+@pytest.fixture
+def far_from_utc_zone() -> Iterator[None]:
+    """
+    Run the test with the process's local time fourteen hours ahead of UTC.
+
+    The zone is applied with ``time.tzset`` and re-applied after ``TZ`` is
+    restored, so no later test sees it. The offset is checked, so a missing
+    zone database cannot quietly leave the test running in UTC.
+    """
+    with pytest.MonkeyPatch.context() as zone:
+        zone.setenv("TZ", _FAR_FROM_UTC_ZONE)
+        time.tzset()
+        try:
+            assert time.localtime().tm_gmtoff == _FAR_FROM_UTC_OFFSET_SECONDS
+            yield
+        finally:
+            zone.undo()
+            time.tzset()
+
+
 @pytest.fixture
 def spool_dir(tmp_path: Path) -> Path:
     """
@@ -303,7 +281,7 @@ def spool_pages(spool_dir: Path) -> Callable[[Sequence[Image.Image]], list[PageR
 
     def _spool(images: Sequence[Image.Image]) -> list[PageRecord]:
         """Spool every image and return the records the sink produced."""
-        return [sink.add(image) for image in images]
+        return [sink.add(image, dpi=300) for image in images]
 
     return _spool
 
@@ -329,7 +307,9 @@ class TestAssemblePdf:
         self, one_page: list[PageRecord], output_dir: Path
     ) -> None:
         """A single spooled page produces a valid PDF file."""
-        pdf_path = assemble_pdf(one_page, output_dir, filename="single.pdf", dpi=300)
+        pdf_path = assemble_pdf(
+            one_page, output_dir, filename="single.pdf", title=_TITLE
+        )
 
         assert pdf_path.exists()
         assert pdf_path.stat().st_size > 0
@@ -350,8 +330,10 @@ class TestAssemblePdf:
             ]
         )
 
-        single_pdf = assemble_pdf(records[:1], output_dir, filename="one.pdf", dpi=300)
-        multi_pdf = assemble_pdf(records, output_dir, filename="many.pdf", dpi=300)
+        single_pdf = assemble_pdf(
+            records[:1], output_dir, filename="one.pdf", title=_TITLE
+        )
+        multi_pdf = assemble_pdf(records, output_dir, filename="many.pdf", title=_TITLE)
 
         assert multi_pdf.stat().st_size > single_pdf.stat().st_size
 
@@ -362,20 +344,17 @@ class TestAssemblePdf:
         output_dir: Path,
     ) -> None:
         """
-        D-03: assembly re-saves nothing -- it embeds the spooled PNG itself.
+        Assembly re-saves nothing -- it embeds the spooled PNG itself.
 
-        The deleted code wrote a ``page_NNNN.png`` copy of every page into a
-        ``TemporaryDirectory`` under ``output_dir`` and handed img2pdf those.
-        Three facts together say it is gone: no PNG of any name survives
-        anywhere under the output directory, the output directory holds nothing
-        but the PDF, and the spool still holds exactly the pages that were
-        spooled, byte for byte.
+        No PNG of any name exists anywhere under the output directory, the
+        output directory holds nothing but the PDF, and the spool still holds
+        exactly the pages that were spooled, byte for byte.
         """
         images = [Image.new("RGB", (100, 100), colour) for colour in ("white", "red")]
         records = spool_pages(images)
         before = {record.path.name: record.path.read_bytes() for record in records}
 
-        assemble_pdf(records, output_dir, filename="embedded.pdf", dpi=300)
+        assemble_pdf(records, output_dir, filename="embedded.pdf", title=_TITLE)
 
         assert list(output_dir.rglob("*.png")) == []
         assert sorted(path.name for path in output_dir.rglob("*")) == ["embedded.pdf"]
@@ -396,14 +375,16 @@ class TestAssemblePdf:
         before = sorted(path.name for path in spool_dir.iterdir())
 
         with pytest.raises(PdfError, match="fake img2pdf error"):
-            assemble_pdf(one_page, output_dir, filename="boom.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, filename="boom.pdf", title=_TITLE)
 
         assert list(output_dir.rglob("*.png")) == []
         assert sorted(path.name for path in spool_dir.iterdir()) == before
 
     def test_output_path(self, one_page: list[PageRecord], output_dir: Path) -> None:
         """Output PDF is written to the specified directory with .pdf extension."""
-        pdf_path = assemble_pdf(one_page, output_dir, filename="named.pdf", dpi=300)
+        pdf_path = assemble_pdf(
+            one_page, output_dir, filename="named.pdf", title=_TITLE
+        )
 
         assert isinstance(pdf_path, Path)
         assert pdf_path.parent == output_dir
@@ -416,7 +397,7 @@ class TestAssemblePdf:
         output_dir: Path,
     ) -> None:
         """
-        Reversing the records reverses the PDF, with no sort and no glob (D-02).
+        Reversing the records reverses the PDF, with no sort and no glob.
 
         The spooled names are unchanged between the two assemblies, so a
         directory listing cannot tell the two PDFs apart -- only the record
@@ -429,25 +410,27 @@ class TestAssemblePdf:
             ]
         )
 
-        forward = assemble_pdf(records, output_dir, filename="fwd.pdf", dpi=300)
+        forward = assemble_pdf(records, output_dir, filename="fwd.pdf", title=_TITLE)
         backward = assemble_pdf(
-            list(reversed(records)), output_dir, filename="rev.pdf", dpi=300
+            list(reversed(records)),
+            output_dir,
+            filename="rev.pdf",
+            title=_TITLE,
         )
 
-        assert _embedded_streams(forward) == list(reversed(_embedded_streams(backward)))
+        assert embedded_streams(forward) == list(reversed(embedded_streams(backward)))
 
 
 class TestBoundedAssembly:
     """
-    D-03 as amended: one convert per page, then a qpdf merge.
+    One convert per page, then a qpdf merge.
 
     ``img2pdf.convert`` reads every input fully into memory and finalises the
     whole document before ``outputstream`` is written, so a single convert is
-    linear in page count whether it streams or not (measured: 1395 MB and
-    787 MB respectively at 48 pages). Converting one page at a time and merging
-    the single-page PDFs with qpdf measured flat at 131 MB for both 12 and 48
-    pages. These tests hold that shape in place and prove the merged document
-    is not a different document.
+    linear in page count whether it streams or not.  Converting one page at a
+    time and merging the single-page PDFs with qpdf is flat in page count.
+    These tests hold that shape in place and prove the merged document is not
+    a different document.
     """
 
     def test_merge_produces_one_page_per_record_in_record_order(
@@ -464,12 +447,14 @@ class TestBoundedAssembly:
             ]
         )
 
-        pdf_path = assemble_pdf(records, output_dir, filename="merged.pdf", dpi=300)
+        pdf_path = assemble_pdf(
+            records, output_dir, filename="merged.pdf", title=_TITLE
+        )
 
         with pikepdf.open(pdf_path) as pdf:
             assert len(pdf.pages) == 3
-        assert _embedded_streams(pdf_path) == [
-            _png_idat_payload(record.path) for record in records
+        assert embedded_streams(pdf_path) == [
+            png_idat(record.path.read_bytes()) for record in records
         ]
 
     def test_convert_runs_once_per_page_with_an_outputstream(
@@ -488,7 +473,7 @@ class TestBoundedAssembly:
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _recording_convert(calls))
 
-        assemble_pdf(records, output_dir, filename="perpage.pdf", dpi=300)
+        assemble_pdf(records, output_dir, filename="perpage.pdf", title=_TITLE)
 
         assert len(calls) == len(records)
         assert [call["images"] for call in calls] == [
@@ -512,19 +497,22 @@ class TestBoundedAssembly:
         argvs: list[list[str]] = []
         monkeypatch.setattr(pdf_mod.pikepdf, "Job", _recording_job(argvs))
 
-        pdf_path = assemble_pdf(records, output_dir, filename="job.pdf", dpi=300)
+        pdf_path = assemble_pdf(records, output_dir, filename="job.pdf", title=_TITLE)
 
         assert len(argvs) == 1
         (argv,) = argvs
         assert argv[0] == "qpdf"
-        assert "--empty" in argv
         assert "--pages" in argv
         assert argv[-1] == str(pdf_path)
-        # T-29-29: every input named in the argv is a file this call created
+        # Every input named in the argv is a file this call created
         # inside its own scratch directory under the output directory.
         singles = argv[argv.index("--pages") + 1 : argv.index("--")]
         assert len(singles) == len(records)
         assert all(Path(single).is_relative_to(output_dir) for single in singles)
+        # The primary input is the first single-page PDF, not ``--empty``:
+        # qpdf keeps the primary input's /Info, and an empty primary has none.
+        assert "--empty" not in argv
+        assert argv[1] == singles[0]
 
     def test_merge_matches_a_single_convert_pdf(
         self,
@@ -536,8 +524,8 @@ class TestBoundedAssembly:
         The merged document is the single-convert document, page for page.
 
         Same page count, the same exact MediaBox on every page, and the same
-        embedded image stream bytes -- which is what makes the amendment a
-        change of memory profile rather than a change of output.
+        embedded image stream bytes, so merging per page changes the memory
+        profile, not the output.
         """
         records = spool_pages(
             [
@@ -547,11 +535,10 @@ class TestBoundedAssembly:
             ]
         )
 
-        merged = assemble_pdf(records, output_dir, filename="merged.pdf", dpi=300)
+        merged = assemble_pdf(records, output_dir, filename="merged.pdf", title=_TITLE)
 
-        # No outputstream here, so convert returns the bytes -- the very
-        # contract whose other half (None when streaming) retired the old
-        # ``pdf_bytes is None`` guard.
+        # No outputstream here, so convert returns the bytes; given one, it
+        # returns None.
         reference_bytes = img2pdf.convert(
             [str(record.path) for record in records],
             layout_fun=img2pdf.get_fixed_dpi_layout_fun((300, 300)),
@@ -560,7 +547,7 @@ class TestBoundedAssembly:
         reference = tmp_path / "single-convert.pdf"
         reference.write_bytes(reference_bytes)
         assert _media_boxes(merged) == _media_boxes(reference)
-        assert _embedded_streams(merged) == _embedded_streams(reference)
+        assert embedded_streams(merged) == embedded_streams(reference)
 
     def test_merge_leaves_no_single_page_pdf_behind(
         self,
@@ -572,7 +559,7 @@ class TestBoundedAssembly:
             [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
         )
 
-        assemble_pdf(records, output_dir, filename="only.pdf", dpi=300)
+        assemble_pdf(records, output_dir, filename="only.pdf", title=_TITLE)
 
         assert sorted(path.name for path in output_dir.rglob("*")) == ["only.pdf"]
 
@@ -592,17 +579,19 @@ class TestBoundedAssembly:
         fronts = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
         backs = SpooledPageSink(spool_dir, _SPOOL_LABEL_B, _TEST_RESERVE_MB)
         records = [
-            fronts.add(Image.new("RGB", (120, 160), "white")),
-            backs.add(Image.new("RGB", (120, 160), "red")),
-            fronts.add(Image.new("RGB", (120, 160), "blue")),
-            backs.add(Image.new("RGB", (120, 160), "green")),
+            fronts.add(Image.new("RGB", (120, 160), "white"), dpi=300),
+            backs.add(Image.new("RGB", (120, 160), "red"), dpi=300),
+            fronts.add(Image.new("RGB", (120, 160), "blue"), dpi=300),
+            backs.add(Image.new("RGB", (120, 160), "green"), dpi=300),
         ]
         assert [record.sequence for record in records] == [1, 1, 2, 2]
 
-        pdf_path = assemble_pdf(records, output_dir, filename="duplex.pdf", dpi=300)
+        pdf_path = assemble_pdf(
+            records, output_dir, filename="duplex.pdf", title=_TITLE
+        )
 
-        assert _embedded_streams(pdf_path) == [
-            _png_idat_payload(record.path) for record in records
+        assert embedded_streams(pdf_path) == [
+            png_idat(record.path.read_bytes()) for record in records
         ]
 
     def test_a_failing_merge_becomes_pdf_error(
@@ -612,10 +601,10 @@ class TestBoundedAssembly:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        EXC-01 is unaffected: the existing broad boundary already covers pikepdf.
+        A failing qpdf merge surfaces as ``PdfError``.
 
         ``Job.run()`` raises pikepdf exception types, which are ordinary
-        ``Exception`` subclasses, so no new ``except`` clause was needed and the
+        ``Exception`` subclasses, so the broad boundary covers them and the
         message keeps its shape -- the page count and the target path.
         """
         records = spool_pages(
@@ -624,7 +613,7 @@ class TestBoundedAssembly:
         monkeypatch.setattr(pdf_mod.pikepdf, "Job", _FailingJob)
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(records, output_dir, "boom.pdf", dpi=300)
+            assemble_pdf(records, output_dir, "boom.pdf", title=_TITLE)
 
         message = str(excinfo.value)
         assert message.startswith(
@@ -632,6 +621,172 @@ class TestBoundedAssembly:
         )
         assert message.endswith("fake qpdf merge failure")
         assert isinstance(excinfo.value.__cause__, pikepdf.PdfError)
+
+
+_REAL_JOB = pikepdf.Job
+
+
+class _RecoveringJob:
+    """
+    A real ``pikepdf.Job`` that reports qpdf warnings once it has run.
+
+    qpdf exits 3 when it repaired something on the way through, and the only
+    honest way to produce that here without a hand-damaged input is to run the
+    real merge and then say it warned. The PDF is therefore a real one, so the
+    test can also prove the path is still returned.
+    """
+
+    def __init__(self, argv: list[str]) -> None:
+        """Build the real job over the argv assembly supplied."""
+        self._job = _REAL_JOB(argv)
+
+    def run(self) -> None:
+        """Run the real merge."""
+        self._job.run()
+
+    @property
+    def has_warnings(self) -> bool:
+        """
+        Report that qpdf warned, as it does when it recovers a damaged input.
+
+        Returns:
+            Always True.
+
+        """
+        return True
+
+
+class TestDocumentInfo:
+    """
+    The assembled PDF describes itself, and a recovered merge is not silent.
+
+    Without ``/Info`` a document in paperless-ngx has no producer to trace it
+    back to and no embedded title, and a qpdf merge that had to repair its
+    input would look exactly like a clean one.
+    """
+
+    def test_title_and_producer_are_written(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+    ) -> None:
+        """``/Title`` is the title given, unicode included; ``/Producer`` names us."""
+        records = spool_pages([Image.new("RGB", (100, 100), "white")])
+        title = "Tax — 2026 Übersicht"
+
+        pdf_path = assemble_pdf(records, output_dir, filename="x.pdf", title=title)
+
+        with pikepdf.open(pdf_path) as pdf:
+            docinfo = pdf.docinfo
+            assert str(docinfo["/Title"]) == title
+            producer = str(docinfo["/Producer"])
+        assert producer.startswith("saneless ")
+        assert producer == f"saneless {version('saneless')}"
+
+    def test_a_missing_distribution_never_fails_an_assembly(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Run from a source tree, the version is unknown and the scan still works.
+
+        The version is resolved once at import, falling back to a bare
+        ``saneless``, so a missing distribution never becomes a PdfError inside
+        assembly's catch-all.
+        """
+
+        def not_installed(_name: str) -> str:
+            raise PackageNotFoundError(_name)
+
+        monkeypatch.setattr(pdf_mod, "version", not_installed)
+        records = spool_pages([Image.new("RGB", (100, 100), "white")])
+
+        pdf_path = assemble_pdf(records, output_dir, filename="x.pdf", title="t")
+
+        assert pdf_path.is_file()
+        assert pdf_mod._producer() == "saneless"
+
+    def test_a_merged_document_keeps_its_info_and_no_extra_page(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+    ) -> None:
+        """
+        Three pages in, three pages out, and the metadata survives the merge.
+
+        The first single-page PDF is qpdf's primary input so that its ``/Info``
+        is kept; the primary input's own page must not appear a second time.
+        """
+        records = spool_pages(
+            [
+                Image.new("RGB", (120, 160), colour)
+                for colour in ("white", "red", "blue")
+            ]
+        )
+
+        pdf_path = assemble_pdf(
+            records, output_dir, filename="three.pdf", title="Three pages"
+        )
+
+        with pikepdf.open(pdf_path) as pdf:
+            assert len(pdf.pages) == len(records)
+            assert str(pdf.docinfo["/Title"]) == "Three pages"
+        assert embedded_streams(pdf_path) == [
+            png_idat(record.path.read_bytes()) for record in records
+        ]
+
+    def test_a_merge_with_qpdf_warnings_is_logged_once(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A qpdf exit 3 becomes one WARNING naming the page count and the path."""
+        records = spool_pages(
+            [
+                Image.new("RGB", (120, 160), colour)
+                for colour in ("white", "red", "blue")
+            ]
+        )
+        monkeypatch.setattr(pdf_mod.pikepdf, "Job", _RecoveringJob)
+        caplog.set_level(logging.WARNING, logger=pdf_mod.logger.name)
+
+        pdf_path = assemble_pdf(
+            records, output_dir, filename="warned.pdf", title=_TITLE
+        )
+
+        assert pdf_path == output_dir / "warned.pdf"
+        assert pdf_path.exists()
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == "saneless.pdf" and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert f"{len(records)} page(s)" in message
+        assert str(pdf_path) in message
+
+    def test_a_clean_merge_logs_no_warning(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Without qpdf warnings, assembly says nothing at WARNING."""
+        records = spool_pages([Image.new("RGB", (120, 160), "white")])
+        caplog.set_level(logging.WARNING, logger=pdf_mod.logger.name)
+
+        assemble_pdf(records, output_dir, filename="clean.pdf", title=_TITLE)
+
+        assert [
+            record
+            for record in caplog.records
+            if record.name == "saneless.pdf" and record.levelno >= logging.WARNING
+        ] == []
 
 
 # The flat-memory proof, run in a child process because the thing being
@@ -646,17 +801,16 @@ _MEMORY_PAGE_HEIGHT = 1200
 _MEMORY_SMALL_PAGES = 4
 _MEMORY_LARGE_PAGES = 16
 _RGB_BANDS = 3
-# ru_maxrss is reported in kilobytes on Linux (getrusage(2)); every other
-# figure in this test is in bytes, so the conversion happens exactly once.
-_RU_MAXRSS_UNIT_BYTES = 1024
-# A bounded wait, not a sleep (TEST-02).  Measured at 0.9 s and 3.0 s for the
-# two runs, so 20 s is slack rather than a limit, and two of them still leave
-# the test far inside pytest-timeout's 60 s.
+# VmHWM is reported in kilobytes (proc(5)); every other figure in this test is
+# in bytes, so the conversion happens exactly once.
+_VMHWM_UNIT_BYTES = 1024
+# A bounded wait, not a sleep.  Each run takes a few seconds, so 20 s is
+# slack rather than a limit, and two of them still leave the test far inside
+# pytest-timeout's 60 s.
 _MEMORY_CHILD_TIMEOUT_SECONDS = 20
 
 _MEMORY_CHILD_SOURCE = """\
 import os
-import resource
 from pathlib import Path
 
 import pikepdf
@@ -679,14 +833,17 @@ for _ in range(page_count):
     # One page decoded at a time: the parent is measuring assembly, so the
     # spooling phase must not be what sets the high-water mark.
     image = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
-    records.append(sink.add(image))
+    records.append(sink.add(image, dpi=300))
     del image
 
-pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", 300)
+pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", title="memory")
 with pikepdf.open(pdf_path) as pdf:
     assembled_pages = len(pdf.pages)
 
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+status = Path("/proc/self/status").read_text(encoding="ascii")
+peak = next(
+    int(line.split()[1]) for line in status.splitlines() if line.startswith("VmHWM:")
+)
 print(f"pages={assembled_pages} peak_kib={peak}")
 """
 
@@ -695,15 +852,9 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
     """
     Spool and assemble ``page_count`` pages in a child, and read its peak RSS.
 
-    Every argv element is a literal and the per-run values travel in the
-    environment, exactly as ``test_atomic_write._run_in_mount_namespace`` does.
-    That is not decoration: ``sys.executable`` sitting in the argv is the one
-    thing that takes the call off ruff's S603 allow-list, and this project adds
-    no suppressions. ``shell=False`` throughout -- the shell is an explicit
-    program running an explicit literal, with nothing interpolated into it.
-
-    ``saneless`` is installed editable, so the child's imports resolve from
-    ``sys.executable`` alone with no ``PYTHONPATH`` fiddling.
+    The per-run values travel in the environment, where the child reads them.
+    The child inherits this process's environment, ``PYTHONPATH`` included,
+    so it imports the same ``saneless`` the test does.
 
     Args:
         script: The child source, already written to disk.
@@ -716,15 +867,13 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
     """
     env = {
         **os.environ,
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_SCRIPT": str(script),
         "SANELESS_TEST_PAGES": str(page_count),
         "SANELESS_TEST_WIDTH": str(_MEMORY_PAGE_WIDTH),
         "SANELESS_TEST_HEIGHT": str(_MEMORY_PAGE_HEIGHT),
         "SANELESS_TEST_WORKSPACE": str(workspace),
     }
     completed = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_SCRIPT"'],
+        [sys.executable, str(script)],
         env=env,
         capture_output=True,
         text=True,
@@ -738,22 +887,19 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
 
 
 class TestAssemblyMemory:
-    """HARD-01's memory sentence, measured rather than asserted."""
+    """Assembly memory is flat in page count, measured rather than asserted."""
 
     def test_peak_memory_is_flat_in_page_count(self, tmp_path: Path) -> None:
         """
         Assembling four times as many pages does not cost four times the RAM.
 
-        Measured the way RESEARCH.md Finding 3 measured it: peak
-        ``ru_maxrss`` in a child process. ``tracemalloc`` is unusable for this
-        -- a 26 MB Pillow image adds 460 bytes to its traced total, because the
-        pixels are malloc'd in C -- and in-process measurement has no honest
-        peak anyway once an earlier test has already grown the heap.
-
-        The same measurement against the single-convert implementation grew
-        from 454 MB at 12 pages to 1395 MB at 48, and to 787 MB with
-        ``outputstream=`` alone; the per-page-plus-qpdf path measured flat at
-        131 MB for both. A regression to either of the old shapes fails here.
+        The child's peak resident memory, ``VmHWM``, is read in the child.
+        ``tracemalloc`` cannot see Pillow's pixels, which are malloc'd in C,
+        and in-process measurement has no honest peak once an earlier test has
+        grown the heap.  ``ru_maxrss`` is no better: it keeps the parent's
+        resident peak across the exec, so a light child reports the test
+        runner's peak instead of its own.  An assembly that holds every page
+        until it finishes, as a single convert does, grows past the budget.
         """
         script = tmp_path / "measure_assembly_memory.py"
         script.write_text(_MEMORY_CHILD_SOURCE, encoding="utf-8")
@@ -764,18 +910,19 @@ class TestAssemblyMemory:
         assert small["pages"] == _MEMORY_SMALL_PAGES
         assert large["pages"] == _MEMORY_LARGE_PAGES
 
-        # The budget is derived, not chosen: it is exactly what the extra
-        # pages weigh decoded, so exceeding it means assembly was holding
-        # them.  A linear assembly holds each page's compressed bytes *and*
-        # the whole finished document, so it overshoots this by about 2x.
+        # The budget is derived, not chosen: half of what the extra pages
+        # weigh decoded.  Noise does not compress, so an assembly that keeps
+        # each finished page alive grows by about their full decoded size,
+        # twice the budget, while the per-page path stays flat.
         decoded_page_bytes = _MEMORY_PAGE_WIDTH * _MEMORY_PAGE_HEIGHT * _RGB_BANDS
         extra_pages = _MEMORY_LARGE_PAGES - _MEMORY_SMALL_PAGES
-        budget_bytes = decoded_page_bytes * extra_pages
-        growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _RU_MAXRSS_UNIT_BYTES
+        budget_bytes = decoded_page_bytes * extra_pages // 2
+        growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _VMHWM_UNIT_BYTES
 
         assert growth_bytes < budget_bytes, (
             f"peak grew {growth_bytes} bytes over {extra_pages} extra pages, "
-            f"which is not less than the {budget_bytes} bytes they decode to"
+            f"which is not less than the {budget_bytes} bytes, half of what "
+            "they decode to"
         )
 
 
@@ -783,11 +930,10 @@ class TestPdfBoundary:
     """
     ``assemble_pdf`` is a module boundary that raises only ``PdfError``.
 
-    M-17 and D-04: img2pdf raises seven unrelated error classes plus bare
-    ``Exception``, ``TypeError`` and ``ValueError``, and Pillow raises
-    ``OSError`` and ``SystemError`` while a page is read.  Each must surface as
-    ``PdfError`` carrying the original text, with the original chained on
-    ``__cause__`` (Phase 28 success criterion 1).
+    img2pdf raises seven unrelated error classes plus bare ``Exception``,
+    ``TypeError`` and ``ValueError``, and Pillow raises ``OSError`` and
+    ``SystemError`` while a page is read.  Each surfaces as ``PdfError``
+    carrying the original text, with the original chained on ``__cause__``.
     """
 
     @pytest.mark.parametrize(
@@ -807,7 +953,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
 
         with pytest.raises(PdfError, match="boom from img2pdf") as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert excinfo.value.__cause__ is original
         assert not isinstance(excinfo.value, error_cls)
@@ -828,7 +974,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
 
         with pytest.raises(PdfError, match=str(original)) as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert excinfo.value.__cause__ is original
 
@@ -845,7 +991,7 @@ class TestPdfBoundary:
         one_page[0].path.write_bytes(b"not a PNG at all")
 
         with pytest.raises(PdfError, match="cannot read input image") as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert isinstance(excinfo.value.__cause__, img2pdf.ImageOpenError)
 
@@ -857,7 +1003,7 @@ class TestPdfBoundary:
         blocker.write_text("a regular file where the directory should be")
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(one_page, blocker / "out", "x.pdf", dpi=300)
+            assemble_pdf(one_page, blocker / "out", "x.pdf", title=_TITLE)
 
         assert isinstance(excinfo.value.__cause__, OSError)
         assert str(blocker / "out" / "x.pdf") in str(excinfo.value)
@@ -868,11 +1014,11 @@ class TestPdfBoundary:
         output_dir: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-08: the one-line message names the page count and the PDF path."""
+        """The one-line message names the page count and the PDF path."""
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(ValueError("valued")))
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         message = str(excinfo.value)
         assert message.startswith(
@@ -883,7 +1029,7 @@ class TestPdfBoundary:
     def test_empty_page_list_is_refused_before_img2pdf(
         self, output_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """EXC-03: an empty list never reaches img2pdf's empty-list ValueError."""
+        """An empty list never reaches img2pdf's empty-list ValueError."""
         calls: list[object] = []
 
         def fake_convert(*args: object, **_kwargs: object) -> bytes:
@@ -893,7 +1039,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", fake_convert)
 
         with pytest.raises(PdfError, match="no pages"):
-            assemble_pdf([], output_dir, "x.pdf", dpi=300)
+            assemble_pdf([], output_dir, "x.pdf", title=_TITLE)
 
         assert calls == []
 
@@ -907,7 +1053,103 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(KeyboardInterrupt()))
 
         with pytest.raises(KeyboardInterrupt):
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+
+class _FullDiskJob:
+    """A ``pikepdf.Job`` stand-in whose merge runs out of disk space."""
+
+    def __init__(self, argv: list[str]) -> None:
+        """Accept and keep the argv a real ``pikepdf.Job`` would be given."""
+        self.argv = argv
+
+    def run(self) -> NoReturn:
+        """Fail with pikepdf's own type, raised from the disk's ``ENOSPC``."""
+        msg = "fake qpdf write failure"
+        full = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        raise pikepdf.PdfError(msg) from full
+
+
+class TestAssemblyOutOfSpace:
+    """A full disk while assembling is disk space; anything else stays PDF."""
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    def test_img2pdf_out_of_space_is_a_disk_space_error(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        code: int,
+    ) -> None:
+        """A page write the disk has no room for names the page count and path."""
+        original = OSError(code, os.strerror(code))
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 1 page(s) into {output_dir / 'x.pdf'}: "
+        )
+        assert os.strerror(code) in message
+        assert excinfo.value.__cause__ is original
+        assert not isinstance(excinfo.value, PdfError)
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
+
+    def test_a_merge_raised_from_a_full_disk_is_a_disk_space_error(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The disk's errno is found under the merge's own exception type."""
+        records = spool_pages(
+            [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
+        )
+        monkeypatch.setattr(pdf_mod.pikepdf, "Job", _FullDiskJob)
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(records, output_dir, "full.pdf", title=_TITLE)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 2 page(s) into {output_dir / 'full.pdf'}: "
+        )
+        assert isinstance(excinfo.value.__cause__, pikepdf.PdfError)
+
+    def test_a_bad_image_is_not_a_disk_space_error(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Any other failure is still the PDF writer's."""
+        monkeypatch.setattr(
+            pdf_mod.img2pdf, "convert", _raising(ValueError("bad image"))
+        )
+
+        with pytest.raises(PdfError, match="bad image") as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+
+    def test_a_disk_space_error_passes_through_unwrapped(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Like ``PdfError``, saneless's own disk-space error is not re-wrapped."""
+        original = DiskSpaceError("Insufficient disk space")
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        assert excinfo.value is original
 
 
 class TestSanitiseTitleForFilename:
@@ -1017,11 +1259,21 @@ class TestBuildPdfFilename:
         assert "-.pdf" not in name
         assert name.endswith(".pdf")
 
+    @pytest.mark.usefixtures("far_from_utc_zone")
     def test_starts_with_a_utc_timestamp(self) -> None:
-        """The name is sortable: a YYYYmmdd-HHMMSS prefix leads it."""
+        """
+        The name is sortable: a UTC ``YYYYmmdd-HHMMSS`` prefix leads it.
+
+        The local zone is fourteen hours ahead of UTC, so a stamp taken in
+        local time falls far outside the window around the call.
+        """
+        before = datetime.now(tz=UTC).replace(microsecond=0)
         name = build_pdf_filename(JOB_A, "Tax Return")
+        after = datetime.now(tz=UTC).replace(microsecond=0)
 
         assert re.match(r"^\d{8}-\d{6}-", name), name
+        stamp = datetime.strptime(name[:15], "%Y%m%d-%H%M%S").replace(tzinfo=UTC)
+        assert before <= stamp <= after, (name, before, after)
 
     @pytest.mark.parametrize("hostile", HOSTILE_TITLES)
     def test_whole_name_stays_inside_its_directory(
@@ -1051,9 +1303,20 @@ class TestBuildPdfFilename:
 
         assert len(name.encode()) <= 143
 
+    def test_a_long_title_keeps_the_part_that_tells_two_halves_apart(self) -> None:
+        """Past the title's cap, "(fronts)" and "(backs)" still name two files."""
+        title = "An Unusually Long Title For A Two Sided Stack Of Tax Paperwork 2026"
+
+        fronts = build_pdf_filename(JOB_A, title, part="(fronts)")
+        backs = build_pdf_filename(JOB_A, title, part="(backs)")
+
+        assert fronts.endswith("-fronts.pdf"), fronts
+        assert backs.endswith("-backs.pdf"), backs
+        assert len(build_pdf_filename(JOB_A, "x" * 500, part="(partial)")) <= 143
+
 
 class TestMediaBox:
-    """Page geometry: a page scanned at N DPI must declare N DPI (OUTC-06)."""
+    """Page geometry: a page scanned at N DPI declares N DPI."""
 
     def test_a4_at_300_dpi_is_an_a4_page(
         self,
@@ -1063,41 +1326,25 @@ class TestMediaBox:
         """An exact A4 raster at 300 DPI yields a 595 x 842 pt MediaBox."""
         # Rounded, never compared exactly: the true value is 595.2 x 841.92.
         records = spool_pages([Image.new("RGB", (2480, 3508), "white")])
-        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", dpi=300)
+        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
 
         assert box == [0, 0, 595, 842]
 
-    def test_a4_page_is_not_the_unlayouted_default(
-        self,
-        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
-        output_dir: Path,
-    ) -> None:
-        """The layout function is provably in play, not passing by accident."""
-        # img2pdf.default_dpi is 96, so an unlayouted 2480 x 3508 raster
-        # becomes 1860 x 2631 pt.  Seeing that means no layout_fun was passed.
-        records = spool_pages([Image.new("RGB", (2480, 3508), "white")])
-        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", dpi=300)
-
-        with pikepdf.open(pdf_path) as pdf:
-            box = _rounded_media_box(pdf.pages[0])
-
-        assert box != [0, 0, 1860, 2631]
-
     def test_cropped_a4_also_rounds_to_a4(
         self,
         spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
         output_dir: Path,
     ) -> None:
-        """What crop_to_paper_size really produces is 2480 x 3507, and still A4."""
-        # int(297 * 300 / 25.4) == 3507, so the exact box is 595.2 x 841.68.
+        """What crop_to_paper_size really produces is 2480 x 3508, and still A4."""
+        # round(297 * 300 / 25.4) == 3508, so the exact box is 595.2 x 841.92.
         cropped = crop_to_paper_size(Image.new("RGB", (2600, 3700), "white"), "a4", 300)
-        assert cropped.size == (2480, 3507)
+        assert cropped.size == (2480, 3508)
 
         records = spool_pages([cropped])
-        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", dpi=300)
+        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -1109,7 +1356,7 @@ class TestMediaBox:
         spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
         output_dir: Path,
     ) -> None:
-        """A fixed-DPI layout applies unconditionally, page by page."""
+        """Pages sharing a dpi share its scale: points follow the pixel count."""
         records = spool_pages(
             [
                 Image.new("RGB", (2480, 3508), "white"),
@@ -1117,7 +1364,7 @@ class TestMediaBox:
                 Image.new("RGB", (1240, 1754), "white"),
             ]
         )
-        pdf_path = assemble_pdf(records, output_dir, filename="mixed.pdf", dpi=300)
+        pdf_path = assemble_pdf(records, output_dir, filename="mixed.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             boxes = [_rounded_media_box(page) for page in pdf.pages]
@@ -1126,3 +1373,38 @@ class TestMediaBox:
         assert boxes[1] == [0, 0, 595, 842]
         # Half the pixels at the same DPI is half the page, not a rescaled A4.
         assert boxes[2] == [0, 0, 298, 421]
+
+    def test_a_page_is_laid_out_at_its_own_records_dpi(
+        self, spool_dir: Path, output_dir: Path
+    ) -> None:
+        """
+        An A4 raster read back at 150 dpi is an A4 page, 595.2 x 841.92.
+
+        The dpi comes from the record and from nowhere else: nothing passes
+        one to ``assemble_pdf``.
+        """
+        sink = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+        record = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+
+        pdf_path = assemble_pdf([record], output_dir, filename="x.pdf", title="t")
+
+        assert _media_boxes(pdf_path) == [
+            pytest.approx((0.0, 0.0, 595.2, 841.92)),
+        ]
+
+    def test_each_page_uses_its_own_dpi(
+        self, spool_dir: Path, output_dir: Path
+    ) -> None:
+        """Two rasters of one size at 150 and 300 dpi differ in width by 2x."""
+        sink = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+        coarse = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+        fine = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=300)
+
+        pdf_path = assemble_pdf(
+            [coarse, fine], output_dir, filename="mixed-dpi.pdf", title=_TITLE
+        )
+
+        boxes = _media_boxes(pdf_path)
+        assert boxes[0][2] == pytest.approx(2 * boxes[1][2])
+        assert boxes[0][3] == pytest.approx(2 * boxes[1][3])
+        assert boxes[1] == pytest.approx((0.0, 0.0, 297.6, 420.96))

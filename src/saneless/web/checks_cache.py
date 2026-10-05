@@ -6,7 +6,9 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
+
+from saneless.web.throttle import MIN_MANUAL_REFRESH_SECONDS, MinimumInterval
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -15,47 +17,28 @@ if TYPE_CHECKING:
 
 __all__ = ["MIN_MANUAL_REFRESH_SECONDS", "CachedChecks", "CheckCache"]
 
-# The shortest gap between two honoured Refresh clicks.  Two seconds is below
-# the interval a human clicks at -- nobody presses Check again twice in the
-# same two seconds and expects two different answers -- and far above the rate
-# at which a scripted loop is a problem, which is the only case this exists
-# for.  It does not break the Refresh button's promise either: that promise is
-# "do not make somebody wait out a 30 s TTL after plugging the scanner back
-# in", and a 2 s floor leaves it intact.  Deliberately not configurable, and
-# read at call time, so a test can shorten it.
-MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
-
 
 @dataclass(frozen=True, slots=True)
 class CachedChecks:
     """
-    What the cache hands a renderer: the results, when they were taken, and how old.
+    What the cache hands a renderer: the results, when they were taken, and whether stale.
 
-    Frozen for the same reason :class:`~saneless.checks.CheckResult` is frozen.
-    This is a snapshot of probes that have already happened, and the results it
-    carries are a ``tuple``, so nothing between the cache and a template can
-    edit a value the next reader will also see.
-
-    ``results`` is ``None`` only at cold start, before the refresher's first
-    tick -- that is the state the strip renders as ``Checking…`` per row.  It
-    is never ``None`` again afterwards: an expired entry is marked ``stale``
-    and returned unchanged rather than discarded, because the strip's
-    "Paused during scan -- last checked 14:02" needs the previous results *and*
-    their age, and a cache that threw them away could offer neither.
+    Frozen, with a ``tuple`` of results, so nothing between the cache and a
+    template can edit a value the next reader will also see.  ``results`` is
+    ``None`` only before the first store; an expired entry is kept and marked
+    ``stale``, because the strip shows the previous results with their age.
 
     Attributes:
         results: The last results stored, or None before the first store.
         checked_at: The aware wall-clock time of that store, or None.
         stale: True when results exist and are older than the TTL.  False at
             cold start: with nothing stored there is nothing to be stale.
-        age_seconds: How long ago the results were stored, or None.
 
     """
 
     results: tuple[CheckResult, ...] | None
     checked_at: datetime | None
     stale: bool
-    age_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,12 +46,9 @@ class _Entry:
     """One stored set of results with both of its timestamps."""
 
     results: tuple[CheckResult, ...]
-    # The monotonic reading the TTL is measured against.  Monotonic because a
-    # system clock step must not make a fresh entry look an hour old.
+    # Monotonic, so a system clock step cannot make a fresh entry look old.
     stamp: float
-    # The aware wall-clock time the same store happened at.  A separate field
-    # because monotonic readings are meaningless in isolation and the strip
-    # renders an actual time of day; neither one can do the other's job.
+    # The wall-clock time of the same store, which the strip renders.
     checked_at: datetime
 
 
@@ -76,26 +56,11 @@ class CheckCache:
     """
     The status strip's cache: one TTL, one entry, and the previous answer kept.
 
-    The shape is copied from :class:`~saneless.web.cache.MetadataCache` -- a
-    TTL, a timestamp taken at store time, a clock passed to the constructor,
-    and one lock with a comment naming exactly what it guards.  Both caches
-    take the clock as a parameter so their tests advance a float instead of
-    waiting out a TTL, and cost the suite no wall-clock time.  This one
-    deviates from that class in two deliberate ways:
-
-    1. **Its previous answer is always on show.**  ``MetadataCache`` keeps a
-       last good copy too, but hands it out only after a refresh has failed;
-       otherwise an expired entry is a miss.  Here an expired or unrefreshable
-       entry is returned with its results and its wall-clock stamp, marked
-       stale, so the strip can say "Paused during scan -- last checked 14:02"
-       rather than going blank.
-    2. **It is typed to ``CheckResult``,** not ``list[dict[str, object]]``.
-       ``run_checks`` already returns a ``tuple`` of frozen results, so the
-       cached value is immutable all the way down and a renderer cannot mutate
-       what the next renderer will read.
-
-    There is one entry rather than a keyed store: the six checks are run and
-    shown together, so there is nothing to key on.
+    Unlike :class:`~saneless.web.cache.MetadataCache`, which hands out its
+    last good copy only after a refresh has failed, an expired entry here is
+    always returned, marked stale, so the strip never goes blank.  There is one
+    entry rather than a keyed store, because every check is run and shown
+    together.
 
     Args:
         ttl: How many seconds a stored entry counts as fresh.
@@ -105,33 +70,34 @@ class CheckCache:
 
     def __init__(
         self,
-        # 30 seconds is long enough that a reload and a few htmx swaps
-        # never re-probe the network, and short enough that unplugging the
-        # scanner surfaces before the operator gives up; the Refresh button
-        # covers impatience.  A default rather than a module constant, so it is
-        # read at call time and a caller or a test can shorten it.
+        # Long enough that a reload and a few htmx swaps never re-probe, short
+        # enough that an unplugged scanner surfaces quickly.  The default is
+        # bound when the class is defined; a caller or a test that wants
+        # another ttl passes it.
         ttl: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize an empty cache with the given TTL and clock."""
         self._ttl = ttl
         self._clock = clock
-        # Guards every read and every rebind of self._entry and of
-        # self._last_manual_claim, and nothing else; never a probe.  The entry
-        # is a frozen _Entry rebound as a whole, so holding this for the rebind
-        # is what makes "results, stamp and checked_at always belong to the
-        # same store" true for a concurrent reader.  The claim stamp shares it
-        # because its read-and-rebind has to be one step for two request
-        # threads arriving together to get one grant between them; the two
-        # pieces of state are otherwise unrelated.
+        # Guards every read and rebind of self._entry, never a probe.  The
+        # entry is rebound whole, so its results and both stamps always belong
+        # to the same store.
         self._lock = threading.Lock()
         self._entry: _Entry | None = None
-        # When a manual refresh was last granted, or None for "never".  None
-        # rather than 0.0 for the reason CheckRefresher._last_watched is None:
-        # time.monotonic() on Linux counts from boot, so 0.0 would sit inside
-        # the interval and refuse the first click on a freshly booted
-        # appliance -- the one click that certainly deserves a probe.
-        self._last_manual_claim: float | None = None
+        # The manual-refresh floor has its own lock, and reads the clock
+        # through _now so the cache and its floor share one clock.
+        self._manual_floor = MinimumInterval(clock=self._now)
+
+    def _now(self) -> float:
+        """
+        Read this cache's clock at call time.
+
+        Returns:
+            The current monotonic reading of whichever clock the cache holds.
+
+        """
+        return self._clock()
 
     def current(self) -> CachedChecks:
         """
@@ -147,15 +113,12 @@ class CheckCache:
         with self._lock:
             entry = self._entry
         if entry is None:
-            return CachedChecks(
-                results=None, checked_at=None, stale=False, age_seconds=None
-            )
+            return CachedChecks(results=None, checked_at=None, stale=False)
         age = self._clock() - entry.stamp
         return CachedChecks(
             results=entry.results,
             checked_at=entry.checked_at,
             stale=age >= self._ttl,
-            age_seconds=age,
         )
 
     def store(self, results: Sequence[CheckResult]) -> None:
@@ -197,90 +160,34 @@ class CheckCache:
         """
         Say whether a manual refresh may probe right now, and record that it did.
 
-        This is a floor under a deliberate bypass, not a second TTL.  The
-        Refresh button exists precisely to ignore :meth:`is_fresh`, so the TTL
-        cannot bound its cost; without something that can, a click is an
-        unbounded probe.  ``POST /api/checks/refresh`` is unauthenticated by
-        design on a LAN and ``CrossOriginGuard`` allows a request carrying
-        neither ``Sec-Fetch-Site`` nor ``Origin`` -- documented, and exactly
-        what ``curl`` in a loop sends -- so every call issues a Paperless
-        request, up to N saned TCP dials and two filesystem writes.  The worst
-        of that is not the traffic: ``ScanWorker._scan_job`` blocks on a
-        scanner gate that is not a fair lock, so an unbounded loop can park a
-        submitted job whose row already reads ``SCANNING``.
-
-        The claim stamp is deliberately not the entry's own timestamp.
-        Conflating them would let a refused click reset the freshness of
-        results it never produced, and would tie a 2 s floor to a 30 s TTL for
-        no better reason than both being durations.  So a :meth:`store` grants
-        nothing, a grant stores nothing, and an expired entry grants nothing.
-
-        A refusal changes no state.  That matters: if a refusal stamped, a
-        caller hammering the endpoint just inside the interval would hold the
-        floor shut for ever and the household member standing at the appliance
-        would never get their probe.
-
-        The clock is read before the lock is taken, so this never calls out
-        while holding it -- the same discipline the lock's comment states.
+        The Refresh button bypasses :meth:`is_fresh`, and the endpoint is
+        reachable by a scripted LAN client, so without this floor each click is
+        an unbounded probe that can park a submitted scan behind the unfair
+        scanner gate.  The claim stamp is separate from the entry's, so a store
+        grants nothing and a grant stores nothing, and a refusal changes no
+        state, so hammering inside the interval cannot hold the floor shut.
 
         Args:
             min_interval: The shortest gap between two grants, in seconds.
 
         Returns:
             The stamp this grant recorded, which the caller may hand to
-            :meth:`release_manual_claim` to give the grant back, or ``None``
-            when it is too soon to probe.
-
-            The truthiness of that value is not the contract: callers test
-            against ``None``.  A stamp is a ``time.monotonic()`` reading, and
-            on Linux that counts from boot, so 0.0 is a reading a grant can
-            really record and it is falsey.  A caller branching on truthiness
-            would read the first click after a boot as a refusal -- the one
-            click that certainly deserves a probe, for the same reason
-            ``_last_manual_claim`` starts at ``None`` rather than at 0.0.
+            :meth:`release_manual_claim`, or ``None`` when it is too soon to
+            probe.  Test against ``None``: on Linux a monotonic stamp counts
+            from boot, so a real grant can record 0.0.
 
         """
-        now = self._clock()
-        with self._lock:
-            last = self._last_manual_claim
-            if last is not None and now - last < min_interval:
-                return None
-            self._last_manual_claim = now
-            return now
+        return self._manual_floor.claim(min_interval)
 
     def release_manual_claim(self, stamp: float) -> bool:
         """
         Give a granted claim back, because the probe it bought never happened.
 
-        ``POST /api/checks/refresh`` claims before it probes, and it has to:
-        the claim is what decides whether it may probe at all.  But
-        ``CheckRefresher.probe_now`` collapses into an in-flight probe and
-        does nothing, and a click that collapsed spent the floor for no probe
-        -- so the clicker's very next press, inside two seconds, was refused
-        for traffic nobody generated: the button appeared to do nothing, twice
-        in a row.  This hands the claim
-        back on exactly that branch.
-
-        The clear is a compare-and-clear, so a caller can only ever give back
-        its own grant.  The stamp handed in is the one
-        :meth:`claim_manual_refresh` returned; the claim is cleared when that
-        is still the recorded one and left alone when it is not, so a release
-        arriving *after* somebody else's grant is a no-op rather than a hole
-        in the floor.  This used to be an argument instead of a
-        check -- the one caller releases microseconds after its grant on the
-        same thread, and a competing claimer inside that window is refused
-        without writing -- and the argument was true of that call site and of
-        nothing else.  A retry, a second caller, or a handler that grew a
-        second release would each have lowered a floor whose whole job is to
-        bound what an unauthenticated LAN endpoint can make the appliance do.
-
-        It cannot be abused to defeat the floor.  The
-        release happens only where ``probe_now`` returned False, and that
-        branch issued no Paperless request, no saned TCP dial and no
-        filesystem write, so a scripted loop that always collides always gets
-        its claim back and still generates zero probe traffic.  The moment a
-        probe is actually granted, the stamp stands and the next call inside
-        the interval is refused like any other.
+        The refresh route releases only when ``request_probe`` collapsed into
+        a probe already in flight, so a clicker's next press is not refused
+        for traffic nobody generated, and a loop that always collides still
+        generates no probe traffic.  The release is a compare-and-clear, so a
+        caller can give back only its own grant, never somebody else's.
 
         Args:
             stamp: The value :meth:`claim_manual_refresh` returned for the
@@ -291,8 +198,4 @@ class CheckCache:
             is not the recorded one and when no claim is recorded at all.
 
         """
-        with self._lock:
-            if self._last_manual_claim != stamp:
-                return False
-            self._last_manual_claim = None
-            return True
+        return self._manual_floor.release(stamp)

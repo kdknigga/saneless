@@ -1,25 +1,30 @@
-"""Tests for CLI commands via click.testing.CliRunner."""
+"""The saneless commands' output, exit codes and side effects, via CliRunner."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
 import errno
+import hashlib
 import importlib.metadata
+import io
 import json
 import logging
 import logging.handlers
 import os
 import re
+import signal
 import socket
 import sqlite3
+import stat
+import subprocess
 import sys
 import threading
 import time
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NamedTuple, NoReturn
 
 import click
 import pytest
@@ -27,10 +32,19 @@ import tomlkit
 import uvicorn
 from click.testing import CliRunner
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+import saneless.checks as checks_module
 import saneless.cli as cli_module
+import saneless.config as config_module
+import saneless.job as job_module
 import saneless.vocabulary as vocabulary_module
+from saneless.checks import (
+    CheckKey,
+    CheckResult,
+    CheckState,
+)
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     CONFIG_FILENAME,
@@ -39,24 +53,37 @@ from saneless.config import (
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
+    ScannerConfig,
     Settings,
     discover_config,
+    load_settings,
 )
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
+    NoScannerFoundError,
     PaperlessError,
+    PaperlessTrustStoreError,
     PdfError,
     SanelessError,
     ScanCancelledError,
     ScanError,
+    ScanInterrupted,
     StorageError,
 )
-from saneless.job import Job, JobStore
+from saneless.job import Job, JobResult, JobStore
 from saneless.logging_config import configure_logging
-from saneless.paperless import UploadResult
-from saneless.pipeline import PipelineEvent, PipelineRequest
+from saneless.paperless import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
+    ApiDelivery,
+    TaskFiled,
+    UploadResult,
+)
+from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -64,23 +91,59 @@ from saneless.scanner.base import (
     ScannerBackend,
 )
 from saneless.vocabulary import (
+    MULTI_PAGE_NEEDS_TERMINAL,
+    PYTHON_SANE_INSTALL_NEXT_STEP,
+    UNCONFIRMED_FILING_LABEL,
+    UNCONFIRMED_SEND_LABEL,
+    WARNED_UPLOAD_LABEL,
     ErrorCategory,
+    ExitCode,
     FlipOutcome,
     JobState,
+    ScanOutcome,
     error_next_step,
     exit_code_for,
+    job_label,
     local_time,
+    multi_page_manual_duplex_refusal,
+    python_sane_missing_message,
     state_label,
 )
-from tests.conftest import StubScannerBackend, build_settings, scan_batch
+from saneless.web import app as app_module
+from saneless.web import server as server_module
+from saneless.web.app import create_app
+from tests.conftest import (
+    StubScannerBackend,
+    build_settings,
+    leave_killed_workspace,
+    poll_until,
+    scan_batch,
+    services_of,
+)
+from tests.fake_sane import (
+    UNNAMED_OPTION_ENTRIES,
+    FakeSaneDev,
+    FakeSaneError,
+    FakeSaneModule,
+)
+from tests.prompt_support import (
+    FakeClock,
+    broken_read,
+    never_readable,
+    readable,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Generator
+    from collections.abc import AsyncGenerator, Callable, Generator
 
     from click.testing import Result
 
+    from saneless.checks import CheckContext
     from saneless.config import LogLevel
     from saneless.scanner.base import PageSink, ScanSettings
+    from saneless.web.refresher import CheckRefresher
+    from saneless.workspace import RecoveredWorkspace
+    from tests.conftest import ListingSeam, ScanChildSeam
 
 
 def _inked_page() -> Image.Image:
@@ -94,6 +157,34 @@ def _inked_page() -> Image.Image:
     page = Image.new("RGB", (100, 100), "white")
     ImageDraw.Draw(page).rectangle([10, 10, 90, 90], fill="black")
     return page
+
+
+# A warning sentence as the pipeline writes one for a skipped sheet: the row a
+# warned upload leaves behind carries it next to state DONE.
+_WARNED_SENTENCE = (
+    "1 page(s) could not be read by the scanner and were skipped. "
+    "They were not removed for being blank; rescan those sheets."
+)
+
+
+def _clean_scan_result() -> ScanResult:
+    """
+    Build the result of a clean one-page upload, as a faked pipeline returns.
+
+    ``saneless scan`` chooses its outcome line and exit code from what the
+    pipeline returns, so a fake that stands in for it has to return a result.
+
+    Returns:
+        A SUCCESS result with no warning.
+
+    """
+    return ScanResult(
+        outcome=ScanOutcome.SUCCESS,
+        pages_scanned=1,
+        pages_removed=0,
+        pages_uploaded=1,
+        warning=None,
+    )
 
 
 def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -135,7 +226,7 @@ def _patch_cli(
         """
         Return the test settings, recording ``--config`` as load_settings does.
 
-        ``auto-profiles`` writes to ``settings.config_path`` (D-16); a stub that
+        ``auto-profiles`` writes to ``settings.config_path``; a stub that
         dropped the path would send its writes to ``./saneless.toml`` in the
         suite's working directory.
 
@@ -178,11 +269,8 @@ def _patch_cli(
             """
             Mock scanner backend for CLI tests.
 
-            Subclasses the shared conftest stub, which subclasses the ABC, so
-            the type checkers can see the contract at all. This was one of the
-            two CLI stubs that would *not* have failed when ScanBatch replaced
-            the generator in this phase -- every stub that does subclass was
-            caught by the checkers, and the sink switch caught this one.
+            It subclasses the shared conftest stub, which subclasses the ABC, so the
+            type checkers hold it to the backend contract.
 
             Only the two device-reporting methods are local, because these
             tests read the richer device list and capabilities back out of the
@@ -208,19 +296,7 @@ def _patch_cli(
                     sources=["Flatbed", "ADF"],
                     resolutions=[150, 300, 600],
                     modes=["color", "gray"],
-                    raw_options=[
-                        (
-                            0,
-                            "source",
-                            "Source",
-                            "desc",
-                            3,
-                            0,
-                            1,
-                            0,
-                            ["Flatbed", "ADF"],
-                        ),
-                    ],
+                    option_names=("source",),
                 )
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
@@ -239,11 +315,11 @@ def _patch_cli(
                 self, *_args: object, **_kwargs: object
             ) -> UploadResult:
                 """Return a delivered upload result carrying a fake task UUID."""
-                return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
+                return ApiDelivery(task_id="mock-task-uuid")
 
-            def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+            def poll_task(self, *_args: object, **_kwargs: object) -> TaskFiled:
                 """Return a successful task result."""
-                return {"status": "SUCCESS"}
+                return TaskFiled(task={"status": "SUCCESS"})
 
             def close(self) -> None:
                 """No-op close."""
@@ -255,14 +331,13 @@ def _patch_cli(
 
 def _failure_lines(result: Result) -> list[str]:
     """
-    Return a classified failure's stderr with the D-12 advice line removed.
+    Return a classified failure's stderr with the advice line removed.
 
     Every ``SanelessError`` the guard classifies to a code other than
-    ``UNEXPECTED`` now prints two things: Phase 28's locked failure line and
-    the category's ``Try: `` next step (APPL-04, D-12). The tests below were
-    written when there was only the first, and each still means "one failure
-    line and no traceback" -- so the advice line is *asserted* and stripped in
-    one place rather than each assertion being loosened to a substring check.
+    ``UNEXPECTED`` prints two things: the failure line and the category's
+    ``Try: `` next step. The tests below each mean "one failure line and no
+    traceback", so the advice line is *asserted* and stripped in one place
+    rather than each assertion being loosened to a substring check.
 
     Args:
         result: The CliRunner result of a command that failed.
@@ -307,8 +382,8 @@ class TestVersionOption:
     """
     ``saneless --version`` reports the installed distribution version.
 
-    D-03/D-04, DLVR-10. The number comes from ``importlib.metadata``, so
-    ``pyproject.toml`` stays its single source, and the line is click's default
+    The number comes from ``importlib.metadata``, so ``pyproject.toml`` stays
+    its single source, and the line is click's default
     ``%(prog)s, version %(version)s`` with no Python or platform block --
     ``saneless doctor`` already covers the diagnostics such a block would
     duplicate.
@@ -337,7 +412,7 @@ class TestVersionOption:
     def test_version_option_needs_no_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``--version`` loads no settings and configures no logging (CFG-10)."""
+        """``--version`` loads no settings and configures no logging."""
         calls: list[str] = []
 
         def failing_load(*_args: object, **_kwargs: object) -> Settings:
@@ -388,6 +463,84 @@ class TestVersionOption:
         assert "saneless, version" not in result.output
 
 
+class TestScanRecoversOrphanedWorkspaces:
+    """
+    ``saneless scan`` first recovers what a killed scan left in ``tmp_dir``.
+
+    A CLI-only install has no server whose startup would do it, so each scan
+    sweeps before it opens the scanner. The sweep is housekeeping: it never
+    decides whether the scan the operator asked for runs.
+    """
+
+    def test_an_orphan_is_recovered_into_failed_before_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The killed scan's pages become a PDF, then the new scan runs."""
+        runner, settings = _patch_cli(monkeypatch)
+        settings.output.tmp_dir.mkdir(mode=0o700)
+        workspace = leave_killed_workspace(
+            settings.output.tmp_dir, job_id="deadbeef-cli", title="Killed CLI scan"
+        )
+        order: list[str] = []
+        original_sweep = cli_module.sweep_orphans
+        original_backend = cli_module.SaneBackend
+
+        def recording_sweep(
+            tmp_dir: Path, failed_dir: Path, reserve_mb: int
+        ) -> list[RecoveredWorkspace]:
+            order.append("sweep")
+            return original_sweep(tmp_dir, failed_dir, reserve_mb)
+
+        def recording_backend(host: str = "") -> ScannerBackend:
+            order.append("scanner")
+            return original_backend(host=host)
+
+        monkeypatch.setattr(cli_module, "sweep_orphans", recording_sweep)
+        monkeypatch.setattr(cli_module, "SaneBackend", recording_backend)
+        caplog.set_level(logging.WARNING, logger="saneless.workspace")
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Test" in result.output
+        assert order == ["sweep", "scanner"]
+        assert not workspace.exists()
+        (pdf,) = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert pdf.name.endswith("-partial.pdf")
+        assert any(
+            "deadbeef-cli" in record.getMessage() and str(pdf) in record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.workspace"
+        )
+
+    def test_a_failing_sweep_never_fails_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A sweep that raises is logged with its traceback; the scan exits 0."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def failing_sweep(
+            tmp_dir: Path, failed_dir: Path, reserve_mb: int
+        ) -> list[RecoveredWorkspace]:
+            msg = f"could not read {tmp_dir} ({failed_dir}, {reserve_mb} MB)"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_module, "sweep_orphans", failing_sweep)
+        caplog.set_level(logging.WARNING, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Test" in result.output
+        assert any(
+            record.name == "saneless.cli"
+            and record.levelno == logging.WARNING
+            and record.exc_info is not None
+            and "orphaned" in record.getMessage()
+            for record in caplog.records
+        )
+
+
 class TestScanCommand:
     """Scan command tests."""
 
@@ -434,10 +587,11 @@ class TestScanCommand:
             _paperless: object,
             _settings: object,
             request: PipelineRequest,
-        ) -> None:
+        ) -> ScanResult:
             captured.append(request)
             if request.status_callback is not None:
                 request.status_callback(PipelineEvent.DONE)
+            return _clean_scan_result()
 
         monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
         result = runner.invoke(cli, args)
@@ -447,7 +601,7 @@ class TestScanCommand:
     def test_scan_blank_title_uses_the_profile_title(
         self, monkeypatch: pytest.MonkeyPatch, typed: str | None, tmp_path: Path
     ) -> None:
-        """An omitted or blank ``--title`` resolves to the profile's title (D-16)."""
+        """An omitted or blank ``--title`` resolves to the profile's title."""
         args = ["scan", "--profile", "receipt"]
         if typed is not None:
             args += ["--title", typed]
@@ -472,10 +626,49 @@ class TestScanCommand:
         assert request.title == "Typed"
         assert "Done: Typed" in result.output
 
+    def test_scan_files_the_document_with_the_profile_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The command line asks nobody, so the profile's defaults are the answer.
+
+        It has no tag or correspondent option, which is exactly an untouched
+        control: the profile's tags and correspondent apply, as they do for a
+        web form nobody changed.
+        """
+        settings = _make_settings(
+            tmp_path,
+            profiles={
+                "default": ProfileConfig(),
+                "receipts": ProfileConfig.model_validate(
+                    {"default_tags": [3, 7], "default_correspondent": 12}
+                ),
+            },
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            captured.append(request)
+            return _clean_scan_result()
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
+        result = runner.invoke(cli, ["scan", "--profile", "receipts"])
+
+        assert result.exit_code == 0, result.output
+        assert len(captured) == 1
+        assert captured[0].tags == [3, 7]
+        assert captured[0].correspondent == 12
+
     def test_scan_unknown_profile_exits_2_before_title_resolution(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """An unknown profile is still refused with exit 2 and no pipeline run."""
+        """An unknown profile is refused with exit 2 and no pipeline run."""
         result, request = self._capture_title_run(
             monkeypatch, tmp_path, ["scan", "--profile", "nope"]
         )
@@ -484,12 +677,92 @@ class TestScanCommand:
         assert "Unknown profile" in result.output
         assert request is None
 
+    def test_scan_title_longer_than_paperless_keeps_is_a_usage_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A 119-character ``--title`` exits 2 naming the option and 118.
+
+        It is refused before the scanner exists, so no paper moves, and the
+        title is never cut to fit.
+        """
+        constructed: list[str] = []
+
+        class RecordingScanner(StubScannerBackend):
+            """Record that the CLI built a scanner at all."""
+
+            def __init__(self, host: str = "") -> None:
+                """Note the construction."""
+                constructed.append(host)
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=RecordingScanner)
+
+        result = runner.invoke(cli, ["scan", "--title", "x" * 119])
+
+        assert result.exit_code == 2, result.output
+        assert "--title" in result.output
+        assert "118 characters or fewer" in result.output
+        assert constructed == []
+
+    def test_scan_title_of_what_paperless_keeps_runs_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A 118-character ``--title`` reaches the pipeline exactly as typed."""
+        title = "x" * 118
+        result, request = self._capture_title_run(
+            monkeypatch, tmp_path, ["scan", "--title", title]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == title
+
     def test_scan_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan with --title succeeds and shows Done message."""
         runner, _ = _patch_cli(monkeypatch)
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 0
         assert "Done: Test" in result.output
+        assert "Removed as blank" not in result.output
+
+    def test_scan_names_the_pages_removed_as_blank(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Pages 2 and 4 of four are blank: named on stdout after Done, and exit 0.
+
+        Removed pages are not kept anywhere, so this line is how the operator
+        learns which sheets to rescan if a real page was taken for a blank.
+        It is information, not a warning: nothing reaches stderr and the
+        command still exits 0.
+        """
+
+        class BlankBacksScanner(StubScannerBackend):
+            """A feeder whose second and fourth sheets have nothing on them."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
+            def scan_pages(
+                self, device_id: str, settings: ScanSettings, sink: PageSink
+            ) -> ScanBatch:
+                """Spool inked, blank, inked, blank."""
+                blank = Image.new("RGB", (100, 100), "white")
+                records = [
+                    sink.add(page, dpi=settings.resolution)
+                    for page in (_inked_page(), blank, _inked_page(), blank)
+                ]
+                return scan_batch(records, resolution=settings.resolution)
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=BlankBacksScanner)
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.stdout.splitlines()
+        done = lines.index("Done: Test")
+        assert lines[done + 1] == "Removed as blank: pages 2, 4 of 4 scanned."
+        assert "Removed as blank" not in result.stderr
 
     def test_scan_status_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan shows its progress messages in pipeline order."""
@@ -519,7 +792,7 @@ class TestScanCommand:
     def test_scan_config_value_error_exits_5(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bare ValueError while loading is not a saneless type -> exit 5 (D-06)."""
+        """A bare ValueError while loading is not a saneless type -> exit 5."""
         runner = CliRunner()
 
         def bad_load(*_args: object, **_kwargs: object) -> None:
@@ -541,14 +814,9 @@ class TestScanCommand:
             """
             Scanner that always raises ScanError.
 
-            The return type used to be annotated ``-> None`` against an ABC
-            whose scan_pages returns ScanBatch. That annotation was "true"
-            only because the body always raises, and the checkers had nothing
-            to compare it against because the class did not subclass the ABC
-            it was standing in for.
-
-            ``get_devices`` comes from the shared conftest stub, which answers
-            ``[]`` exactly as the local copy did.
+            It subclasses the shared conftest stub, so ``scan_pages`` is checked
+            against the ABC's ``ScanBatch`` return type even though its body only
+            raises. ``get_devices`` comes from that stub and answers ``[]``.
             """
 
             def __init__(self, host: str = "") -> None:
@@ -603,7 +871,7 @@ class TestScanCommand:
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 3
         assert "Server down" in result.output
-        # The scan is not lost when the upload is (OUTC-04), and this pins
+        # The scan is not lost when the upload is, and this pins
         # where it went: this test's own directory, not the shared one.
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
         assert len(preserved) == 1
@@ -613,10 +881,10 @@ class TestScanCommand:
         """Scan --profile photo -> pipeline called with profile_name='photo'."""
         captured: dict[str, object] = {}
 
-        def capturing_pipeline(*args: object, **_kwargs: object) -> dict[str, str]:
+        def capturing_pipeline(*args: object, **_kwargs: object) -> ScanResult:
             """Capture the PipelineRequest from the 4th positional arg."""
             captured["request"] = args[3]
-            return {"status": "SUCCESS"}
+            return _clean_scan_result()
 
         runner, _ = _patch_cli(monkeypatch)
         monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
@@ -631,19 +899,16 @@ class TestScanCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        WR-09: the CLI mints a job id, so a same-second rescan cannot overwrite.
+        The CLI mints a job id, so a same-second rescan cannot overwrite.
 
-        ``build_pdf_filename`` rests its whole collision argument on the job
-        id -- "uniqueness comes from the job id, not from the timestamp" -- and
-        ``saneless scan`` supplied none, so every CLI run composed
-        ``{timestamp}-{title-slug}.pdf``.  Preservation moves onto an explicit
-        destination path, which overwrites silently, so two scans of one title
-        landing in the same second destroyed one of them.
+        ``build_pdf_filename`` takes uniqueness from the job id, not from the
+        timestamp, and preservation writes to an explicit destination path that
+        overwrites silently. Without a job id two scans of one title in the same
+        second would land on one file.
 
-        The two runs are driven back to back in one second, which is the case
-        the timestamp alone cannot separate; asserting on the *files* rather
-        than on the request's ``job_id`` is what makes this a test of the
-        guarantee and not of the implementation.
+        The two runs are driven back to back in one second, and the assertion is
+        on the *files* rather than on the request's ``job_id``, so it tests the
+        guarantee rather than the implementation.
         """
 
         class FailPaperless:
@@ -686,11 +951,13 @@ _DUPLEX_PROFILE = "duplex"
 # sentence so a rewording of the tail does not break the ordering checks.
 _FLIP_PROMPT_FRAGMENT = "Flip the stack"
 
-# The one line an operator's abort at the flip prompt prints (D-03, N-08).
+# The one line an operator's abort at the flip prompt prints.
 _FLIP_CANCEL_LINE = "Manual duplex scan cancelled at the flip prompt"
 
 
-def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Settings:
+def _duplex_settings(
+    tmp_path: Path, operator_wait_timeout_seconds: int = 600
+) -> Settings:
     """
     Build settings with a manual-duplex profile, writing only under ``tmp_path``.
 
@@ -700,7 +967,7 @@ def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Setting
 
     Args:
         tmp_path: The pytest temporary directory for tmp, data and log files.
-        flip_timeout_seconds: The flip-wait bound, in seconds.
+        operator_wait_timeout_seconds: The flip-wait bound, in seconds.
 
     Returns:
         Settings whose ``duplex`` profile is manual duplex on a feeder source.
@@ -712,7 +979,7 @@ def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Setting
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
             log_file=str(tmp_path / "saneless.log"),
-            flip_timeout_seconds=flip_timeout_seconds,
+            operator_wait_timeout_seconds=operator_wait_timeout_seconds,
         ),
         profiles={
             "default": ProfileConfig(),
@@ -762,7 +1029,7 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
 
             Args:
                 device_id: Recorded, one entry per call, in call order.
-                settings: Only ``resolution`` is used, and only to report back.
+                settings: Only ``resolution`` is used, as the page's dpi and the batch's.
                 sink: The pipeline's own sink, which receives the page.
 
             Returns:
@@ -770,7 +1037,7 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
 
             """
             calls.append(device_id)
-            record = sink.add(_inked_page())
+            record = sink.add(_inked_page(), dpi=settings.resolution)
             return scan_batch([record], resolution=settings.resolution)
 
     return CountingScanner
@@ -797,11 +1064,11 @@ def _recording_paperless(uploads: list[str]) -> type:
         def upload_document(self, *_args: object, **_kwargs: object) -> UploadResult:
             """Record the upload and report it delivered."""
             uploads.append("uploaded")
-            return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
+            return ApiDelivery(task_id="mock-task-uuid")
 
-        def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+        def poll_task(self, *_args: object, **_kwargs: object) -> TaskFiled:
             """Return a successful task result."""
-            return {"status": "SUCCESS"}
+            return TaskFiled(task={"status": "SUCCESS"})
 
         def close(self) -> None:
             """No-op close."""
@@ -813,18 +1080,33 @@ class TestManualDuplexPrompt:
     """
     The CLI flip prompt, its non-terminal refusal, abort, and bounded wait.
 
-    Read the two halves of the TTY policy together, because they look
-    contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so
-    the refusal test runs with ``_stdin_is_interactive`` *unpatched* -- it is
-    telling the truth about its environment.  The prompt tests patch that one
-    seam to ``True`` so they can reach ``click.confirm`` at all.  Neither test
-    lies, and neither can be "simplified" into the other: without the seam, one
-    of the two could not be written.
+    ``CliRunner`` is not a terminal, so the refusal test runs with
+    ``_stdin_is_interactive`` *unpatched*; the prompt tests patch that one
+    seam to ``True`` so they can reach the question at all. Neither test can
+    be folded into the other: without the seam, one of them could not exist.
+
+    The question waits for stdin to be readable before it reads a line, and
+    ``CliRunner``'s stdin has no descriptor to wait on, so the prompt tests
+    also replace that one wait (``tests.prompt_support``). The line is then
+    read, parsed and answered for real.
     """
 
     def _interactive(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Pretend stdin is a terminal a human can answer on."""
+        """Pretend stdin is a terminal a human can answer on, readable at once."""
         monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+        readable(monkeypatch)
+
+    def _typed(self, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+        """
+        Give a coordinator called directly ``text`` on stdin, readable at once.
+
+        Args:
+            monkeypatch: Replaces ``sys.stdin`` and the prompt's wait.
+            text: What the operator typed; empty for end of input.
+
+        """
+        monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+        readable(monkeypatch)
 
     def test_prompt_between_passes_then_scans_backs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -849,7 +1131,7 @@ class TestManualDuplexPrompt:
         assert result.exit_code == 0, result.output
         assert len(calls) == 2
         assert uploads == ["uploaded"]
-        # C-02's own prescribed check: the prompt is echoed into the output,
+        # The prompt is echoed into the output,
         # and it lands after the fronts and before the backs.
         fronts = result.output.index("Scanning...")
         prompt = result.output.index(_FLIP_PROMPT_FRAGMENT)
@@ -863,9 +1145,9 @@ class TestManualDuplexPrompt:
         Answering no cancels the scan: one line, exit 130, nothing uploaded.
 
         A no is the operator choosing to stop, so it is a cancel rather than a
-        scan error (N-08, D-02), and it exits with the shell's interrupt code
-        so a script still sees a non-zero status (D-03, D-07).  The prompt
-        itself is echoed to stdout, so the cancel line is read from stderr.
+        scan error, and it exits with the shell's interrupt code so a script
+        still sees a non-zero status. The prompt itself is echoed to stdout, so
+        the cancel line is read from stderr.
         """
         calls: list[str] = []
         uploads: list[str] = []
@@ -893,7 +1175,7 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        EOF (Ctrl-D) at the prompt cancels exactly as answering no does (D-03).
+        EOF (Ctrl-D) at the prompt cancels exactly as answering no does.
 
         Both are the operator's abort, so both exit 130 with the same cancel
         line, one scan pass and no upload -- the way a web Abort ends CANCELLED.
@@ -925,24 +1207,12 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Ctrl-C at the flip prompt exits 130 with the flip cancel line (D-03).
+        Ctrl-C at the flip prompt exits 130 with the flip cancel line.
 
         The coordinator turns the ``KeyboardInterrupt`` into ``ABORTED``, so
         the guard sees ``ScanCancelledError`` and prints its message -- not the
         generic ``Cancelled (interrupted)`` of a Ctrl-C elsewhere in a command.
         """
-
-        def interrupted_wait(_slot: object, timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -952,15 +1222,12 @@ class TestManualDuplexPrompt:
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
-        monkeypatch.setattr("saneless.cli.FlipAnswerSlot.wait", interrupted_wait)
+        # Raised out of the wait, as SIGINT is on the main thread.
+        broken_read(monkeypatch, KeyboardInterrupt())
 
-        try:
-            result = runner.invoke(
-                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Ctrl-C"]
-            )
-        finally:
-            release.set()
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Ctrl-C"]
+        )
 
         assert result.exit_code == 130, result.output
         assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
@@ -972,16 +1239,11 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A prompt that breaks is a scan failure, exit 1 -- not a cancel (D-02).
+        A prompt that breaks is a scan failure, exit 1 -- not a cancel.
 
         Nobody chose to stop, so the coordinator's ``abort_cause`` turns the
         ``ABORTED`` into a ``ScanError`` naming what broke.
         """
-
-        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
-            """Fail with a read error, as an I/O error at the terminal does."""
-            raise OSError(errno.EIO, "Input/output error")
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -991,14 +1253,15 @@ class TestManualDuplexPrompt:
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+        # A read error, as an I/O error at the terminal gives.
+        broken_read(monkeypatch, OSError(errno.EIO, "Input/output error"))
 
         result = runner.invoke(
             cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Lost terminal"]
         )
 
         assert result.exit_code == 1, result.output
-        # A prefix rather than the whole line: since plan 29-09 the fronts pass
+        # A prefix rather than the whole line: the fronts pass
         # A already fed are preserved, because nobody chose to stop, and the
         # error line goes on to name how many were kept and where.  The exit
         # code is unchanged, which is what preserving the exception type buys.
@@ -1018,37 +1281,22 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        Ctrl-C while the prompt is up resolves ``ABORTED``, not a raw interrupt.
+        Ctrl-C while the question waits resolves ``ABORTED``, not a raw interrupt.
 
-        SIGINT is handled on the main thread, so a real Ctrl-C does not reach
-        ``click.confirm`` on the prompt thread at all -- it raises
-        ``KeyboardInterrupt`` out of the calling thread's bounded wait (measured
-        with a real SIGINT against a never-answering stdin).  A real signal
-        cannot be sent here without taking the pytest session down with it if
-        the handling regressed, so the answer slot's wait is made to raise.
+        SIGINT is handled on the main thread, which is the thread the question
+        waits on, so it raises ``KeyboardInterrupt`` out of the wait.  A real
+        signal cannot be sent here without taking the pytest session down with
+        it if the handling regressed, so the wait is made to raise; the real
+        signal is sent on a real terminal in ``test_cli_prompt_terminal``.
         """
-
-        def interrupted_wait(timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, KeyboardInterrupt())
         coordinator = ClickFlipCoordinator()
-        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
 
-        try:
-            outcome = coordinator.wait_for_flip(600)
-        finally:
-            release.set()
+        outcome = coordinator.wait_for_flip(600)
 
         assert outcome is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
 
     @pytest.mark.parametrize(
         "failure",
@@ -1067,23 +1315,17 @@ class TestManualDuplexPrompt:
         failure: Exception,
     ) -> None:
         """
-        WR-08: an unexpected prompt failure ends the wait now, as ``ABORTED``.
+        An unexpected prompt failure ends the wait now, as ``ABORTED``.
 
-        A prompt thread that died on anything but ``click.Abort`` used to leave
-        the calling thread waiting out the whole ``flip_timeout_seconds`` and
-        then report that nobody confirmed the flip, which was false.  It is an
-        abort, not a fourth outcome (D-09), and the traceback in the log carries
-        the real cause.  The failure itself is kept as ``abort_cause``, so the
-        pipeline reports a broken prompt as a failure rather than as the
-        operator's cancel (D-02).  The suite's ``filterwarnings = ["error"]``
-        also turns a prompt thread that died unhandled into a failure here.
+        A broken read must not leave the scan waiting out the whole
+        ``operator_wait_timeout_seconds`` and then report that nobody confirmed
+        the flip, which would be false.  It is an abort, not a fourth outcome,
+        and the traceback in the log carries the real cause.  The
+        failure itself is kept as ``abort_cause``, so the pipeline reports a
+        broken prompt as a failure rather than as the operator's cancel.
         """
-
-        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
-            """Fail the way a broken terminal does."""
-            raise failure
-
-        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, failure)
         caplog.set_level(logging.ERROR, logger="saneless.cli")
         coordinator = ClickFlipCoordinator()
 
@@ -1104,30 +1346,55 @@ class TestManualDuplexPrompt:
         assert len(records) == 1
         assert records[0].exc_info is not None
 
+    def test_a_closed_stdin_at_the_question_is_a_broken_prompt(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        No stdin at all when the question is asked: a failure, never a crash.
+
+        The scan refuses a closed stdin before any paper moves, so this is the
+        coordinator's own guard: it answers as a broken read does.
+        """
+        monkeypatch.setattr(sys, "stdin", None)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        coordinator = ClickFlipCoordinator()
+
+        outcome = coordinator.wait_for_flip(600)
+
+        assert outcome is FlipOutcome.ABORTED
+        assert isinstance(coordinator.abort_cause, OSError)
+        assert any(
+            "Flip prompt failed" in record.getMessage() for record in caplog.records
+        )
+
     def test_answering_no_leaves_no_abort_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A no is the operator's own abort, so there is no cause to report (D-02)."""
-        monkeypatch.setattr(
-            "saneless.cli.click.confirm", lambda *_args, **_kwargs: False
-        )
+        """A no is the operator's own abort, so there is no cause to report."""
+        self._typed(monkeypatch, "n\n")
         coordinator = ClickFlipCoordinator()
 
         outcome = coordinator.wait_for_flip(600)
 
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
+
+    @pytest.mark.parametrize("typed", ["\n", "y\n", "YES\n", " Y \n"])
+    def test_yes_or_just_return_continues(
+        self, monkeypatch: pytest.MonkeyPatch, typed: str
+    ) -> None:
+        """Yes, in any case, or Return on its own (the default) continues."""
+        self._typed(monkeypatch, typed)
+
+        outcome = ClickFlipCoordinator().wait_for_flip(600)
+
+        assert outcome is FlipOutcome.CONTINUED
 
     def test_eof_at_the_prompt_leaves_no_abort_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl-D (``click.Abort`` from the prompt) is an operator abort (D-02)."""
-
-        def end_of_input(*_args: object, **_kwargs: object) -> bool:
-            """Fail the way click.confirm does at EOF."""
-            raise click.Abort
-
-        monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
+        """Ctrl-D (end of input at the question) is an operator abort."""
+        self._typed(monkeypatch, "")
         coordinator = ClickFlipCoordinator()
 
         outcome = coordinator.wait_for_flip(600)
@@ -1135,52 +1402,26 @@ class TestManualDuplexPrompt:
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
 
-    def test_ctrl_c_before_a_prompt_failure_leaves_no_abort_cause(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    def test_ctrl_c_leaves_no_abort_cause_and_no_thread(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A Ctrl-C that claimed first keeps its meaning when the prompt then breaks.
+        Ctrl-C keeps its meaning, a cancel, and leaves nothing reading stdin.
 
-        The order is forced, not timed: the prompt stays blocked until
-        ``wait_for_flip`` has already returned the Ctrl-C's ``ABORTED``, and only
-        then fails.  Its offer loses, so no cause is recorded and the run is
-        still the operator's cancel -- but the failure is still logged (D-02,
-        WR-08).
+        The question was read on the calling thread, so once ``wait_for_flip``
+        has returned nothing of it is left behind to answer late.
         """
-
-        def interrupted_wait(timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def fails_once_released(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then fail with a terminal I/O error."""
-            release.wait()
-            raise OSError(errno.EIO, "Input/output error")
-
-        monkeypatch.setattr("saneless.cli.click.confirm", fails_once_released)
-        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, KeyboardInterrupt())
         coordinator = ClickFlipCoordinator()
-        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
 
-        try:
-            outcome = coordinator.wait_for_flip(600)
-        finally:
-            release.set()
-        for thread in threading.enumerate():
-            if thread.name == "saneless-flip-prompt":
-                thread.join(timeout=5)
+        outcome = coordinator.wait_for_flip(600)
 
+        assert _FLIP_PROMPT_THREAD not in [
+            thread.name for thread in threading.enumerate()
+        ]
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
-        assert any(
-            "Flip prompt failed" in record.getMessage() and record.exc_info is not None
-            for record in caplog.records
-            if record.name == "saneless.cli"
-        )
 
     def test_the_coordinator_times_out_at_a_zero_timeout(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1189,73 +1430,73 @@ class TestManualDuplexPrompt:
         ``wait_for_flip(0)`` with nobody answering resolves ``TIMED_OUT``.
 
         The coordinator's own contract, independent of the config bounds that
-        keep zero out of ``flip_timeout_seconds`` (WR-01): its ``timeout``
+        keep zero out of ``operator_wait_timeout_seconds``: its ``timeout``
         argument is the zero-cost seam, so no wall clock is spent here.
         """
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        self._typed(monkeypatch, "")
+        never_readable(monkeypatch, FakeClock())
         coordinator = ClickFlipCoordinator()
 
-        try:
-            outcome = coordinator.wait_for_flip(0)
-        finally:
-            release.set()
+        outcome = coordinator.wait_for_flip(0)
 
         assert outcome is FlipOutcome.TIMED_OUT
+
+    def test_a_bad_answer_is_asked_again_with_the_time_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A refused answer does not restart the clock: the deadline still stands.
+
+        The first answer is refused at 40 s into a 60 s wait; the question is
+        asked again for the remaining 20 s, and nothing comes.
+        """
+        clock = FakeClock()
+        waits: list[float] = []
+
+        def wait(_stream: object, timeout: float) -> bool:
+            """Answer once after 40 s, then stay silent for the time given."""
+            waits.append(timeout)
+            if len(waits) == 1:
+                clock.advance(40)
+                return True
+            clock.advance(timeout)
+            return False
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO("maybe\n"))
+        monkeypatch.setattr("saneless.cli._monotonic", clock)
+        monkeypatch.setattr("saneless.cli._wait_readable", wait)
+
+        outcome = ClickFlipCoordinator().wait_for_flip(60)
+
+        assert outcome is FlipOutcome.TIMED_OUT
+        assert waits == [60, 20]
 
     def test_unanswered_prompt_times_out_before_pass_b(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        An answer that never arrives fails the job on the flip wait (D-19).
+        An answer that never arrives fails the job on the flip wait.
 
-        The timeout is one second, the smallest value config accepts: zero is
-        no longer a legal ``flip_timeout_seconds`` (WR-01), and the field is
-        typed ``int``, so a fractional float is rejected too.  One second of
-        wall clock buys the whole ``scan`` command end to end -- the bounded
-        wait expires and ``TIMED_OUT`` is claimed before pass B.  The
-        zero-cost version of the coordinator's own contract is
-        ``test_the_coordinator_times_out_at_a_zero_timeout``.
+        The whole ``scan`` command runs end to end: the bounded wait expires
+        and ``TIMED_OUT`` is claimed before pass B.  The wait runs on a fake
+        clock, so the one second the config allows at least costs nothing.
         """
-        # The only test in this class that stubs click.confirm instead of
-        # driving the real one, and it has to.  CliRunner's empty input stream
-        # hits EOF immediately, click.confirm raises Abort, and the coordinator
-        # would claim ABORTED in a race against TIMED_OUT -- a flaky test that
-        # passes on one machine.  This stub makes "the answer never comes"
-        # deterministic, and the finally releases it so the daemon thread ends
-        # with the test instead of lingering in the pytest process.
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_duplex_settings(tmp_path, flip_timeout_seconds=1),
+            settings=_duplex_settings(tmp_path, operator_wait_timeout_seconds=1),
             scanner_cls=_counting_scanner(calls),
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        never_readable(monkeypatch, FakeClock())
 
-        try:
-            result = runner.invoke(
-                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
-            )
-        finally:
-            release.set()
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
+        )
 
-        # A forgotten prompt is a failure, not a cancel: exit 1, never 130 (D-02).
+        # A forgotten prompt is a failure, not a cancel: exit 1, never 130.
         assert result.exit_code == 1, result.output
         assert "flip wait" in result.output
         assert len(calls) == 1
@@ -1301,6 +1542,263 @@ class TestManualDuplexPrompt:
         assert _FLIP_PROMPT_FRAGMENT not in result.output
         assert "interactive terminal" not in result.output
         assert len(calls) == 1
+
+    def test_no_flip_prompt_thread_is_started(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The flip question is asked on the calling thread: no prompt thread at all.
+
+        A thread parked on stdin outlives the command that started it, and on
+        a real terminal it holds the process open at exit until someone
+        presses Enter.  So no thread is started for the question, and none is
+        left behind once the command is over.
+        """
+        started: list[str] = []
+        real_start = threading.Thread.start
+
+        def recording_start(thread: threading.Thread) -> None:
+            """Note the thread's name, then start it as usual."""
+            started.append(thread.name)
+            real_start(thread)
+
+        calls: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+        )
+        self._interactive(monkeypatch)
+        readable(monkeypatch)
+        monkeypatch.setattr(threading.Thread, "start", recording_start)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "No thread"],
+            input="n\n",
+        )
+
+        assert result.exit_code == ExitCode.CANCELLED, result.output
+        assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
+        assert _FLIP_PROMPT_THREAD not in started
+        assert _FLIP_PROMPT_THREAD not in [
+            thread.name for thread in threading.enumerate()
+        ]
+        assert len(calls) == 1
+
+    def test_a_bad_flip_answer_is_asked_again(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An answer that is neither yes nor no is refused, and the question asked again.
+
+        The refusal is click's own wording, the one every click confirmation
+        prompt prints.
+        """
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        readable(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Asked twice"],
+            input="maybe\ny\n",
+        )
+
+        assert result.exit_code == ExitCode.SUCCESS, result.output
+        assert "Error: invalid input" in result.output
+        assert result.output.count(_FLIP_PROMPT_FRAGMENT) == 2
+        assert len(calls) == 2
+        assert uploads == ["uploaded"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            OSError(errno.EIO, "Input/output error"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        ],
+        ids=["lost-terminal", "undecodable-input"],
+    )
+    def test_a_broken_flip_read_is_a_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tmp_path: Path,
+        failure: Exception,
+    ) -> None:
+        """
+        A read that breaks at the flip question fails the scan: exit 1, logged.
+
+        Nobody chose to stop, so it is neither a cancel (130) nor an
+        unexpected error (5), and the log keeps the traceback.
+        """
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        broken_read(monkeypatch, failure)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Broken read"]
+        )
+
+        assert result.exit_code == ExitCode.SCAN, result.output
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "saneless.cli"
+            and "Flip prompt failed; treating it as an abort" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert len(calls) == 1
+        assert uploads == []
+
+    def test_a_closed_stdin_with_a_manual_duplex_profile_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``saneless scan`` with stdin closed (``<&-``) is refused, exit 2.
+
+        With no stdin at all there is nobody to flip the stack, the same as
+        from cron, so it gets the same refusal rather than an unexpected
+        error.  A real process, because only a real process can start with
+        no standard input.
+        """
+        completed = _scan_with_stdin_closed(tmp_path, ["--profile", _DUPLEX_PROFILE])
+
+        assert completed.returncode == ExitCode.CONFIG, completed.stderr
+        assert "which needs an interactive terminal" in completed.stderr
+
+    def test_a_closed_stdin_with_multi_page_is_refused(self, tmp_path: Path) -> None:
+        """
+        ``saneless scan --multi-page`` with stdin closed (``<&-``) is refused, exit 2.
+
+        Nobody can answer "another page?" without a stdin, so it gets the
+        off-terminal refusal before the scanner opens, not an unexpected
+        error.
+        """
+        completed = _scan_with_stdin_closed(tmp_path, ["--multi-page"])
+
+        assert completed.returncode == ExitCode.CONFIG, completed.stderr
+        assert MULTI_PAGE_NEEDS_TERMINAL in " ".join(completed.stderr.split())
+
+
+def _scan_with_stdin_closed(
+    tmp_path: Path, args: list[str]
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run the real ``saneless scan`` in a process started with no stdin (``<&-``).
+
+    A shell starts the child because ``<&-`` leaves descriptor 0 closed, which
+    no ``subprocess`` stdin setting does.
+
+    Args:
+        tmp_path: The test's scratch directory, for the config and every path
+            the scan would write.
+        args: The arguments after ``scan``, before ``--title``.
+
+    Returns:
+        The finished process, its output captured as text.
+
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = tmp_path / "saneless.toml"
+    config.write_text(
+        _CLOSED_STDIN_CONFIG.format(
+            tmp_dir=tmp_path / "scratch",
+            data_dir=data_dir,
+            log_file=tmp_path / "logs" / "saneless.log",
+            profile=_DUPLEX_PROFILE,
+        )
+    )
+    env = {
+        **os.environ,
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SOURCE": _CLOSED_STDIN_CHILD,
+        "SANELESS_TEST_CONFIG": str(config),
+        "SANELESS_TEST_ARGS": json.dumps(args),
+    }
+    return subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE" <&-',
+        ],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=_CLOSED_STDIN_CHILD_SECONDS,
+    )
+
+
+# The thread the flip question was once read on.  Nothing may start it.
+_FLIP_PROMPT_THREAD = "saneless-flip-prompt"
+
+_CLOSED_STDIN_CHILD_SECONDS = 60
+
+_CLOSED_STDIN_CONFIG = """\
+[scanner]
+device = "test:device:001"
+
+[paperless]
+url = "http://paperless.invalid:8000"
+token = "closed-stdin-token"
+
+[output]
+tmp_dir = "{tmp_dir}"
+data_dir = "{data_dir}"
+log_file = "{log_file}"
+
+[profiles.default]
+
+[profiles.{profile}]
+source = "ADF"
+duplex = "manual"
+"""
+
+# The console script's shim with the SANE library check replaced, the
+# arguments travelling in the environment.  They are taken out of it before
+# the CLI starts, because saneless reads every SANELESS_ variable as a setting.
+_CLOSED_STDIN_CHILD = """
+import json
+import os
+import sys
+
+from saneless import cli as cli_module
+from saneless import main
+
+config = os.environ.pop("SANELESS_TEST_CONFIG")
+args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
+os.environ.pop("SANELESS_TEST_PYTHON")
+os.environ.pop("SANELESS_TEST_SOURCE")
+
+
+def require_sane():
+    return None
+
+
+cli_module.require_sane = require_sane
+sys.argv = ["saneless", "--config", config, "scan", *args, "--title", "t"]
+sys.exit(main())
+"""
 
 
 class _RangeScanner(StubScannerBackend):
@@ -1474,7 +1972,7 @@ class TestDevicesCommand:
         ]
         assert [
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-        ] == [f"Could not read capabilities for hp:002: {_HALF_BROKEN_REASON}"]
+        ] == [f"Could not read capabilities for 'hp:002': {_HALF_BROKEN_REASON!r}"]
 
     def test_devices_text_capabilities_reports_a_failed_probe_and_lists_the_rest(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1568,19 +2066,105 @@ class TestDevicesCommand:
         assert result.stdout == stdout
         assert result.stderr.splitlines() == stderr
 
+    def test_the_device_table_fits_80_columns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        On an 80-column terminal no line of the table is wider than 80.
+
+        That holds even for a device type as long as SANE's own
+        "multi-function peripheral" after three fixed columns.
+        """
+
+        class _LongFields(StubScannerBackend):
+            def __init__(self, host: str = "") -> None:
+                """Accept the host the CLI passes."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Report one device whose every field is long."""
+                return [
+                    DeviceInfo(
+                        "net:scanner-host.example.lan:hpaio:/net/OfficeJet_Pro?ip=1",
+                        "Hewlett-Packard Development Company",
+                        "OfficeJet Pro 9010 series all-in-one",
+                        "multi-function peripheral",
+                    )
+                ]
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_LongFields)
+
+        result = runner.invoke(cli, ["devices"], env={"COLUMNS": "80"})
+
+        assert result.exit_code == 0, result.output
+        lines = result.stdout.splitlines()
+        assert len(lines) == 3, result.stdout
+        assert all(len(line) <= 80 for line in lines), [len(x) for x in lines]
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+    def test_capabilities_omit_blank_option_names(
+        self, monkeypatch: pytest.MonkeyPatch, *, as_json: bool
+    ) -> None:
+        """
+        The raw option list names options, and nothing without a name.
+
+        The real backend over a device that reports the option count ('') and
+        a group heading (None) among its options: the text has no blank line
+        and no "None" under "Raw options", and the JSON list holds strings
+        only.
+        """
+        device = FakeSaneDev()
+        named = device.get_options()
+        count, group = UNNAMED_OPTION_ENTRIES
+
+        def with_unnamed() -> list[tuple]:
+            return [count, *named[:2], group, *named[2:]]
+
+        # The device stores a name that is not one of its options on itself,
+        # as python-sane does, so this shadows get_options for this device.
+        monkeypatch.setattr(device, "get_options", with_unnamed)
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=device))
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        expected = [str(opt[1]) for opt in named]
+
+        result = runner.invoke(
+            cli, ["devices", "--capabilities", *(["--json"] if as_json else [])]
+        )
+
+        assert result.exit_code == 0, result.output
+        if as_json:
+            entries = json.loads(result.stdout)
+            assert entries
+            for entry in entries:
+                assert entry["capabilities"]["raw_options"] == expected
+        else:
+            blocks = result.stdout.split("  Raw options:\n")[1:]
+            assert blocks, result.stdout
+            for block in blocks:
+                listed = [
+                    line for line in block.splitlines() if line.startswith("    ")
+                ]
+                assert listed == [f"    {name}" for name in expected]
+
     def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Devices --capabilities -> raw option names shown."""
+        """
+        Devices --capabilities -> raw option names shown.
+
+        The "Raw options:" label and one indented name per line are the text
+        the documentation shows, so they stay whatever shape the backend hands
+        the names over in.
+        """
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
         assert result.exit_code == 0
         assert "Flatbed" in result.output
         assert "ADF" in result.output
+        assert "  Raw options:\n    source\n" in result.stdout
 
     def test_devices_capabilities_prints_a_reported_word_list(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A list-reporting device prints its exact values, as it always did."""
+        """A list-reporting device prints its exact values."""
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
@@ -1596,9 +2180,9 @@ class TestDevicesCommand:
         """
         A range-reporting device's minimum, maximum and step all reach the operator.
 
-        This is the N-01 symptom the user actually sees. The SANE ``test``
-        backend constrains resolution with ``(1.0, 1200.0, 1.0)``, which used to
-        arrive as an empty list and print a label with nothing after it.
+        The SANE ``test`` backend constrains resolution with
+        ``(1.0, 1200.0, 1.0)``; printed as a list, that range would be a label
+        with nothing after it.
         """
         runner, _ = _patch_cli(monkeypatch, scanner_cls=_RangeScanner)
 
@@ -1654,7 +2238,7 @@ class TestCliFlags:
         assert "verbose-probe-5c1d" in result.stderr
 
     def test_config_flag(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """--config /path/to/config -> load_settings called with that path."""
+        """``--config`` hands its path to load_settings unchanged."""
         captured: dict[str, object] = {}
 
         def capture_load(config_path: str | None = None) -> Settings:
@@ -1684,7 +2268,7 @@ class TestCliFlags:
 
 
 class TestLegacyDuplexWarningReachesLogFile:
-    """The legacy manual-duplex warning lands in the configured log file (WR-05)."""
+    """The legacy manual-duplex warning lands in the configured log file."""
 
     def test_warning_is_written_to_log_file(self, tmp_path: Path) -> None:
         """
@@ -1788,13 +2372,13 @@ class TestLazySettingsLoading:
     """
     Settings load lazily, once, inside the commands that need them.
 
-    CFG-10 / N-25: ``saneless <subcommand> --help`` must work with a broken or
-    missing configuration. Click runs the group callback *before* a subcommand
-    parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
-    (verified against Click 8.3), so the group callback cannot load anything;
-    each command loads on first need instead. A ConfigError from loading is
-    printed by the group guard as rendered, exit 2; an unwritable log file is
-    not a failure, it falls back to stderr.
+    ``saneless <subcommand> --help`` must work with a broken or missing
+    configuration. Click runs the group callback *before* a subcommand
+    parses its own ``--help``, and ``ctx.resilient_parsing`` is False there,
+    so the group callback cannot load anything; each command loads on first
+    need instead. A ConfigError from loading is printed by the group guard
+    as rendered, exit 2; an unwritable log file is not a failure, it falls
+    back to stderr.
     """
 
     @pytest.mark.parametrize("command", _ALL_COMMANDS)
@@ -1839,7 +2423,7 @@ class TestLazySettingsLoading:
     def test_real_config_error_printed_once_with_its_own_header(
         self, tmp_path: Path
     ) -> None:
-        """The loader's rendered error is echoed as-is, not prefixed again (D-10)."""
+        """The loader's rendered error is echoed as-is, not prefixed again."""
         config_file = _write_real_config(tmp_path, paperless={"tokne": "x"})
 
         with _restored_logging():
@@ -1852,7 +2436,7 @@ class TestLazySettingsLoading:
         assert not (tmp_path / "logs").exists()
 
     def test_missing_config_exits_2_naming_the_path(self, tmp_path: Path) -> None:
-        """``--config`` to a file that does not exist exits 2 and names it (CFG-02)."""
+        """``--config`` to a file that does not exist exits 2 and names it."""
         missing = tmp_path / "nope.toml"
 
         with _restored_logging():
@@ -1865,10 +2449,10 @@ class TestLazySettingsLoading:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        ``--config ""`` is an explicit, unusable path, not "no path" (WR-05).
+        ``--config ""`` is an explicit, unusable path, not "no path".
 
-        ``saneless --config "$CFG" ...`` with ``CFG`` unset used to load -- and
-        ``auto-profiles`` to write -- whichever file discovery found.
+        ``saneless --config "$CFG" ...`` with ``CFG`` unset must not load -- or
+        let ``auto-profiles`` write -- whichever file discovery would find.
         """
         _write_real_config(tmp_path)
         monkeypatch.chdir(tmp_path)
@@ -1884,7 +2468,7 @@ class TestLazySettingsLoading:
         self, tmp_path: Path
     ) -> None:
         """
-        An unwritable ``log_file`` warns on stderr; the command still runs (WR-07).
+        An unwritable ``log_file`` warns on stderr; the command still runs.
 
         The real ``configure_logging`` catches the OSError from creating the
         log directory or opening the file and logs to stderr instead, so this
@@ -1904,11 +2488,11 @@ class TestLazySettingsLoading:
 
     def test_toml_syntax_error_is_one_line_exit_2(self, tmp_path: Path) -> None:
         """
-        A TOML syntax error exits 2 without a traceback, under the D-10 header.
+        A TOML syntax error exits 2 without a traceback, under the config header.
 
         The loader turns the ``TOMLDecodeError`` into a ConfigError naming the
-        line and column (D-12), so it reaches the ConfigError handler rather
-        than the generic one.
+        line and column, so it reaches the ConfigError handler rather than the
+        generic one.
         """
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("[output\n")
@@ -1949,13 +2533,106 @@ class TestLazySettingsLoading:
         assert counts == {"load": 1, "logging": 1}
 
 
+class TestFirstRunFileModes:
+    """
+    A one-shot command run before the server creates private state.
+
+    The default log file sits inside the default ``data_dir``, so whichever
+    command runs first creates ``data_dir`` while it sets up logging. A bare
+    metal install commonly runs ``saneless doctor`` or ``saneless jobs`` before
+    ever starting the server, and later calls leave an existing directory's
+    mode alone. The directory and the log, which holds document titles, must
+    therefore come out owner-only from that first command.
+    """
+
+    @staticmethod
+    def _mode(path: Path) -> int:
+        """Return the permission bits of ``path``."""
+        return path.stat().st_mode & 0o777
+
+    def test_jobs_on_a_fresh_state_home_leaves_data_dir_and_log_private(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``saneless jobs`` first, on an empty state home, under umask 022."""
+        state_home = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        data_dir = state_home / "saneless"
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o700
+        assert self._mode(data_dir / "saneless.log") == 0o600
+        # Listing the history only reads it: none yet is no database.
+        assert not (data_dir / "saneless.db").exists()
+
+    def test_a_log_nested_inside_data_dir_still_leaves_data_dir_private(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``data_dir`` is 0700 when the log sits in a subdirectory of it.
+
+        Logging creates the log's own directory 0700, but a plain parent
+        created on the way would get the umask's 0755.
+        """
+        data_dir = tmp_path / "data"
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            tomlkit.dumps(
+                {
+                    "output": {
+                        "tmp_dir": str(tmp_path / "tmp"),
+                        "data_dir": str(data_dir),
+                        "log_file": str(data_dir / "logs" / "saneless.log"),
+                    }
+                }
+            )
+        )
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o700
+        assert self._mode(data_dir / "logs") == 0o700
+        assert self._mode(data_dir / "logs" / "saneless.log") == 0o600
+
+    def test_an_existing_data_dir_keeps_its_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ``data_dir`` an earlier release left 0755 is not re-moded."""
+        state_home = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        data_dir = state_home / "saneless"
+        data_dir.mkdir(parents=True)
+        data_dir.chmod(0o755)
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o755
+
+
 class TestStartupConfigLog:
     """
-    One INFO record says where the configuration came from (CFG-11).
+    One INFO record says where the configuration came from.
 
-    Names only, never values (D-14, CFG-05): a token supplied through the
-    environment, or typed under a misspelt key, never reaches a log record or
-    the terminal.
+    Names only, never values: a token supplied through the environment, or
+    typed under a misspelt key, never reaches a log record or the terminal.
     """
 
     def test_config_sources_logged_once_without_values(
@@ -1988,7 +2665,7 @@ class TestStartupConfigLog:
         assert secret not in (tmp_path / "logs" / "saneless.log").read_text()
 
     def test_mistyped_key_error_never_echoes_its_value(self, tmp_path: Path) -> None:
-        """A token under a misspelt key is not printed with the error (D-14)."""
+        """A token under a misspelt key is not printed with the error."""
         secret = "tok-SECRET-51ab"
         config_file = _write_real_config(tmp_path, paperless={"tokne": secret})
 
@@ -2008,48 +2685,45 @@ _LIBSANE_MISSING = (
 
 def _block_sane_import(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``import sane`` raise ModuleNotFoundError, as with python-sane absent."""
-    monkeypatch.setattr(sane_backend, "sane", None)
+    monkeypatch.setattr(scan_session_mod, "sane", None)
     monkeypatch.setitem(sys.modules, "sane", None)
 
 
 def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the python-sane import fail the way a missing libsane.so does."""
 
-    def unloadable() -> None:
+    def unloadable() -> NoReturn:
         raise ImportError(_LIBSANE_MISSING)
 
-    monkeypatch.setattr(sane_backend, "_ensure_sane", unloadable)
+    monkeypatch.setattr(scan_session_mod, "_ensure_sane", unloadable)
+
+
+# The SANE commands that start a child before they finish, so a child is
+# where a libsane that will not load is found.
+_CHILD_REPORTED_COMMAND_LINES = [
+    pytest.param(["scan"], id="scan"),
+    pytest.param(["devices"], id="devices"),
+    pytest.param(["auto-profiles"], id="auto-profiles"),
+]
 
 
 class TestRequireSane:
     """
-    Every SANE command refuses at once when python-sane cannot be imported (D-05).
+    Every SANE command refuses at once when python-sane cannot be imported.
 
     python-sane is a mandatory dependency, so a missing package or an
     unloadable libsane is a setup problem: one line naming the import's reason
     and the SANE development package to install, exit 2, before the config is
     loaded or the scanner touched. ``jobs`` does not need a scanner and must
-    keep working, and ``--help`` never reaches a command body (CFG-10), so
-    neither imports python-sane.
+    keep working, and ``--help`` never reaches a command body, so neither
+    imports python-sane.
     """
 
     @pytest.mark.parametrize("command", _SANE_COMMANDS)
-    @pytest.mark.parametrize(
-        ("break_sane", "reason"),
-        [
-            (_block_sane_import, "import of sane halted"),
-            (_break_libsane, "libsane.so.1"),
-        ],
-        ids=["module_missing", "libsane_missing"],
-    )
     def test_python_sane_unavailable_exits_2_before_anything_else(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        command: str,
-        break_sane: Callable[[pytest.MonkeyPatch], None],
-        reason: str,
+        self, monkeypatch: pytest.MonkeyPatch, command: str
     ) -> None:
-        """One install-hint line and exit 2; no config load, no scanner (D-05)."""
+        """One install-hint line and exit 2; no config load, no scanner."""
         runner, settings = _patch_cli(monkeypatch)
         calls: list[str] = []
 
@@ -2067,7 +2741,7 @@ class TestRequireSane:
         monkeypatch.setattr("saneless.cli.load_settings", recording_load)
         monkeypatch.setattr("saneless.cli.SaneBackend", RecordingScanner)
         monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
-        break_sane(monkeypatch)
+        _block_sane_import(monkeypatch)
 
         result = runner.invoke(cli, [command])
 
@@ -2075,20 +2749,79 @@ class TestRequireSane:
         lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "python-sane cannot be imported" in lines[0]
-        assert reason in lines[0]
+        assert "No module named 'sane'" in lines[0]
         assert "libsane-dev" in lines[0]
         assert "sane-backends-devel" in lines[0]
         assert "Traceback" not in result.output
         assert calls == []
 
+    @pytest.mark.parametrize("command_line", _CHILD_REPORTED_COMMAND_LINES)
+    def test_an_unloadable_libsane_exits_2_from_the_first_child(
+        self, monkeypatch: pytest.MonkeyPatch, command_line: list[str]
+    ) -> None:
+        """
+        A python-sane whose libsane will not load gives the same one line, exit 2.
+
+        Checking that python-sane is installed loads nothing, and neither
+        does building the backend, so the missing ``libsane.so`` is found
+        where the library is first loaded: the first child, which reports it.
+        """
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        _break_libsane(monkeypatch)
+
+        result = runner.invoke(cli, command_line)
+
+        assert result.exit_code == 2, result.output
+        # devices announces its discovery before it asks a child.
+        lines = [
+            line for line in _failure_lines(result) if line != "Discovering scanners..."
+        ]
+        assert lines == [python_sane_missing_message(_LIBSANE_MISSING)], result.stderr
+        assert PYTHON_SANE_INSTALL_NEXT_STEP in result.stderr
+        assert "Traceback" not in result.output
+
+    def test_serve_starts_with_an_unloadable_libsane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve`` builds its backend and goes on to build the app.
+
+        Building the backend loads nothing, so a libsane that will not load
+        no longer stops the server at start-up; the health checks, which run
+        in children, are where it shows.  The app factory is stopped here
+        with a start-up failure of its own, so nothing is served.
+        """
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        _break_libsane(monkeypatch)
+        reached: list[ScannerBackend] = []
+
+        def unreadable_trust_store(
+            _settings: Settings, scanner: ScannerBackend
+        ) -> NoReturn:
+            reached.append(scanner)
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert len(reached) == 1
+        assert isinstance(reached[0], sane_backend.SaneBackend)
+        assert "python-sane cannot be imported" not in result.output
+
     def test_jobs_needs_no_python_sane_on_a_fresh_install(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        ``jobs`` runs without python-sane and shows an empty history (D-05).
+        ``jobs`` runs without python-sane and shows an empty history.
 
         On a fresh install the data directory does not exist yet: the command
-        creates it and prints the header with no rows, exit 0.
+        prints the header with no rows, exit 0, and creates nothing, because
+        listing the history only reads it.
         """
         data_dir = tmp_path / "new"
         settings = _make_settings(
@@ -2110,13 +2843,13 @@ class TestRequireSane:
         assert len(lines) == 2, result.output
         assert lines[0].startswith("Timestamp")
         assert set(lines[1]) == {"-"}
-        assert data_dir.is_dir()
+        assert not data_dir.exists()
 
     @pytest.mark.parametrize("command", _SANE_COMMANDS)
     def test_help_runs_without_python_sane(
         self, monkeypatch: pytest.MonkeyPatch, command: str
     ) -> None:
-        """``<command> --help`` exits 0 without checking for python-sane (CFG-10)."""
+        """``<command> --help`` exits 0 without checking for python-sane."""
         runner, _ = _patch_cli(monkeypatch)
         calls: list[str] = []
 
@@ -2172,8 +2905,25 @@ class TestJobsCommand:
         store.update_state(job.id, state)
         store.close()
 
+    def _populate_warned(self, db_path: Path, title: str) -> None:
+        """Populate a JobStore at db_path with one DONE job that has a warning."""
+        store = JobStore(db_path=db_path)
+        job = store.create_job(profile="default", title=title)
+        store.finish_job(
+            job.id,
+            JobState.DONE,
+            JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=_WARNED_SENTENCE,
+                pages_scanned=4,
+                pages_removed=0,
+                pages_uploaded=3,
+            ),
+        )
+        store.close()
+
     def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """Jobs with no jobs in DB shows empty output (exit 0)."""
+        """Jobs on an empty history prints the header and rule, no rows, exit 0."""
         settings = self._settings_for(tmp_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         # Create empty DB
@@ -2182,6 +2932,10 @@ class TestJobsCommand:
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
+        lines = result.output.splitlines()
+        assert len(lines) == 2
+        assert lines[0].split() == ["Timestamp", "Profile", "Title", "Status"]
+        assert set(lines[1]) == {"-"}
 
     def test_jobs_table_output(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2247,10 +3001,10 @@ class TestJobsCommand:
         """
         The widest status label still fits, unwrapped, in 80 columns.
 
-        The status column's reserve was sized for the raw enum values, the
-        longest of which was `AWAITING_FLIP`. Humanised labels are longer, and
-        "Saved to folder" is longer than `FALLBACK`, so the reserve is derived
-        from `state_label` rather than hardcoded.
+        Humanised labels are longer than the raw enum values, and "Saved to
+        folder" is longer than `FALLBACK`, so the status column's reserve is
+        derived from `state_label` -- and from the warned-upload label, the
+        widest of all -- rather than hardcoded.
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
@@ -2263,7 +3017,7 @@ class TestJobsCommand:
         assert len(lines) == 3
         row = lines[2]
         assert row.endswith("Saved to folder")
-        widest = max(len(state_label(s)) for s in JobState)
+        widest = max(*(len(state_label(s)) for s in JobState), len(WARNED_UPLOAD_LABEL))
         assert all(len(line) <= 80 for line in lines)
         # Every other label would fit too, not just this one.
         assert len(row) - len("Saved to folder") + widest <= 80
@@ -2286,9 +3040,110 @@ class TestJobsCommand:
         data = json.loads(result.output)
         assert data[0]["state"] == "FALLBACK"
         assert "Saved to folder" not in result.output
-        # No writer for either column until plan 23-07, so both read None today.
+        # update_state records no outcome or warning, so both read None.
         assert data[0]["outcome"] is None
         assert data[0]["warning"] is None
+
+    def test_jobs_table_labels_a_warned_upload(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A DONE job with a warning reads "Uploaded with a warning", not Complete."""
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "Warned Doc")
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        assert len(lines) == 3
+        assert lines[2].endswith(WARNED_UPLOAD_LABEL)
+        assert "Complete" not in result.output
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_jobs_table_width_fits_the_warned_label(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The warned label fits beside a title that fills its column.
+
+        The title column takes whatever the status reserve leaves, so a reserve
+        sized only for `state_label` would let a long title push the warned
+        label past column 80.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "W" * 120)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        row = lines[2]
+        assert row.endswith(job_label(JobState.DONE, _WARNED_SENTENCE))
+        assert all(len(line) <= 80 for line in lines)
+
+    @pytest.mark.parametrize(
+        ("category", "label"),
+        [
+            (ErrorCategory.UNCONFIRMED_SEND, UNCONFIRMED_SEND_LABEL),
+            (ErrorCategory.UNCONFIRMED_FILING, UNCONFIRMED_FILING_LABEL),
+        ],
+    )
+    def test_jobs_table_labels_an_amber_failure_by_its_category(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        category: ErrorCategory,
+        label: str,
+    ) -> None:
+        """
+        A failure that may be in paperless-ngx is not listed as "Failed".
+
+        The label is the one the web history cell shows for the same row, and
+        it fits beside a title that fills its column at 80 columns.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="W" * 120)
+        store.update_state(
+            job.id,
+            JobState.ERROR,
+            error="the poll ran out",
+            error_category=category,
+        )
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        assert len(lines) == 3
+        assert lines[2].endswith(label)
+        assert state_label(JobState.ERROR) not in result.output
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_jobs_json_keeps_done_and_the_warning_for_a_warned_upload(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        `--json` keeps the raw DONE state and the warning for a warned upload.
+
+        The warned label is derived from the state and the warning, so the
+        machine contract carries both unchanged and never the label.
+        """
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "Warned Doc")
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data[0]["state"] == "DONE"
+        assert data[0]["outcome"] == "SUCCESS"
+        assert data[0]["warning"] == _WARNED_SENTENCE
+        assert WARNED_UPLOAD_LABEL not in result.output
 
     def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
@@ -2327,8 +3182,284 @@ class TestJobsCommand:
         data = json.loads(result.output)
         assert data == []
 
+    def test_jobs_json_error_carries_the_full_stored_text(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``--json`` adds the stored error verbatim, host path included.
+
+        The web page shows a failure only as a path-free sentence pointing
+        here, so this output is where the full text lives. The field is
+        additive: every key a script already reads is still present.
+        """
+        settings = self._settings_for(tmp_path)
+        stored = "kept at /x/failed/a.pdf"
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="Failed Doc")
+        store.update_state(job.id, JobState.ERROR, error=stored)
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert row["error"] == stored
+        assert {
+            "id",
+            "profile",
+            "title",
+            "state",
+            "created_at",
+            "outcome",
+            "warning",
+        } <= row.keys()
+        assert row["state"] == "ERROR"
+
+    def test_jobs_json_error_is_null_for_a_job_without_one(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A job that never failed carries ``"error": null``, not a missing key."""
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=1)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert "error" in row
+        assert row["error"] is None
+
+    def test_jobs_json_appends_the_counts_and_removed_positions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The three counts and the removed positions follow every existing key.
+
+        Appended, so a script reading the earlier keys, in their order, is
+        unaffected.  The positions are 1-based scanned-page numbers, and mean
+        nothing without the scanned count beside them.
+        """
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="Blank backs")
+        store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=None,
+                pages_scanned=4,
+                pages_removed=2,
+                pages_uploaded=2,
+                removed_positions=(2, 4),
+            ),
+        )
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert list(row) == [
+            "id",
+            "profile",
+            "title",
+            "state",
+            "created_at",
+            "outcome",
+            "warning",
+            "error",
+            "pages_scanned",
+            "pages_removed",
+            "pages_uploaded",
+            "pages_removed_positions",
+        ]
+        assert row["pages_scanned"] == 4
+        assert row["pages_removed"] == 2
+        assert row["pages_uploaded"] == 2
+        assert row["pages_removed_positions"] == [2, 4]
+        # Information, never a warning: a DONE with blank backs stays plain.
+        assert row["warning"] is None
+
+    def test_jobs_json_counts_and_positions_are_null_when_never_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A job that counted nothing carries ``null`` for all four, not 0 or []."""
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=1)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        for key in (
+            "pages_scanned",
+            "pages_removed",
+            "pages_uploaded",
+            "pages_removed_positions",
+        ):
+            assert key in row
+            assert row[key] is None, key
+
+    @staticmethod
+    def _settings_in(tmp_path: Path, data_dir: Path) -> Settings:
+        """Build Settings whose data_dir is ``data_dir``, everything else in tmp_path."""
+        return _make_settings(
+            tmp_path,
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(data_dir),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
+    @pytest.mark.parametrize("limit", ["-1", "0"])
+    def test_jobs_rejects_a_non_positive_limit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: str
+    ) -> None:
+        """
+        ``--limit`` below 1 is a usage error, exit 2.
+
+        SQLite reads a negative LIMIT as no limit at all, so ``-1`` would print
+        the whole history, and ``0`` would ask for nothing.
+        """
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=3)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--limit", limit])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "Invalid value for '--limit'" in result.stderr
+        assert "Test Document" not in result.stdout
+
+    def test_jobs_refuses_an_older_database_and_leaves_it_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A history at an older schema is refused, and not upgraded behind a server.
+
+        Listing the history is a read.  Upgrading the database is the job of
+        the ``saneless serve`` that owns it, so ``jobs`` names that and exits
+        2, and the file's bytes and its stamped version are as they were.
+        """
+        settings = self._settings_for(tmp_path)
+        db_path = settings.output.db_path
+        conn = sqlite3.connect(db_path)
+        try:
+            # The first two steps of the real ladder, as a version 2 release
+            # left the database.
+            for step in job_module._MIGRATIONS[:2]:
+                step(conn, str(db_path))
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        finally:
+            conn.close()
+        before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "schema version 2" in result.stderr
+        assert "saneless serve" in result.stderr
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone() == (2,)
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["table", "json"])
+    @pytest.mark.parametrize("data_dir_exists", [True, False], ids=["dir", "no-dir"])
+    def test_jobs_without_a_database_creates_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        as_json: bool,
+        data_dir_exists: bool,
+    ) -> None:
+        """
+        No history yet is an empty listing, and leaves no file behind.
+
+        Neither the database nor its ``-wal`` and ``-shm`` files are created,
+        and a ``data_dir`` that does not exist yet still does not: it is the
+        server's and the scan's to create.
+        """
+        data_dir = tmp_path / "data"
+        if data_dir_exists:
+            data_dir.mkdir()
+        settings = self._settings_in(tmp_path, data_dir)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", *(["--json"] if as_json else [])])
+
+        assert result.exit_code == 0, result.output
+        if as_json:
+            assert json.loads(result.stdout) == []
+        else:
+            assert result.stdout.splitlines()[0].startswith("Timestamp")
+            assert len(result.stdout.splitlines()) == 2
+        assert data_dir.exists() is data_dir_exists
+        db_path = settings.output.db_path
+        for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            assert not path.exists(), path
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["table", "json"])
+    def test_jobs_with_a_database_it_cannot_reach_exits_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        as_json: bool,
+    ) -> None:
+        """
+        A database path that cannot be looked up is a storage error, exit 2.
+
+        Only a database that is not there is an empty history.  A path the
+        lookup fails on for any other reason -- here a symlink that loops --
+        is not, and an empty table, or ``[]`` on the JSON contract, would tell
+        a script there are no jobs.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        settings = self._settings_in(tmp_path, data_dir)
+        db_path = settings.output.db_path
+        db_path.symlink_to(db_path.name)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", *(["--json"] if as_json else [])])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert result.stdout == ""
+        assert str(db_path) in result.stderr
+
+    def test_jobs_with_a_file_for_data_dir_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A data_dir that is a regular file is a configuration error, exit 2."""
+        data_dir = tmp_path / "data"
+        data_dir.write_text("not a directory\n")
+        runner, _ = _patch_cli(
+            monkeypatch, settings=self._settings_in(tmp_path, data_dir)
+        )
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "data_dir is not a directory" in result.stderr
+        assert data_dir.read_text() == "not a directory\n"
+
 
 _UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+
+# The longest a serve test waits for a thread it started to reach a point.
+_THREAD_JOIN_TIMEOUT = 5.0
 
 
 @pytest.fixture
@@ -2456,7 +3587,7 @@ def _fake_server_run(
         runs.append(run)
         app = self.config.app
         if isinstance(app, FastAPI):
-            store: object = app.state.job_store
+            store: object = services_of(app).job_store
             if isinstance(store, JobStore):
                 store.close()
         self.started = started
@@ -2538,7 +3669,7 @@ def _record_sockets(monkeypatch: pytest.MonkeyPatch) -> list[socket.socket]:
 
 
 @contextlib.asynccontextmanager
-async def _refusing_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def _refusing_lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """
     Refuse to start, the way a lifespan with a failed pre-flight would.
 
@@ -2598,6 +3729,105 @@ def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
     return outcome[0]
 
 
+@dataclasses.dataclass
+class _HeldRefresherChecks:
+    """
+    The refresher's scanner and Paperless checks, each held on an Event.
+
+    Neither looks at the stop: each waits for its release, as a request that
+    cannot be cut short does, so only what the refresher does between checks
+    decides whether a stop ends its run.
+    """
+
+    scanner_entered: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    scanner_release: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    paperless_entered: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    paperless_release: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Put both held checks in place of the real ones."""
+
+        def held_scanner_check(
+            _context: CheckContext, _gate: threading.Lock
+        ) -> CheckResult:
+            self.scanner_entered.set()
+            self.scanner_release.wait(_THREAD_JOIN_TIMEOUT)
+            return CheckResult(key=CheckKey.SCANNER, state=CheckState.OK, message="")
+
+        def held_paperless_check(_context: CheckContext) -> CheckResult:
+            self.paperless_entered.set()
+            self.paperless_release.wait(_THREAD_JOIN_TIMEOUT)
+            return CheckResult(key=CheckKey.PAPERLESS, state=CheckState.OK, message="")
+
+        monkeypatch.setattr(checks_module, "_scanner_result", held_scanner_check)
+        monkeypatch.setattr(checks_module, "_check_paperless", held_paperless_check)
+
+    def release(self) -> None:
+        """Let both checks finish, so no thread a test started is left waiting."""
+        self.scanner_release.set()
+        self.paperless_release.set()
+
+
+@dataclasses.dataclass
+class _RecordedCloses:
+    """The closes the lifespan ran, and the real ones it may have skipped."""
+
+    calls: list[str]
+    skipped: list[Callable[[], None]]
+
+    def release_leftovers(self) -> None:
+        """Close the job store and Paperless client if the lifespan did not."""
+        if not self.calls:
+            for close in self.skipped:
+                close()
+
+
+def _record_closes(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI, scanner: StubScannerBackend
+) -> _RecordedCloses:
+    """
+    Record the lifespan's three closes, in order, still running the real two.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        app: The app whose job store and Paperless client are watched.
+        scanner: The scanner backend the app was built with.
+
+    Returns:
+        The record the closes are appended to.
+
+    """
+    store: JobStore = services_of(app).job_store
+    paperless = services_of(app).paperless
+    real_store_close = store.close
+    real_paperless_close = paperless.close
+    closes = _RecordedCloses(calls=[], skipped=[real_paperless_close, real_store_close])
+
+    def recording_store_close() -> None:
+        closes.calls.append("job_store.close")
+        real_store_close()
+
+    def recording_paperless_close() -> None:
+        closes.calls.append("paperless.close")
+        real_paperless_close()
+
+    def recording_scanner_close() -> None:
+        closes.calls.append("scanner.close")
+
+    monkeypatch.setattr(store, "close", recording_store_close)
+    monkeypatch.setattr(paperless, "close", recording_paperless_close)
+    monkeypatch.setattr(scanner, "close", recording_scanner_close)
+    return closes
+
+
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
     """
@@ -2623,7 +3853,7 @@ class TestServeCommand:
         def fake_create_app(*_args: object, **_kwargs: object) -> object:
             return object()
 
-        monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", fake_create_app)
 
     @staticmethod
     def _refusing_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2632,7 +3862,7 @@ class TestServeCommand:
         def failing_create_app(*_args: object, **_kwargs: object) -> FastAPI:
             return FastAPI(lifespan=_refusing_lifespan)
 
-        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", failing_create_app)
 
     def test_serve_binds_the_configured_defaults(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2663,6 +3893,232 @@ class TestServeCommand:
         [run] = runs
         assert run.config.log_config is None
         assert run.config.access_log is True
+
+    def test_serve_bounds_the_graceful_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A stop waits 8 s for requests to finish, per uvicorn's config.
+
+        An int, because uvicorn types the setting ``int | None``.  The drain
+        is long enough for one request-path call to paperless-ngx, whose
+        connect and read budgets come to 7 s, to end inside it, so the
+        lifespan does not close the Paperless client under that request.  An
+        idle server has no request to wait for, so its stop still fits
+        inside Docker's default 10 s grace period.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        bound = run.config.timeout_graceful_shutdown
+        assert isinstance(bound, int)
+        assert bound > PROBE_CONNECT_SECONDS + PROBE_READ_SECONDS
+        assert bound == 8
+
+    def test_a_stop_ends_the_refreshers_run_before_its_paperless_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A stop tells the refresher at once, so the drain does not let it go on.
+
+        The stop lands during the refresher's scanner check, which finishes in
+        the request drain; the Paperless check after it never ends here. Told to
+        stop only after the drain, the refresher would be inside that request,
+        miss its join, and the lifespan would close nothing. Told at once, it
+        ends its run after the scanner check and all three closes run.
+
+        uvicorn is replaced by a run that does what it does around a SIGTERM:
+        start the lifespan, hand the signal to ``handle_exit``, wait out the
+        drain, then shut the lifespan down. The join is cut to 1 s so a broken
+        stop fails fast.
+        """
+        monkeypatch.setattr(app_module, "STOP_JOIN_SECONDS", 1.0)
+        held = _HeldRefresherChecks()
+        held.install(monkeypatch)
+        scanner = StubScannerBackend()
+        app = create_app(self._loopback_settings(tmp_path), scanner)
+        refresher: CheckRefresher = services_of(app).refresher
+        closes = _record_closes(monkeypatch, app, scanner)
+
+        def stopped_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            with TestClient(app):
+                self.started = True
+                refresher.note_watcher()
+                assert held.scanner_entered.wait(_THREAD_JOIN_TIMEOUT)
+                self.handle_exit(signal.SIGTERM, None)
+                held.scanner_release.set()
+                # The drain: requests still being answered keep the lifespan
+                # waiting until the refresher has either gone on to the
+                # Paperless check or ended its run.
+                assert poll_until(
+                    lambda: (
+                        held.paperless_entered.is_set() or not refresher.probe_in_flight
+                    ),
+                    _THREAD_JOIN_TIMEOUT,
+                )
+
+        monkeypatch.setattr(uvicorn.Server, "run", stopped_run)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            server_module.run_server(app, [sock], "WARNING")
+            assert not held.paperless_entered.is_set()
+            assert closes.calls == [
+                "paperless.close",
+                "job_store.close",
+                "scanner.close",
+            ]
+        finally:
+            sock.close()
+            held.release()
+            assert refresher.stop(timeout=_THREAD_JOIN_TIMEOUT) is True
+            closes.release_leftovers()
+
+    def test_a_sigterm_before_uvicorn_takes_it_also_tells_the_refresher(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve``'s own SIGTERM handler stops the refresher as well as the server.
+
+        It is in place around uvicorn's run, so it is what a SIGTERM reaches
+        before uvicorn has installed its own handler.  The run below is a
+        stand-in that installs none, so the signal it raises lands there.
+        """
+        assert threading.current_thread() is threading.main_thread()
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = services_of(app).refresher
+        asked: list[str] = []
+        should_exit: list[bool] = []
+
+        def recording_note_stop() -> None:
+            asked.append("note_stop")
+
+        def signalled_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            signal.raise_signal(signal.SIGTERM)
+            should_exit.append(self.should_exit)
+            self.started = True
+
+        monkeypatch.setattr(refresher, "note_stop", recording_note_stop)
+        monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            server_module.run_server(app, [sock], "WARNING")
+            assert should_exit == [True]
+            assert asked == ["note_stop"]
+        finally:
+            sock.close()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
+
+    def test_an_inherited_ignored_sigterm_still_stops_serve_and_is_put_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve`` stops on SIGTERM even when it was started with SIGTERM ignored.
+
+        uvicorn replaces an ignored SIGTERM with its own handler while it
+        runs, so ``serve``'s handler replaces it too, and a SIGTERM before
+        uvicorn's handler is in place stops the server as one during the run
+        would.  The ignored disposition is put back once the run returns.
+        """
+        assert threading.current_thread() is threading.main_thread()
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = services_of(app).refresher
+        should_exit: list[bool] = []
+
+        def signalled_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            signal.raise_signal(signal.SIGTERM)
+            should_exit.append(self.should_exit)
+            self.started = True
+
+        monkeypatch.setattr(refresher, "note_stop", lambda: None)
+        monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            server_module.run_server(app, [sock], "WARNING")
+            assert should_exit == [True]
+            assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+            sock.close()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
+
+    @pytest.mark.parametrize(
+        "stopping",
+        [
+            pytest.param(True, id="during-the-shutdown"),
+            pytest.param(False, id="after-a-failed-start-up"),
+        ],
+    )
+    def test_a_stop_signal_inside_the_refreshers_stop_does_not_hang(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, stopping: bool
+    ) -> None:
+        """
+        A signal that lands while the main thread stops the refresher is safe.
+
+        The lifespan stops the refresher on the main thread, at shutdown and
+        after a failed start-up, and uvicorn's signal handler runs on that same
+        thread. ``threading.Event.set`` holds a non-reentrant lock, so a handler
+        setting the same Event from inside that call would wait for ever on the
+        frame it interrupted. After a failed start-up ``should_exit`` is unset,
+        so the handler cannot tell the two cases apart by it.
+
+        The patched ``set`` stands in for that lock: a second ``set`` beginning
+        inside the first is recorded instead of blocking, and the handler is
+        called from inside the first, as a signal arriving there would run it.
+        """
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = services_of(app).refresher
+        # serve's own config: no log_config, so uvicorn rewires no loggers
+        # for the rest of the session.
+        server = server_module.StoppingServer(uvicorn.Config(app, log_config=None), app)
+        server.should_exit = stopping
+        stop_event = refresher._stopping
+        real_set = threading.Event.set
+        inside = threading.Lock()
+        reentered: list[str] = []
+        signalled: list[signal.Signals] = []
+
+        def interrupted_set(event: threading.Event) -> None:
+            if event is not stop_event:
+                real_set(event)
+                return
+            if not inside.acquire(blocking=False):
+                reentered.append("set")
+                return
+            try:
+                if not signalled:
+                    signalled.append(signal.SIGTERM)
+                    server.handle_exit(signal.SIGTERM, None)
+                real_set(event)
+            finally:
+                inside.release()
+
+        monkeypatch.setattr(threading.Event, "set", interrupted_set)
+        try:
+            refresher.request_stop()
+        finally:
+            monkeypatch.undo()
+            services_of(app).paperless.close()
+            services_of(app).job_store.close()
+        assert signalled == [signal.SIGTERM]
+        assert reentered == []
+        assert server.should_exit is True
+        assert stop_event.is_set() is True
 
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2749,8 +4205,8 @@ class TestServeCommand:
 
         A resolver lists ``::1`` first on a typical host.  Binding only that
         would refuse a reverse proxy pointed at ``127.0.0.1``; binding every
-        address keeps what uvicorn did when it bound the name itself.  With
-        port 0 the OS picks the port once and every address shares it.
+        address matches uvicorn binding the name itself.  With port 0 the OS
+        picks the port once and every address shares it.
         """
         _resolving_to(monkeypatch, "::1", "127.0.0.1")
         runs = _fake_server_run(monkeypatch)
@@ -2830,7 +4286,7 @@ class TestServeCommand:
 
         made = _record_sockets(monkeypatch)
         self._stub_create_app(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.Config", failing_config)
+        monkeypatch.setattr("saneless.web.server.uvicorn.Config", failing_config)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
@@ -2843,10 +4299,10 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A port that is taken is found before SANE is touched.
+        A port that is taken is found before the backend is built.
 
-        Binding first means a setup mistake costs no SANE start-up, and leaves
-        no initialised backend behind that no lifespan will ever close.
+        Binding first means a setup mistake leaves no backend behind that no
+        lifespan will ever close.
         """
         scanner_cls, built = _closing_scanner()
         runs = _fake_server_run(monkeypatch)
@@ -2866,17 +4322,17 @@ class TestServeCommand:
         assert built == []
         assert runs == []
 
-    def test_serve_closes_the_sockets_when_sane_fails_to_initialise(
+    def test_serve_closes_the_sockets_when_the_backend_cannot_be_built(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """SANE failing after the bind still closes the bound socket: exit 2."""
+        """A backend refused after the bind still closes the bound socket: exit 2."""
 
         class FailingSaneBackend:
-            """A backend whose construction fails the way ``sane.init()`` does."""
+            """A backend whose construction finds python-sane gone."""
 
             def __init__(self, host: str = "") -> None:
-                msg = "Could not initialise SANE: Error during device I/O"
-                raise ScanError(msg)
+                msg = python_sane_missing_message("No module named 'sane'")
+                raise ConfigError(msg, next_step=PYTHON_SANE_INSTALL_NEXT_STEP)
 
         made = _record_sockets(monkeypatch)
         runs = _fake_server_run(monkeypatch)
@@ -3081,25 +4537,17 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Uvicorn's own start-up exit code never becomes this CLI's (DEP-09, D-13).
+        Uvicorn's own start-up exit code never becomes this CLI's.
 
-        Nothing about uvicorn is stubbed here (D-14): ``serve`` binds a real
-        ephemeral loopback socket and hands it to the real
-        ``uvicorn.Server.run(sockets=...)``, so the production pre-bound-socket
-        path executes end to end. Newer uvicorn exits the process itself when
-        start-up fails, with a code that happens to be this project's Paperless
-        code, so a caller reading exit codes would be told the wrong cause.
+        Nothing about uvicorn is stubbed: ``serve`` hands a real loopback socket
+        to the real ``uvicorn.Server.run(sockets=...)``. Newer uvicorn exits the
+        process itself when start-up fails, with a code that is this project's
+        Paperless code, so a caller would be told the wrong cause.
 
-        The lifespan is made to refuse by patching ``saneless.cli.create_app``
-        rather than by pointing a configured directory somewhere unwritable
-        (the corrected D-15): the CLI's own settings pre-flight calls
-        ``validate_settings_dirs`` and exits 2 from there, before
-        ``_run_server`` is ever reached, so the configuration route would pass
-        on an unfixed tree and prove nothing.
-
-        This is the one serve test that reaches real uvicorn, so it is the one
-        that needs ``_invoke_on_a_worker_thread``; see that helper for why the
-        main thread cannot be used once the browser module has run.
+        The lifespan refuses through a patched ``saneless.web.app.create_app``: an
+        unwritable configured directory would be refused by the settings
+        pre-flight, exit 2, before ``run_server`` is reached, and prove nothing.
+        It reaches real uvicorn, so it runs on ``_invoke_on_a_worker_thread``.
         """
         self._refusing_create_app(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
@@ -3153,38 +4601,31 @@ class TestServeCommand:
         assert len(runs) == 1
         assert "Cancelled" not in result.output
 
-    def test_serve_sane_init_failure_exits_2_not_1(
+    def test_serve_starts_when_sane_will_not_initialise(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        SANE failing to initialise stops ``serve`` starting: exit 2, not 1.
+        A SANE that will not initialise does not stop ``serve`` starting.
 
-        ``serve`` scans nothing itself, so its setup failures share the
-        "can't start, fix your setup" code.
+        Building the backend starts no SANE in this process, so the failure
+        is the first scanner child's to report, on the Scanner row or in the
+        first scan, and the web page stays up to show it.
         """
         runs = _fake_server_run(monkeypatch)
-
-        class FailingSaneBackend:
-            """A backend whose construction fails the way ``sane.init()`` does."""
-
-            def __init__(self, host: str = "") -> None:
-                msg = "Could not initialise SANE: Error during device I/O"
-                raise ScanError(msg)
-
+        broken = FakeSaneModule(init_error=FakeSaneError("Error during device I/O"))
+        monkeypatch.setattr(scan_session_mod, "sane", broken)
         runner, _ = _patch_cli(
             monkeypatch,
             settings=self._loopback_settings(tmp_path),
-            scanner_cls=FailingSaneBackend,
+            scanner_cls=sane_backend.SaneBackend,
         )
 
         result = runner.invoke(cli, ["serve"])
 
-        assert result.exit_code == 2, result.output
-        assert _failure_lines(result) == [
-            "The web server could not start: Could not initialise SANE: "
-            "Error during device I/O"
-        ]
-        assert runs == []
+        assert result.exit_code == 0, result.output
+        assert len(runs) == 1
+        assert "could not start" not in result.output
+        assert broken.init_call_count == 0
 
     def test_serve_ctrl_c_before_the_server_starts_exits_130(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3199,7 +4640,7 @@ class TestServeCommand:
         def interrupted_create_app(*_args: object, **_kwargs: object) -> object:
             raise KeyboardInterrupt
 
-        monkeypatch.setattr("saneless.cli.create_app", interrupted_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", interrupted_create_app)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
@@ -3218,7 +4659,7 @@ class TestServeCommand:
             msg = "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
             raise PaperlessError(msg)
 
-        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", failing_create_app)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
@@ -3233,7 +4674,7 @@ class TestServeCommand:
 
 
 class TestAutoProfiles:
-    """auto-profiles command tests."""
+    """auto-profiles generates, refreshes and reports scanner profiles."""
 
     @staticmethod
     def _make_auto_scanner(
@@ -3320,15 +4761,15 @@ class TestAutoProfiles:
         assert "'flatbed'" in added
         assert "'adf'" in added
         # Match the whole printed "  <name>: source=..." line, not a bare
-        # substring: "flatbed" alone is a substring of the pre-D-14 name too,
-        # so a looser assertion would pass before and after the rename.
+        # substring: "flatbed" also occurs inside longer profile names, so a
+        # looser assertion could match the wrong line.
         assert "  flatbed: source=Flatbed" in result.output
         assert "  adf: source=ADF" in result.output
 
     def test_auto_profiles_writes_to_loaded_config_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """auto-profiles writes to the file settings were loaded from (D-16)."""
+        """auto-profiles writes to the file settings were loaded from."""
         monkeypatch.chdir(tmp_path)
         config_file = tmp_path / "elsewhere" / CONFIG_FILENAME
         config_file.parent.mkdir()
@@ -3340,36 +4781,52 @@ class TestAutoProfiles:
         assert config_file.exists()
         assert not (tmp_path / "saneless.toml").exists()
 
-    def test_auto_profiles_without_loaded_file_writes_cwd_default(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_auto_profiles_without_loaded_file_never_writes_the_cwd(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
     ) -> None:
-        """With no config file loaded, auto-profiles keeps ./saneless.toml."""
-        monkeypatch.chdir(tmp_path)
-        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+        """
+        With no config file loaded, ./saneless.toml is never the target.
+
+        It is the first file the next start looks at, so a file created there
+        would outrank every documented location, and the output names the
+        file that was written by its absolute path.
+        """
+        files = patched_search_paths
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=self._make_auto_scanner()
+        )
 
         result = runner.invoke(cli, ["auto-profiles"])
 
-        assert result.exit_code == 0
-        assert (tmp_path / "saneless.toml").exists()
-        # Orchestrator resolution 2: the relative default is named absolutely.
-        resolved = (tmp_path / "saneless.toml").resolve()
-        assert f"Profiles in {resolved}:" in result.output
+        assert result.exit_code == 0, result.output
+        assert not files.cwd.exists()
+        assert f"Profiles in {files.xdg}:" in result.output
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
-        auto-profiles with no scanners is a setup error: exit 2, as on scan.
+        auto-profiles with no scanners is a scanner condition: exit 1, as on scan.
 
-        D-07 files "No scanner found" under exit 2 on every command where it
-        can occur (WR-06); ``scan`` already exits 2 for it.
+        Finding no scanner means the scanner is off, unplugged or out of
+        reach, not that the configuration is wrong, so both commands that can
+        find none exit 1: an exit code means the same thing in every command.
+        The line carries the ``Scan error:`` prefix every scanner failure has,
+        and the advice is the scanner's.
         """
         scanner_cls = self._make_auto_scanner(devices=[])
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 
         result = runner.invoke(cli, ["auto-profiles"])
-        assert result.exit_code == 2
+        assert result.exit_code == 1
         lines = _failure_lines(result)
         assert len(lines) == 1
-        assert lines[0].startswith("No scanner found: ")
+        assert lines[0].startswith("Scan error: No scanner found: ")
+        advice = result.stderr.splitlines()[-1]
+        assert advice == f"Try: {error_next_step(ErrorCategory.SCANNER)}"
 
     def test_auto_profiles_force_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3389,13 +4846,13 @@ class TestAutoProfiles:
         assert "  flatbed: source=Flatbed" in result.output
         flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
         assert flatbed["source"] == "Flatbed"
-        # D-02: a key the tool does not own survives the refresh.
+        # A key the tool does not own survives the refresh.
         assert flatbed["default_tags"] == [4]
 
     def test_auto_profiles_force_skips_an_unflagged_profile_grouped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """D-01: --force reports a hand-written profile and leaves it unchanged."""
+        """--force reports a hand-written profile and leaves it unchanged."""
         config_file = tmp_path / "saneless.toml"
         self._flatbed_config(config_file, flagged=False)
         before = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
@@ -3417,7 +4874,7 @@ class TestAutoProfiles:
     def test_auto_profiles_ebusy_exits_2_without_traceback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """D-08: a single-file bind mount prints the fix and exits 2."""
+        """A single-file bind mount prints the fix and exits 2."""
         config_file = tmp_path / "saneless.toml"
         self._flatbed_config(config_file, flagged=True)
         runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
@@ -3455,7 +4912,7 @@ class TestAutoProfiles:
     def test_auto_profiles_force_in_a_config_directory_mount(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """SC3: --force refreshes a config held in a mounted directory."""
+        """--force refreshes a config held in a mounted directory."""
         config_file = tmp_path / "config" / CONFIG_FILENAME
         config_file.parent.mkdir()
         self._flatbed_config(config_file, flagged=True)
@@ -3502,6 +4959,129 @@ class TestAutoProfiles:
             assert repr(name) in line
         assert "Added: " not in result.output
 
+    def test_auto_profiles_force_unchanged_reports_no_changes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        --force over a file that already matches the generation changes nothing.
+
+        The command says so, names nothing as refreshed, and leaves the file
+        where it was rather than replacing it with identical text.
+        """
+        config_file = tmp_path / "saneless.toml"
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+        first = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+        assert first.exit_code == 0, first.output
+        inode = config_file.stat().st_ino
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"No changes to {config_file.resolve()}." in result.output
+        assert "Refreshed" not in result.output
+        assert config_file.stat().st_ino == inode
+
+    def test_auto_profiles_no_source_device_keeps_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A scanner with no source option adds default and prunes nothing.
+
+        Such a device generates only ``default``, so a flagged ``flatbed`` left
+        by an earlier run cannot be judged orphaned: the scanner said nothing
+        about where pages come from. The operator's table, with its
+        ``default_tags``, survives, and the file the command leaves behind loads.
+        """
+        config_file = tmp_path / "saneless.toml"
+        self._flatbed_config(config_file, flagged=True)
+        no_source = DeviceCapabilities(
+            sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, scanner_cls=self._make_auto_scanner(caps=no_source)
+        )
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert self._group_line(result.output, "Added: ") == "Added: 'default'"
+        assert "Removed" not in result.output
+        settings = load_settings(str(config_file))
+        assert "default" in settings.profiles
+        assert settings.profiles["flatbed"].default_tags == [4]
+
+    def test_auto_profiles_no_source_default_claims_no_source(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The detail line says what the file says: no source.
+
+        The written table has no ``source`` key, so the scanner uses its own.
+        Printing the model's ``Flatbed`` fallback would claim a platen the
+        device never reported.
+        """
+        config_file = tmp_path / "saneless.toml"
+        no_source = DeviceCapabilities(
+            sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, scanner_cls=self._make_auto_scanner(caps=no_source)
+        )
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        written = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "source" not in written
+        details = [
+            line for line in result.output.splitlines() if line.startswith("  default:")
+        ]
+        assert details == [
+            "  default: source=(none; the scanner's own), resolution=300, mode=Color"
+        ]
+
+    @staticmethod
+    def _two_devices() -> list[DeviceInfo]:
+        """Two visible scanners, listed in the order discovery reports them."""
+        return [
+            DeviceInfo(name="dev:a", vendor="A", model="One", device_type="scanner"),
+            DeviceInfo(name="dev:b", vendor="B", model="Two", device_type="scanner"),
+        ]
+
+    def test_auto_profiles_pins_the_discovered_device_when_none_is_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With ``scanner.device`` empty, the id discovery chose is written."""
+        config_file = tmp_path / "saneless.toml"
+        settings = _make_settings(tmp_path, scanner=ScannerConfig(device=""))
+        scanner_cls = self._make_auto_scanner(devices=self._two_devices())
+        runner, _ = _patch_cli(monkeypatch, settings=settings, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        data = tomllib.loads(config_file.read_text())
+        assert data["scanner"]["device"] == "dev:a"
+        pinned = self._group_line(result.output, "Pinned ")
+        assert pinned == "Pinned [scanner] device: 'dev:a'"
+
+    def test_auto_profiles_does_not_pin_over_a_configured_device(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A configured device, from a file or the environment, is not re-pinned."""
+        config_file = tmp_path / "saneless.toml"
+        settings = _make_settings(tmp_path, scanner=ScannerConfig(device="dev:b"))
+        scanner_cls = self._make_auto_scanner(devices=self._two_devices())
+        runner, _ = _patch_cli(monkeypatch, settings=settings, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert "scanner" not in tomllib.loads(config_file.read_text())
+        assert "Pinned " not in result.output
+
 
 # What the superseded-name file holds in these tests.  Byte-for-byte
 # comparable, so "auto-profiles left it alone" is an assertion and not a hope.
@@ -3516,7 +5096,8 @@ def _stale_only_discovery(tmp_path: Path) -> ConfigDiscovery:
         tmp_path: pytest's per-test directory.
 
     Returns:
-        The recording: no ``saneless.toml``, one stale ``<tmp_path>/etc/config.toml``.
+        The recording: no ``saneless.toml``, and one stale
+        ``<tmp_path>/etc/config.toml``.
 
     """
     directory = tmp_path / "etc"
@@ -3543,20 +5124,72 @@ def _leftover_discovery(tmp_path: Path) -> ConfigDiscovery:
     return discover_config((directory / CONFIG_FILENAME,))
 
 
+class _SearchFiles(NamedTuple):
+    """The three config search candidates of one test, each spelled absolute."""
+
+    cwd: Path
+    xdg: Path
+    etc: Path
+
+
+@pytest.fixture
+def patched_search_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> _SearchFiles:
+    """
+    Redirect the three config search candidates into ``tmp_path``.
+
+    The real third candidate is ``/etc/saneless``, which no test may create or
+    write, so the search list itself is replaced.  The working directory is
+    moved into the first candidate's directory and that candidate stays
+    relative, exactly as the real one is.  Only the directories the first two
+    candidates need to exist are created: the XDG base, but not its
+    ``saneless`` directory, and nothing under ``etc`` -- whether those exist is
+    what several tests are about.
+
+    A test attaches ``_searched()`` to its settings, which is what the real
+    loader records.
+
+    Returns:
+        The three candidate files, absolute, in search order.
+
+    """
+    files = _SearchFiles(
+        cwd=tmp_path / "cwd" / CONFIG_FILENAME,
+        xdg=tmp_path / "xdg" / "saneless" / CONFIG_FILENAME,
+        etc=tmp_path / "etc" / "saneless" / CONFIG_FILENAME,
+    )
+    files.cwd.parent.mkdir(parents=True)
+    files.xdg.parent.parent.mkdir(parents=True)
+    monkeypatch.chdir(files.cwd.parent)
+    monkeypatch.setattr(
+        "saneless.config.config_search_paths",
+        lambda: (Path(CONFIG_FILENAME), files.xdg, files.etc),
+    )
+    return files
+
+
+def _searched() -> ConfigDiscovery:
+    """
+    Record the (patched) search as the real loader would, right now.
+
+    Returns:
+        The recording of a search over ``config_search_paths()``.
+
+    """
+    return discover_config(config_module.config_search_paths())
+
+
 class TestAutoProfilesRefusesAStaleOnlyConfig:
     """
-    D-15: the one CLI write refuses while a superseded-name file is the only one.
+    auto-profiles refuses to write while a superseded-name file is the only one.
 
-    ``auto-profiles``'s target with nothing loaded is ``./saneless.toml``, and
-    that file is the *first* thing the next start looks at.  Writing a
-    ``saneless.toml`` while an unread ``config.toml`` still holds the only
-    copy of the Paperless URL and token would not lose those values but would
-    permanently shadow them: the search would stop at the new file and the row
-    saying to rename the old one would go green, with the appliance still
-    running on defaults.
-
-    So the refusal is not tidiness -- it is the difference between a fixable
-    situation and one whose evidence has been buried.
+    With nothing loaded, ``auto-profiles`` creates a file in a searched
+    directory, and the next start loads it. A ``saneless.toml`` written while
+    an unread ``config.toml`` holds the only copy of the Paperless URL and
+    token would bury them: the search would stop at the new file and the red
+    row saying to rename the old one would drop to amber, with the appliance
+    still running on defaults.
     """
 
     @staticmethod
@@ -3636,7 +5269,7 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     def test_it_exits_two_and_says_to_rename_the_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Exit 2 through the group guard, exactly as the no-scanner refusal does."""
+        """The refusal exits 2 through the group guard and says to rename the file."""
         result = self._refuse(monkeypatch, tmp_path, [])
         stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
 
@@ -3663,7 +5296,7 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     def test_it_creates_no_shadowing_config_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The refusal is about a file that must not appear, so look for it."""
+        """The refusal creates no ``saneless.toml`` that would shadow the stale file."""
         self._refuse(monkeypatch, tmp_path, [])
 
         assert not (tmp_path / CONFIG_FILENAME).exists()
@@ -3672,7 +5305,7 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     def test_it_leaves_the_stale_files_bytes_alone(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Detecting a name is not supporting it: the file is stat-ed, never touched."""
+        """The stale file is stat-ed, never touched: its bytes stay as they were."""
         self._refuse(monkeypatch, tmp_path, [])
 
         stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
@@ -3682,7 +5315,7 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A configuration refusal must not need a scanner to be reached.
+        The refusal comes before any device enumeration.
 
         Placing it after the device call would mean an operator with the file
         in the wrong place *and* no scanner attached is told about the scanner
@@ -3697,11 +5330,10 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
 
 class TestAutoProfilesWriteTargetFollowsTheSearch:
     """
-    CFG-05/D-13: the write goes to the file the search loaded, under its new name.
+    The write goes to the file the search loaded, under its new name.
 
-    ``--config`` was already covered; these are the two paths where no explicit
-    path was given and the recording is the only thing that says where the
-    configuration lives.
+    These are the paths where no ``--config`` was given and the recording is
+    the only thing that says where the configuration lives.
     """
 
     def test_it_writes_to_the_file_the_search_loaded(
@@ -3726,15 +5358,16 @@ class TestAutoProfilesWriteTargetFollowsTheSearch:
         assert "flatbed" in tomllib.loads(loaded.read_text())["profiles"]
         assert not (tmp_path / CONFIG_FILENAME).exists()
 
-    def test_a_search_that_found_nothing_writes_the_cwd_default(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_a_search_that_found_nothing_writes_no_cwd_file(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
     ) -> None:
-        """With nothing loaded and nothing stale, the new name in the cwd is the target."""
-        monkeypatch.chdir(tmp_path)
+        """With nothing loaded and nothing stale, the cwd is still not the target."""
+        files = patched_search_paths
         settings = _make_settings(tmp_path)
-        settings._config_discovery = discover_config(
-            (tmp_path / "etc" / CONFIG_FILENAME,)
-        )
+        settings._config_discovery = _searched()
         runner, _ = _patch_cli(
             monkeypatch,
             settings=settings,
@@ -3744,19 +5377,576 @@ class TestAutoProfilesWriteTargetFollowsTheSearch:
         result = runner.invoke(cli, ["auto-profiles"])
 
         assert result.exit_code == 0, result.output
-        written = tmp_path / CONFIG_FILENAME
-        assert "flatbed" in tomllib.loads(written.read_text())["profiles"]
+        assert "flatbed" in tomllib.loads(files.xdg.read_text())["profiles"]
+        assert not files.cwd.exists()
+
+
+class TestAutoProfilesTarget:
+    """
+    With no config file loaded, the new file goes where no later search shadows.
+
+    The search reads ``./saneless.toml`` first, and in the container the
+    working directory is the data directory, so a file created there outranks
+    the ``/etc/saneless`` file the documentation tells the operator to mount --
+    the command that was meant to help would build the trap itself.  The target
+    is therefore the last documented location saneless may write: the system
+    directory when it already exists and is writable, else the per-user XDG
+    one.  saneless never creates the system directory.
+
+    Every test redirects the search into ``tmp_path``; no test may touch the
+    real ``/etc/saneless``.
+    """
+
+    @staticmethod
+    def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        args: tuple[str, ...] = ("auto-profiles",),
+    ) -> Result:
+        """
+        Run ``auto-profiles`` over the patched search with nothing loaded.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            args: The command line.
+
+        Returns:
+            The runner's result.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+        return runner.invoke(cli, list(args))
+
+    def test_the_target_is_an_existing_writable_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        An existing, writable system directory is the target.
+
+        The container's mounted ``./config`` is that directory.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert files.etc.stat().st_mode & 0o777 == 0o600
+        assert not files.cwd.exists()
+        assert not files.xdg.exists()
+        assert str(files.etc) in result.stdout
+
+    def test_the_target_is_xdg_without_an_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        No system directory: the per-user one, created private, and nothing else.
+
+        The ``saneless`` directory under the XDG base is created 0700, because
+        the file it holds may later carry the Paperless token.
+        """
+        files = patched_search_paths
+        assert not files.xdg.parent.exists()
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        assert files.xdg.parent.stat().st_mode & 0o777 == 0o700
+        assert files.xdg.stat().st_mode & 0o777 == 0o600
+        assert not files.etc.parent.exists()
+        assert not files.cwd.exists()
+        assert str(files.xdg) in result.stdout
+
+    def test_the_target_is_xdg_when_etc_is_not_writable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        An admin-owned system directory is left alone for a non-root user.
+
+        ``os.access`` is patched for that one directory, so the test does not
+        depend on whether it runs as root.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        real_access = os.access
+
+        def _access(path: str | Path, mode: int) -> bool:
+            """
+            Refuse write access to the system directory only.
+
+            Returns:
+                False for writing the system directory, else the real answer.
+
+            """
+            if Path(path) == files.etc.parent and mode == os.W_OK:
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", _access)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        assert not files.etc.exists()
+        assert not files.cwd.exists()
+
+    def test_a_target_directory_that_cannot_be_created_exits_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The container's HOME may not exist: a configuration error, not a crash.
+
+        The message names the file that could not be written, so the operator
+        can create the directory or mount ``/etc/saneless``.
+        """
+        files = patched_search_paths
+        refused = files.xdg.parent
+        real_mkdir = Path.mkdir
+
+        def _mkdir(
+            path: Path,
+            mode: int = 0o777,
+            *,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            """
+            Refuse to create the XDG ``saneless`` directory only.
+
+            Raises:
+                PermissionError: For that directory.
+
+            """
+            if path == refused:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot write {files.xdg}" in result.stderr
+        assert "Traceback" not in result.output
+        assert not files.cwd.exists()
+
+    @staticmethod
+    def _refuse_etc_and_xdg(
+        monkeypatch: pytest.MonkeyPatch, files: _SearchFiles
+    ) -> None:
+        """
+        Make the system directory unwritable and the XDG directory uncreatable.
+
+        ``os.access`` is patched for the system directory only, so the test
+        does not depend on whether it runs as root; the XDG ``saneless``
+        directory's creation is refused the way a missing HOME refuses it.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            files: The patched search candidates.
+
+        """
+        files.etc.parent.mkdir(parents=True)
+        real_access = os.access
+        real_mkdir = Path.mkdir
+
+        def _access(path: str | Path, mode: int) -> bool:
+            """
+            Refuse write access to the system directory only.
+
+            Returns:
+                False for writing the system directory, else the real answer.
+
+            """
+            if Path(path) == files.etc.parent and mode == os.W_OK:
+                return False
+            return real_access(path, mode)
+
+        def _mkdir(
+            path: Path,
+            mode: int = 0o777,
+            *,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            """
+            Refuse to create the XDG ``saneless`` directory only.
+
+            Raises:
+                PermissionError: For that directory.
+
+            """
+            if path == files.xdg.parent:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(os, "access", _access)
+        monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+    def test_a_failed_fallback_names_the_unwritable_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The failure says why the system directory was passed over.
+
+        Otherwise the operator is told only about a per-user file they never
+        meant to use, and goes looking in the wrong place.
+        """
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        (line,) = [
+            line for line in result.stderr.splitlines() if "Cannot write" in line
+        ]
+        assert line.startswith(f"Cannot write {files.xdg}: ")
+        assert line.endswith(
+            f"({files.etc.parent} exists but is not writable by this user)"
+        )
+
+    def test_a_failed_fallback_names_a_read_only_etc_mount(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """A ``:ro`` mount is named as one, since its fix is not an ownership change."""
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+        monkeypatch.setattr(
+            cli_module, "is_read_only_mount", lambda path: path == files.etc.parent
+        )
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"({files.etc.parent} exists but is mounted read-only)" in result.stderr
+
+    def test_a_failed_write_with_no_etc_directory_adds_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """With no system directory, the write error names no skipped directory."""
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+        files.etc.parent.rmdir()
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot write {files.xdg}: " in result.stderr
+        assert "exists but" not in result.stderr
+
+    def test_a_dangling_symlink_at_the_target_exits_2_and_creates_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The search counts a link to nothing as no file; the write must not follow it.
+
+        Whoever can write the system directory could plant the link, and a
+        root run would otherwise create the file it names.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        planted = tmp_path / "elsewhere" / "planted.conf"
+        planted.parent.mkdir()
+        files.etc.symlink_to(planted)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot create {files.etc}: it is a symlink" in result.stderr
+        assert "Traceback" not in result.output
+        assert not planted.exists()
+        assert list(planted.parent.iterdir()) == []
+
+    def test_an_explicit_config_is_the_target_whatever_else_exists(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """``--config`` names the file, and a writable system directory is ignored."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        given = tmp_path / "given" / CONFIG_FILENAME
+        given.parent.mkdir()
+
+        result = self._run(
+            monkeypatch, tmp_path, ("--config", str(given), "auto-profiles")
+        )
+
+        assert result.exit_code == 0, result.output
+        assert given.exists()
+        assert not files.etc.exists()
+        assert not files.xdg.exists()
+        assert not files.cwd.exists()
+
+    def test_the_target_without_a_recording_uses_the_documented_search(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Settings built without a load carry no recording; the search list stands in.
+
+        The CLI's own name for the search list is patched, as the module-level
+        fixture patches the loader's.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        monkeypatch.setattr(
+            cli_module,
+            "config_search_paths",
+            lambda: (Path(CONFIG_FILENAME), files.xdg, files.etc),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_make_settings(tmp_path),
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert not files.cwd.exists()
+
+
+def _fake_file_owner(monkeypatch: pytest.MonkeyPatch, path: Path, uid: int) -> None:
+    """
+    Make ``os.stat`` report ``path`` as owned by ``uid`` once it exists.
+
+    A path that does not exist yet still raises, so a writer asking whether
+    the file is there is answered for real.  Nothing is chowned: a non-root
+    test cannot give a file to root.
+
+    Args:
+        monkeypatch: pytest's patcher.
+        path: The file whose owner is faked.
+        uid: The owner to report.
+
+    """
+    real_stat = os.stat
+    faked = os.fspath(path)
+
+    def fake_stat(
+        target: int | str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        """
+        Return the real status, with the file's owner replaced.
+
+        Returns:
+            The real status of ``target``, owned by ``uid`` when it is the file.
+
+        """
+        result = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if isinstance(target, int) or os.fspath(target) != faked:
+            return result
+        fields = list(result)
+        fields[stat.ST_UID] = uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
+class TestAutoProfilesRootOwnedNewConfig:
+    """
+    A config root creates and cannot give away is named, with the fix.
+
+    A new file takes its directory's owner, which on a bare-metal host is
+    usually root for ``/etc/saneless``.  The file then stays root's, mode 0600,
+    and a service running as an ordinary user finds it and cannot read it, so
+    every later command exits 2.  The command therefore says so on stderr, with
+    the absolute path and the ``chown`` that fixes it.
+    """
+
+    @staticmethod
+    def _run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Result:
+        """
+        Run ``auto-profiles`` over the patched search with nothing loaded.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        Returns:
+            The runner's result.
+
+        """
+        return TestAutoProfilesTarget._run(monkeypatch, tmp_path)
+
+    def test_a_new_root_owned_file_is_named_with_the_chown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """The note names the absolute file and tells the operator to chown it."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        _fake_file_owner(monkeypatch, files.etc, 0)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        notes = [line for line in result.stderr.splitlines() if "chown" in line]
+        assert len(notes) == 1, result.stderr
+        assert f"chown <user>: {files.etc}" in notes[0]
+        assert f"{files.etc} is owned by root" in notes[0]
+        assert "chown" not in result.stdout
+
+    def test_a_new_root_owned_per_user_file_is_not_told_to_chown_in_place(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        A root-owned per-user file gets the moves that work, not a chown.
+
+        Root's own per-user file is not in another user's search at all.
+        With no system directory, root's target is the file under its own
+        home.  A ``chown`` there fixes nothing: another user never searches
+        that home, and its saneless would quietly run on defaults.  The note
+        says so and gives the moves that do work.
+        """
+        files = patched_search_paths
+        _fake_file_owner(monkeypatch, files.xdg, 0)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        notes = [line for line in result.stderr.splitlines() if "chown" in line]
+        assert len(notes) == 1, result.stderr
+        note = notes[0]
+        assert f"{files.xdg} is owned by root" in note
+        assert f"chown <user>: {files.xdg}" not in note
+        assert "any other user will not read it" in note
+        assert f"mv {files.xdg} {files.etc.parent}/" in note
+        assert f"chown <user>: {files.etc}" in note
+        assert "`saneless auto-profiles` as that user" in note
+
+    def test_a_new_per_user_directory_takes_its_parents_owner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Root with an ordinary user's HOME leaves no root-only directory there.
+
+        ``sudo -E`` keeps HOME, so the per-user target is in the invoking
+        user's home.  The ``saneless`` directory it creates takes that home's
+        owner, the rule the new file already follows, so the file follows it
+        too and the user can reach both.
+        """
+        files = patched_search_paths
+        base = files.xdg.parent.parent.stat()
+        monkeypatch.setattr(os, "geteuid", lambda: base.st_uid + 1)
+        given: list[tuple[int, int, int]] = []
+
+        def fchown(fd: int, uid: int, gid: int) -> None:
+            given.append((os.fstat(fd).st_ino, uid, gid))
+
+        monkeypatch.setattr(os, "fchown", fchown)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        directory = files.xdg.parent.stat()
+        assert (directory.st_ino, base.st_uid, base.st_gid) in given
+
+    def test_a_new_file_owned_by_another_user_says_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """A file that went to the directory's non-root owner needs no fix."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        _fake_file_owner(monkeypatch, files.etc, 4242)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert "chown" not in result.output
+
+    def test_an_existing_root_owned_file_says_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A rewrite keeps the owner the file already had; that is not news.
+
+        The note is about a file this command created, so a loaded file owned
+        by root -- whoever put it there chose that -- is rewritten silently.
+        """
+        loaded = tmp_path / "etc" / CONFIG_FILENAME
+        loaded.parent.mkdir()
+        loaded.write_text("# loaded by the search\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config((loaded,))
+        _fake_file_owner(monkeypatch, loaded, 0)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert "flatbed" in tomllib.loads(loaded.read_text())["profiles"]
+        assert "chown" not in result.output
 
 
 class TestStaleConfigWarningReachesTheTerminal:
     """
-    D-16: a one-shot command says on stderr what its log file says.
+    A one-shot command says on stderr what its log file says.
 
-    The startup log already names the ignored file, but a one-shot command's
-    log goes to ``log_file`` and is read afterwards, if at all.  The operator
-    watching the command run sees nothing -- which is the shape of the
-    2026-09-22 failure, where every surface that could have said it was one the
-    reader was not looking at.
+    The startup log names the ignored file, but a one-shot command's log goes
+    to ``log_file`` and is read afterwards, if at all, so the operator
+    watching the command run would otherwise see nothing.
 
     ``serve`` is exempt because its records already stream to stderr: a service
     printing the sentence twice per start is noise in the one stream an
@@ -3824,7 +6014,7 @@ class TestStaleConfigWarningReachesTheTerminal:
 
         It is the state an upgraded Docker deployment lands in, and the old
         file there can hold the only copy of the URL and token -- so the
-        terminal says to move before it says to delete (D-17).
+        terminal says to move before it says to delete.
         """
         result = self._devices(monkeypatch, tmp_path, _leftover_discovery(tmp_path))
         stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
@@ -3834,6 +6024,61 @@ class TestStaleConfigWarningReachesTheTerminal:
         assert f"an old {LEGACY_CONFIG_FILENAME} is being ignored" in warnings[0]
         assert f"Move anything you still need from {stale.absolute()}" in warnings[0]
         assert warnings[0].index("Move") < warnings[0].index("then delete")
+
+    def test_shadowed_config_is_warned_on_stderr(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Two config files: the terminal names the one in use and the one not read.
+
+        A second file is the Docker trap in its settled form -- the file the
+        operator edits is not the one saneless reads -- and a one-shot command's
+        log is not in front of the person who just ran it.
+        """
+        files = patched_search_paths
+        files.cwd.write_text("# in use\n")
+        files.etc.parent.mkdir(parents=True)
+        files.etc.write_text("# not read\n")
+
+        result = self._devices(monkeypatch, tmp_path, _searched())
+
+        assert result.exit_code == 0, result.output
+        warnings = self._warnings(result)
+        assert len(warnings) == 1, result.stderr
+        assert warnings[0].startswith("Warning: Using ")
+        assert str(files.cwd) in warnings[0]
+        assert str(files.etc) in warnings[0]
+
+    def test_shadowed_and_leftover_are_both_warned(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        A shadowing file must not hide an old-name file that may hold the token.
+
+        The Configuration row can show only one of the two situations, and the
+        shadowed one wins there; the terminal has room for both lines.
+        """
+        files = patched_search_paths
+        files.cwd.write_text("# in use\n")
+        files.etc.parent.mkdir(parents=True)
+        files.etc.write_text("# not read\n")
+        stale = files.cwd.with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text(_STALE_TEXT)
+
+        result = self._devices(monkeypatch, tmp_path, _searched())
+
+        warnings = self._warnings(result)
+        assert len(warnings) == 2, result.stderr
+        assert warnings[0].startswith("Warning: Using ")
+        assert str(files.etc) in warnings[0]
+        assert f"an old {LEGACY_CONFIG_FILENAME} is being ignored" in warnings[1]
+        assert f"Move anything you still need from {stale}" in warnings[1]
 
     def test_a_loaded_file_with_nothing_beside_it_prints_no_warning(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3874,19 +6119,16 @@ class TestStaleConfigWarningReachesTheTerminal:
         expected: int,
     ) -> None:
         """
-        ``serve``'s own log already carries the sentence to stderr.
+        Only the one-shot shape echoes the warning; ``serve``'s log streams it.
 
-        Asserted at ``_load_cli_settings`` rather than by starting a server,
-        because the split is a parameter of that function and starting uvicorn
-        would test a great deal else.  Both shapes are run in one test so that
-        the exemption cannot be satisfied by printing nowhere at all.
+        Both shapes of ``_load_cli_settings`` run in one test, so the exemption
+        cannot be satisfied by printing nowhere at all.
 
         Args:
             monkeypatch: pytest's patcher.
             tmp_path: pytest's per-test directory.
             capsys: Captures the echo, which goes to the real stderr here.
-            shape: "service" for the streaming shape ``serve`` asks for,
-                "one-shot" for every other command.
+            shape: "service" for ``serve``'s shape, "one-shot" for the rest.
             expected: How many warning lines that shape should print.
 
         """
@@ -3907,7 +6149,7 @@ class TestStaleConfigWarningReachesTheTerminal:
 
 
 class TestTruncation:
-    """Tests for the _truncate helper and CLI table truncation behavior."""
+    """``_truncate`` and the CLI tables cut over-wide text with an ellipsis."""
 
     def test_truncate_short_string(self) -> None:
         """Short string within width is returned unchanged."""
@@ -4119,20 +6361,20 @@ def _cli_error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogReco
 
 class TestExitCodes:
     """
-    One guard maps every CLI failure to one message and its D-07 exit code.
+    One guard maps every CLI failure to one message and its exit code.
 
-    EXC-02 / success criterion 2: a bad config (2), a broken scanner (1), an
-    unreachable Paperless (3) and an unassemblable PDF (4) each print one error
-    report; a job database saneless cannot use is a setup problem (2); a cancel
-    or Ctrl-C is 130; anything that is not a saneless type is 5 with its
-    traceback in the log (D-06). click's own ``--help``, usage errors and
-    ``ClickException`` keep click's behaviour (Pitfall 2).
+    A bad config (2), a broken scanner (1), an unreachable Paperless (3) and
+    an unassemblable PDF (4) each print one error report; a job database
+    saneless cannot use is a setup problem (2); a cancel or Ctrl-C is 130;
+    anything that is not a saneless type is 5 with its traceback in the log.
+    click's own ``--help``, usage errors and ``ClickException`` keep click's
+    behaviour.
     """
 
     def test_bad_config_exits_2_with_header_and_one_problem_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The loader's header plus its one problem line, exit 2 (Pitfall 8)."""
+        """The loader's header plus its one problem line, exit 2."""
         runner, _ = _patch_cli(monkeypatch)
 
         def bad_load(*_args: object, **_kwargs: object) -> Settings:
@@ -4204,11 +6446,10 @@ class TestExitCodes:
         """
         A PdfError from assembly is one ``PDF error:`` line, exit 4.
 
-        Since plan 29-09 that line goes on to say where the spooled pages were
-        kept: no PDF could be built, so the page files themselves are moved
-        into a job-keyed directory under ``failed/`` (D-10).  It is still one
-        line, and still exit 4, which is what preserving the exception type
-        buys.
+        The line goes on to say where the spooled pages were kept: no PDF
+        could be built, so the page files themselves are moved into a
+        job-keyed directory under ``failed/``.  It stays one line and exit 4,
+        which is what preserving the exception type buys.
         """
         runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
 
@@ -4232,25 +6473,61 @@ class TestExitCodes:
         assert "1 spooled page file(s) were preserved at" in lines[0]
         assert "Traceback" not in result.output
 
-    def test_mid_scan_config_error_exits_2_with_one_line(
+    def test_mid_scan_no_scanner_error_exits_1_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A ConfigError raised by the scanner mid-command is exit 2, as rendered."""
+        """A NoScannerFoundError from the scanner is one ``Scan error:`` line, exit 1."""
         runner, _ = _patch_cli(
             monkeypatch,
             settings=_tmp_settings(tmp_path),
-            scanner_cls=_raising_scanner(ConfigError("No scanner found")),
+            scanner_cls=_raising_scanner(NoScannerFoundError("No scanner found")),
         )
 
         result = runner.invoke(cli, ["scan"])
 
-        assert result.exit_code == 2
-        assert _failure_lines(result) == ["No scanner found"]
+        assert result.exit_code == 1
+        assert _failure_lines(result) == ["Scan error: No scanner found"]
+
+    def test_scan_with_no_scanner_found_exits_1_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``scan`` with no device set and none discovered is a scanner error, exit 1.
+
+        The advice is the scanner's, to check it is switched on and connected,
+        not the configuration's: nothing in the file is wrong.
+        """
+
+        class _NoDeviceScanner(StubScannerBackend):
+            """A SANE that answers discovery with an empty list."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Find no scanner."""
+                return []
+
+        settings = _tmp_settings(tmp_path)
+        settings.scanner.device = ""
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=_NoDeviceScanner
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        lines = _failure_lines(result)
+        assert len(lines) == 1
+        assert lines[0].startswith("Scan error: No scanner found: ")
+        advice = result.stderr.splitlines()[-1]
+        assert advice == f"Try: {error_next_step(ErrorCategory.SCANNER)}"
+        assert "Traceback" not in result.output
 
     def test_scan_cancelled_exits_130_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A ScanCancelledError is a cancel, not a failure: exit 130 (D-01, D-03)."""
+        """A ScanCancelledError is a cancel, not a failure: exit 130."""
         exc = ScanCancelledError("Manual duplex scan cancelled at the flip prompt")
         runner, _ = _patch_cli(
             monkeypatch,
@@ -4270,9 +6547,9 @@ class TestExitCodes:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
     ) -> None:
         """
-        Ctrl-C in a command is ``Cancelled (interrupted)`` and exit 130 (D-03).
+        Ctrl-C in a command is ``Cancelled (interrupted)`` and exit 130.
 
-        Raised only inside ``runner.invoke`` (Pitfall 5): a KeyboardInterrupt
+        Raised only inside ``runner.invoke``: a KeyboardInterrupt
         escaping a test would stop the whole pytest session.
         """
         runner, _ = _patch_cli(
@@ -4292,6 +6569,128 @@ class TestExitCodes:
             lines = lines[1:]
         assert lines == ["Cancelled (interrupted)"]
         assert "Aborted!" not in result.output
+
+    def test_all_pages_blank_exits_8_with_threshold_advice(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Every page judged blank is its own failure: exit 8, never a scan error.
+
+        The advice line points at the detection threshold, because the scanner
+        did its job; a script can tell this apart from exit 1.
+        """
+        exc = AllPagesBlankError("All pages were blank")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 8
+        lines = _failure_lines(result)
+        assert len(lines) == 1
+        assert lines[0].startswith("Empty-page detection: All pages were blank")
+        assert "empty_page_coverage_threshold" in result.stderr.splitlines()[-1]
+        assert "Scan error" not in result.stderr
+
+    def test_a_classified_failure_line_includes_the_exception_notes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        What ``add_note`` attached reaches stderr, on the one failure line.
+
+        ``str(exc)`` drops notes, and a preserved scan says where its pages
+        went in one; printing the bare message would hide the file.
+        """
+        exc = ScanError("jam")
+        exc.add_note("The 3 page(s) were preserved at /d/x.pdf")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        assert _failure_lines(result) == [
+            "Scan error: jam. The 3 page(s) were preserved at /d/x.pdf"
+        ]
+
+    def test_an_unexpected_error_line_includes_the_exception_notes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A foreign exception's notes reach its ``Unexpected error`` line too."""
+        exc = RuntimeError("boom")
+        exc.add_note("The 3 page(s) were preserved at /d/x.pdf")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: False)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            "Unexpected error (RuntimeError): boom. "
+            "The 3 page(s) were preserved at /d/x.pdf"
+        )
+
+    @pytest.mark.parametrize(
+        ("signum", "code"),
+        [
+            pytest.param(signal.SIGHUP, 129, id="sighup"),
+            pytest.param(signal.SIGTERM, 143, id="sigterm"),
+        ],
+    )
+    def test_a_signal_interruption_exits_128_plus_the_signal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        signum: signal.Signals,
+        code: int,
+    ) -> None:
+        """
+        SIGHUP or SIGTERM is an interruption, not a cancel: 129 or 143.
+
+        One ``Interrupted:`` line, never the cancel's 130, because the pages
+        already scanned are kept rather than discarded.
+        """
+        exc = ScanInterrupted(f"Interrupted by {signum.name}", signum=signum)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == code
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith("Interrupted: ")
+        assert "Traceback" not in result.output
+
+    def test_keyboard_interrupt_still_exits_130_beside_the_signal_codes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Ctrl-C is a deliberate cancel that keeps nothing: exit 130."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(KeyboardInterrupt()),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 130
+        assert result.stderr.splitlines() == ["Cancelled (interrupted)"]
 
     def test_unexpected_error_exits_5_naming_the_log_file(
         self,
@@ -4327,10 +6726,10 @@ class TestExitCodes:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        When logging fell back to stderr, the line claims no log file (T-28-35).
+        When logging fell back to stderr, the line claims no log file.
 
-        The fallback renders no traceback (CR-01), so the line says how to get
-        one instead.
+        The fallback renders no traceback, so the line says how to get one
+        instead.
         """
         exc = RuntimeError("kaboom")
         runner, _ = _patch_cli(
@@ -4357,7 +6756,7 @@ class TestExitCodes:
     def test_multi_line_unexpected_message_prints_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """An exception whose text spans lines still prints one line (WR-01)."""
+        """An exception whose text spans lines still prints one line."""
         runner, _ = _patch_cli(
             monkeypatch,
             settings=_tmp_settings(tmp_path),
@@ -4434,11 +6833,11 @@ class TestExitCodes:
         code: int,
     ) -> None:
         """
-        An unwritable log file logs to stderr, but never a traceback (CR-01).
+        An unwritable log file logs to stderr, but never a traceback.
 
         The real ``configure_logging`` runs, so the stderr fallback handler is
         genuinely attached: a stub that attaches nothing cannot catch a
-        traceback printed through it (EXC-02, D-06).
+        traceback printed through it.
         """
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
@@ -4469,7 +6868,7 @@ class TestExitCodes:
     def test_stderr_log_fallback_with_verbose_prints_the_traceback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """With -v the traceback is mirrored to stderr, as D-06 promises."""
+        """With -v the traceback is mirrored to stderr."""
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         settings = _make_settings(
@@ -4499,7 +6898,7 @@ class TestExitCodes:
     def test_job_database_not_sqlite_exits_2_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A jobs.db that is not SQLite is a setup problem: exit 2 (D-07 amendment)."""
+        """A jobs.db that is not SQLite is a setup problem: exit 2."""
         settings = _tmp_settings(tmp_path)
         settings.output.db_path.write_bytes(b"this is not a database\n" * 64)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
@@ -4507,7 +6906,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith("Job database error: ")
         assert str(settings.output.db_path) in lines[0]
@@ -4517,7 +6916,12 @@ class TestExitCodes:
     def test_job_database_unsupported_schema_exits_2_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A jobs table saneless cannot migrate is exit 2, naming the database."""
+        """
+        A jobs table from before the versioned schema is exit 2, naming the database.
+
+        ``jobs`` only reads, so it refuses the old table rather than migrating
+        it, and points at ``saneless serve``, which upgrades it.
+        """
         settings = _tmp_settings(tmp_path)
         conn = sqlite3.connect(settings.output.db_path)
         try:
@@ -4530,10 +6934,10 @@ class TestExitCodes:
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert str(settings.output.db_path) in lines[0]
-        assert "unsupported schema" in lines[0]
+        assert "older than this saneless reads" in lines[0]
         assert "Unexpected error" not in result.output
         assert "Traceback" not in result.output
 
@@ -4546,18 +6950,18 @@ class TestExitCodes:
         """A StorageError is one line and exit 2, logged without a bug-report hint."""
         exc = StorageError(f"Could not open the job database at {tmp_path}: boom")
 
-        def failing_store(*_args: object, **_kwargs: object) -> JobStore:
+        def failing_read(*_args: object, **_kwargs: object) -> list[Job]:
             raise exc
 
         runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: True)
-        monkeypatch.setattr("saneless.cli.JobStore", failing_store)
+        monkeypatch.setattr("saneless.cli.read_recent_jobs", failing_read)
         caplog.set_level(logging.ERROR, logger="saneless.cli")
 
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == [f"Job database error: {exc}"]
+        assert _failure_lines(result) == [f"Job database error: {exc}"]
         assert "Full details in" not in result.output
         records = _cli_error_records(caplog)
         assert len(records) == 1
@@ -4670,7 +7074,7 @@ def _closing_scanner() -> tuple[type[_ClosingScanner], list[_ClosingScanner]]:
 
 class TestEntryPointsCloseTheBackend:
     """
-    Each one-shot command shuts SANE down when it ends (HARD-05, D-18).
+    Each one-shot command shuts SANE down when it ends.
 
     ``sane_init`` is process-global, so somebody has to undo it, and the one
     place that knows the process is ending is the entry point that started it.
@@ -4678,8 +7082,9 @@ class TestEntryPointsCloseTheBackend:
     command that exits 1 has finished with the scanner exactly as much as one
     that exits 0.
 
-    ``serve`` is the exception and is asserted as one: its backend is handed to
-    ``create_app`` and outlives the command body, so the lifespan closes it.
+    ``serve`` is the exception and is asserted as one: once its server has
+    started, the backend outlives the command body and the lifespan closes it.
+    Before that, nobody else will, so a start that fails closes it here.
     """
 
     def test_scan_closes_the_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4695,7 +7100,7 @@ class TestEntryPointsCloseTheBackend:
     def test_scan_closes_the_backend_when_the_pipeline_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The close happens before the guard prints the error and exits 1."""
+        """A failing pipeline still closes the backend once, and the scan exits 1."""
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 
@@ -4756,11 +7161,11 @@ class TestEntryPointsCloseTheBackend:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A ``ctx.exit()`` taken mid-command is not a way to skip the close.
+        The refusal to write the config file is not a way to skip the close.
 
-        An unwritable config file ends ``auto-profiles`` through
-        ``ctx.exit(ExitCode.CONFIG)`` rather than by returning or raising, and
-        that is the path most likely to be forgotten.
+        An unwritable config file ends ``auto-profiles`` with a configuration
+        error raised after the scanner was opened, exit 2, and an early exit
+        is the path most likely to be forgotten.
         """
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
@@ -4788,7 +7193,7 @@ class TestEntryPointsCloseTheBackend:
         """
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
-        monkeypatch.setattr("saneless.cli.create_app", lambda *_args: object())
+        monkeypatch.setattr("saneless.web.app.create_app", lambda *_args: object())
         _fake_server_run(monkeypatch)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
@@ -4796,12 +7201,119 @@ class TestEntryPointsCloseTheBackend:
         assert result.exit_code == 0, result.output
         assert [scanner.close_calls for scanner in built] == [0]
 
+    def test_serve_closes_the_backend_when_the_app_cannot_be_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An app that is never built never takes the backend, so ``serve`` closes it.
+
+        An unreadable trust store is the real case: the Paperless client is
+        built after SANE was initialised, and the command exits 3.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        def unreadable_trust_store(*_args: object) -> NoReturn:
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    @pytest.mark.usefixtures("uvicorn_loggers_restored")
+    def test_serve_closes_the_backend_when_the_server_never_starts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A server that never started never ran the lifespan that would close SANE.
+
+        The command exits 2, and the backend is closed on the way out.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        _fake_server_run(monkeypatch, started=False)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 2, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    @pytest.mark.usefixtures("uvicorn_loggers_restored")
+    def test_serve_leaves_the_backend_to_a_lifespan_that_took_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Once the lifespan owns the backend, a failed run does not close it here.
+
+        The lifespan keeps SANE open on purpose when a thread will not stop,
+        and that thread may be inside a SANE call that a shutdown from here
+        would pull out from under it.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        real_create_app = app_module.create_app
+
+        def taken_over(settings: Settings, scanner: ScannerBackend) -> FastAPI:
+            app = real_create_app(settings, scanner)
+            services_of(app).lifecycle.started = True
+            return app
+
+        monkeypatch.setattr("saneless.web.app.create_app", taken_over)
+        _fake_server_run(monkeypatch, started=False)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 2, result.output
+        assert [scanner.close_calls for scanner in built] == [0]
+
+    def test_serve_builds_the_backend_without_starting_sane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        scan_child_seam: ScanChildSeam,
+        listing_seam: ListingSeam,
+    ) -> None:
+        """
+        Building the server's real backend starts SANE nowhere.
+
+        No ``sane_init`` in this process and no child of either kind, by the
+        time the app factory runs; the factory then fails, so nothing is
+        served and the command exits as a start-up failure.
+        """
+        fake_sane = FakeSaneModule()
+        monkeypatch.setattr(scan_session_mod, "sane", fake_sane)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        when_built: list[tuple[int, int, int, int]] = []
+
+        def unreadable_trust_store(*_args: object) -> NoReturn:
+            when_built.append(
+                (
+                    fake_sane.init_call_count,
+                    fake_sane.child_init_call_count,
+                    len(scan_child_seam.launches),
+                    len(listing_seam.calls),
+                )
+            )
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert when_built == [(0, 0, 0, 0)]
+        assert fake_sane.exit_call_count == 0
+
 
 # The five categories a SanelessError can carry through the guard to an exit
 # code that is not ExitCode.UNEXPECTED, each paired with an exception
 # classify_error maps to it.  UNKNOWN and REJECTED are deliberately absent:
-# both map to UNEXPECTED, which takes the _report_unexpected branch, and D-12
-# leaves that branch alone because its category is a guess.
+# both map to UNEXPECTED, which takes the _report_unexpected branch, and that
+# branch prints no advice because its category is a guess.
 _ADVISED_CATEGORIES: list[tuple[ErrorCategory, type[SanelessError]]] = [
     (ErrorCategory.FEEDER, FeederEmptyError),
     (ErrorCategory.SCANNER, ScanError),
@@ -4838,16 +7350,16 @@ def _scan_raising(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> Result
 
 class TestFailureAdvice:
     """
-    The second CLI line, ``Try: <next step>`` (APPL-04, D-12).
+    A classified failure ends with a second line, ``Try: <next step>``.
 
-    Phase 28's failure line is printed byte-identically and the advice follows
-    it on stderr, so a script parsing line 1 is unaffected.
+    The failure line is printed byte for byte and the advice follows it on
+    stderr, so a script parsing line 1 is unaffected.
     """
 
     def test_feeder_failure_prints_the_failure_line_then_the_advice(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The UI-SPEC S2 specimen: the locked line, then ``Try: ``."""
+        """A feeder failure prints its failure line, then the ``Try: `` line."""
         exc = FeederEmptyError("the feeder is empty")
         result = _scan_raising(monkeypatch, exc)
 
@@ -4878,7 +7390,7 @@ class TestFailureAdvice:
         category: ErrorCategory,
         exc_type: type[SanelessError],
     ) -> None:
-        """The advice is additive: line 1 is still exactly _failure_line's."""
+        """Line 1 is exactly ``_failure_line``'s output; the advice only adds line 2."""
         exc = exc_type("boom")
         result = _scan_raising(monkeypatch, exc)
 
@@ -4893,7 +7405,7 @@ class TestFailureAdvice:
         category: ErrorCategory,
         exc_type: type[SanelessError],
     ) -> None:
-        """Phase 28's D-07 exit code per category still holds."""
+        """Each category keeps its own exit code with the advice line printed."""
         result = _scan_raising(monkeypatch, exc_type("boom"))
 
         assert result.exit_code == int(exit_code_for(category))
@@ -4920,7 +7432,7 @@ class TestFailureAdvice:
     def test_an_unexpected_saneless_error_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bare SanelessError takes _report_unexpected, which is unchanged."""
+        """A bare SanelessError takes ``_report_unexpected``, which prints no advice."""
         result = _scan_raising(monkeypatch, SanelessError("boom"))
 
         assert result.exit_code == 5
@@ -4929,26 +7441,85 @@ class TestFailureAdvice:
     def test_a_non_saneless_exception_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The final except Exception arm is untouched by D-12."""
+        """The final ``except Exception`` arm prints no advice line."""
         result = _scan_raising(monkeypatch, RuntimeError("boom"))
 
         assert result.exit_code == 5
         assert "Try: " not in result.stderr
 
-    def test_a_storage_error_gets_no_advice_line(
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_a_raise_site_next_step_replaces_the_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """
+        A raise site that knows the fix is advised by it, not by its category.
+
+        Line 1 is unchanged; only line 2 moves from the category's fallback to
+        the error's own next step.
+        """
+        exc = exc_type("boom", next_step="Do y.")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines == [_failure_line(exc, category), "Try: Do y."]
+        assert result.exit_code == int(exit_code_for(category))
+
+    def test_a_next_step_has_its_control_characters_shown_as_escapes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """StorageError has its own arm and its own line; it gains no advice."""
-        result = _scan_raising(monkeypatch, StorageError("db is unreadable"))
+        """A next step is neutralised like the failure line, so it stays one line."""
+        exc = ConfigError("boom", next_step="Do \x1b[31m y.\nThen z.")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines == ["boom", "Try: Do \\x1b[31m y.\\nThen z."]
+
+    def test_a_storage_error_gets_advice(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A job database saneless cannot use ends with a ``Try:`` line too.
+
+        ``StorageError`` has its own arm, ahead of the classified one, so it
+        has to print the advice itself: its first line is unchanged and the
+        second is the configuration fallback.
+        """
+        runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+
+        def unusable_history(*_args: object, **_kwargs: object) -> NoReturn:
+            msg = "db is unreadable"
+            raise StorageError(msg)
+
+        monkeypatch.setattr("saneless.cli.read_recent_jobs", unusable_history)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2, result.output
+        assert result.stderr.splitlines() == [
+            "Job database error: db is unreadable",
+            f"Try: {error_next_step(ErrorCategory.CONFIG)}",
+        ]
+
+    def test_a_storage_error_with_its_own_next_step_prints_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``StorageError`` that knows its fix is advised by it."""
+        exc = StorageError("db is unreadable", next_step="Do y.")
+        result = _scan_raising(monkeypatch, exc)
 
         assert result.exit_code == 2
-        assert result.stderr.startswith("Job database error: db is unreadable")
-        assert "Try: " not in result.stderr
+        assert result.stderr.splitlines() == [
+            "Job database error: db is unreadable",
+            "Try: Do y.",
+        ]
 
     def test_a_cancelled_scan_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A cancel is not a failure, so there is nothing to advise (D-03)."""
+        """A cancel is not a failure, so there is nothing to advise."""
         result = _scan_raising(monkeypatch, ScanCancelledError("Cancelled"))
 
         assert result.exit_code == 130
@@ -4957,11 +7528,418 @@ class TestFailureAdvice:
     def test_a_keyboard_interrupt_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl-C exits 130 with one line, as it did before D-12."""
+        """Ctrl-C exits 130 with one line and no advice."""
         result = _scan_raising(monkeypatch, KeyboardInterrupt())
 
         assert result.exit_code == 130
         assert "Try: " not in result.stderr
+
+
+# Arranges one raise site's failure and returns the runner and the argv.
+type _RaiseSiteSetup = Callable[
+    [pytest.MonkeyPatch, Path, contextlib.ExitStack], tuple[CliRunner, list[str]]
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class _RaiseSite:
+    """
+    One known raise site, and the two lines its failure ends with.
+
+    Attributes:
+        setup: Arranges the failure and returns the runner and the argv.
+        exit_code: The documented exit code.
+        line_one: How the failure line starts.
+        next_step: The ``Try:`` line's text: the site's own fix.
+
+    """
+
+    setup: _RaiseSiteSetup
+    exit_code: int
+    line_one: str
+    next_step: str
+
+
+def _site_without_python_sane(
+    monkeypatch: pytest.MonkeyPatch, _tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``devices`` with python-sane missing, through the real ``require_sane``."""
+    runner, _ = _patch_cli(monkeypatch)
+    monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+    _block_sane_import(monkeypatch)
+    return runner, ["devices"]
+
+
+def _site_port_in_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` on a port a real listening socket already holds."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    holder = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    return runner, ["serve", "--host", "127.0.0.1", "--port", str(port)]
+
+
+def _site_server_never_started(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` whose uvicorn start-up fails, so the server never started."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    TestServeCommand._stub_create_app(monkeypatch)
+    _fake_server_run(monkeypatch, started=False)
+    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
+
+
+def _site_unreadable_trust_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` with SSL_CERT_FILE naming no file, through the real app factory."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "absent-ca.crt"))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
+
+
+def _site_empty_config_path(
+    _monkeypatch: pytest.MonkeyPatch, _tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--config ""``, as an unset ``$CFG`` gives, through the real loader."""
+    return CliRunner(), ["--config", "", "jobs"]
+
+
+def _site_missing_config_path(
+    _monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--config`` naming a file that is not there, through the real loader."""
+    return CliRunner(), ["--config", str(tmp_path / "absent.toml"), "jobs"]
+
+
+def _site_shared_tmp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``jobs`` with a group-writable ``output.tmp_dir``."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    settings = _make_settings(
+        tmp_path,
+        output=OutputConfig(
+            tmp_dir=str(shared),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+        ),
+    )
+    runner, _ = _patch_cli(monkeypatch, settings=settings)
+    return runner, ["jobs"]
+
+
+def _site_flip_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan whose flip prompt nobody answers in time."""
+    runner, _ = _patch_cli(
+        monkeypatch,
+        settings=_duplex_settings(tmp_path, operator_wait_timeout_seconds=1),
+        scanner_cls=_counting_scanner([]),
+        paperless_cls=_recording_paperless([]),
+    )
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    never_readable(monkeypatch, FakeClock())
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
+
+
+def _site_broken_flip_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan whose terminal fails at the flip prompt."""
+    runner, _ = _patch_cli(
+        monkeypatch,
+        settings=_duplex_settings(tmp_path),
+        scanner_cls=_counting_scanner([]),
+        paperless_cls=_recording_paperless([]),
+    )
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    broken_read(monkeypatch, OSError(errno.EIO, "Input/output error"))
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Lost"]
+
+
+def _site_unknown_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``scan --profile`` naming no profile in the configuration."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    return runner, ["scan", "--profile", "nonesuch"]
+
+
+def _site_multi_page_manual_duplex(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--multi-page`` with a manual-duplex profile, at a terminal."""
+    runner, _ = _patch_cli(monkeypatch, settings=_duplex_settings(tmp_path))
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    return runner, ["scan", "--multi-page", "--profile", _DUPLEX_PROFILE]
+
+
+def _site_multi_page_off_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--multi-page`` with no terminal to ask on; CliRunner is honestly none."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    return runner, ["scan", "--multi-page"]
+
+
+def _site_manual_duplex_off_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan with no terminal to prompt the flip on."""
+    runner, _ = _patch_cli(monkeypatch, settings=_duplex_settings(tmp_path))
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE]
+
+
+def _site_unwritable_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``auto-profiles`` whose write of the config file is refused."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+
+    def unwritable(*_args: object, **_kwargs: object) -> NoReturn:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr("saneless.cli.write_profiles_to_config", unwritable)
+    return runner, ["--config", str(tmp_path / "saneless.toml"), "auto-profiles"]
+
+
+def _site_stale_only_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``auto-profiles`` when the only config file has the superseded name."""
+    settings = _make_settings(tmp_path)
+    settings._config_discovery = _stale_only_discovery(tmp_path)
+    runner, _ = _patch_cli(monkeypatch, settings=settings)
+    return runner, ["auto-profiles"]
+
+
+_FROM_A_TERMINAL = (
+    "Run the scan again from an interactive terminal, or scan from the web UI."
+)
+
+_RAISE_SITES: dict[str, _RaiseSite] = {
+    "python-sane missing": _RaiseSite(
+        _site_without_python_sane,
+        2,
+        "python-sane cannot be imported",
+        "Install the SANE development package and reinstall saneless, as the "
+        "error says, then run the command again.",
+    ),
+    "port in use": _RaiseSite(
+        _site_port_in_use,
+        2,
+        "Cannot bind to 127.0.0.1:",
+        "Stop the program that is using that port, or set output.web_port (or "
+        "pass --port) to a free port, then start saneless serve again.",
+    ),
+    "server never started": _RaiseSite(
+        _site_server_never_started,
+        2,
+        "The web server could not start on http://127.0.0.1:",
+        "Fix the problem the log lines above name, then start saneless serve again.",
+    ),
+    "unreadable trust store": _RaiseSite(
+        _site_unreadable_trust_store,
+        3,
+        "Paperless error: Could not build the TLS trust store",
+        "Check that SSL_CERT_FILE names a readable CA bundle file and "
+        "SSL_CERT_DIR a readable directory, or unset them, then try again.",
+    ),
+    "empty --config": _RaiseSite(
+        _site_empty_config_path,
+        2,
+        "Config file path is empty (was --config given an unset variable?)",
+        "Give --config the path of a saneless config file, or leave --config "
+        "out to use the usual search.",
+    ),
+    "missing --config": _RaiseSite(
+        _site_missing_config_path,
+        2,
+        "Config file not found or not a regular file: ",
+        "Give --config the path of an existing saneless config file, or leave "
+        "--config out to use the usual search.",
+    ),
+    "shared tmp_dir": _RaiseSite(
+        _site_shared_tmp_dir,
+        2,
+        "output.tmp_dir ",
+        "Make output.tmp_dir a directory you own that nobody else can write "
+        "to, or set output.tmp_dir to another directory, then try again.",
+    ),
+    "flip timeout": _RaiseSite(
+        _site_flip_timeout,
+        1,
+        "Scan error: Manual duplex flip wait timed out",
+        "Start the scan again and answer the flip prompt within "
+        "output.operator_wait_timeout_seconds, or raise that setting.",
+    ),
+    "broken flip prompt": _RaiseSite(
+        _site_broken_flip_prompt,
+        1,
+        "Scan error: Flip prompt failed",
+        "Run the scan again from a working terminal.",
+    ),
+    "unknown profile": _RaiseSite(
+        _site_unknown_profile,
+        2,
+        "Unknown profile: nonesuch",
+        "Pass --profile the name of a profile in the saneless config file, or "
+        "add a profile with that name to it, then run the scan again.",
+    ),
+    "multi-page with manual duplex": _RaiseSite(
+        _site_multi_page_manual_duplex,
+        2,
+        multi_page_manual_duplex_refusal(_DUPLEX_PROFILE),
+        "Run the scan again without --multi-page, or with a profile that is "
+        "not manual duplex.",
+    ),
+    "multi-page off a terminal": _RaiseSite(
+        _site_multi_page_off_a_terminal,
+        2,
+        MULTI_PAGE_NEEDS_TERMINAL,
+        _FROM_A_TERMINAL,
+    ),
+    "manual duplex off a terminal": _RaiseSite(
+        _site_manual_duplex_off_a_terminal,
+        2,
+        f"Profile '{_DUPLEX_PROFILE}' is manual duplex, which needs an "
+        "interactive terminal: saneless must prompt you to flip the stack "
+        "between the two passes. Run it from a terminal, or scan from the web UI.",
+        _FROM_A_TERMINAL,
+    ),
+    "unwritable config": _RaiseSite(
+        _site_unwritable_config,
+        2,
+        "Cannot write ",
+        "Make that file and its folder writable by this user, or pass "
+        "--config naming an existing config file this user can write, then "
+        "run saneless auto-profiles again.",
+    ),
+    "stale-only config": _RaiseSite(
+        _site_stale_only_config,
+        2,
+        "No config file loaded: saneless now reads saneless.toml",
+        f"Rename the {LEGACY_CONFIG_FILENAME} named above to {CONFIG_FILENAME}, "
+        "then run saneless auto-profiles again.",
+    ),
+}
+
+# The five refusals that exit 2 through the group guard, each with the whole
+# first line it prints.
+_REFUSALS: dict[str, str] = {
+    "unknown profile": "Unknown profile: nonesuch",
+    "multi-page with manual duplex": multi_page_manual_duplex_refusal(_DUPLEX_PROFILE),
+    "multi-page off a terminal": MULTI_PAGE_NEEDS_TERMINAL,
+    "manual duplex off a terminal": _RAISE_SITES[
+        "manual duplex off a terminal"
+    ].line_one,
+    "unwritable config": "",
+}
+
+
+class TestRaiseSiteAdvice:
+    """
+    Each known raise site's failure ends with its own fix, not its category's.
+
+    Every case runs the whole command, so the next step is shown to travel
+    from where the error is raised, through the group guard, to stderr.
+    """
+
+    @pytest.mark.parametrize(
+        "site",
+        [
+            pytest.param(
+                site,
+                # The trust store is built by the real HTTP transport only.
+                marks=[pytest.mark.real_paperless_transport]
+                if site == "unreadable trust store"
+                else [],
+            )
+            for site in _RAISE_SITES
+        ],
+    )
+    def test_each_raise_site_prints_its_own_next_step(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, site: str
+    ) -> None:
+        """Line 1 is the failure line; line 2 is the site's own fix."""
+        case = _RAISE_SITES[site]
+        with contextlib.ExitStack() as stack:
+            runner, args = case.setup(monkeypatch, tmp_path, stack)
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == case.exit_code, result.output
+        lines = result.stderr.splitlines()
+        assert lines[-1] == f"Try: {case.next_step}", result.stderr
+        assert lines[-2].startswith(case.line_one), result.stderr
+        fallbacks = {f"Try: {error_next_step(category)}" for category in ErrorCategory}
+        assert lines[-1] not in fallbacks
+        assert "Traceback" not in result.output
+
+    @pytest.mark.parametrize("site", list(_REFUSALS))
+    def test_refusals_are_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        site: str,
+    ) -> None:
+        """
+        A refusal is logged at ERROR, as every other failure is, and exits 2.
+
+        Its first line is the refusal's own line, byte for byte.
+        """
+        case = _RAISE_SITES[site]
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        with contextlib.ExitStack() as stack:
+            runner, args = case.setup(monkeypatch, tmp_path, stack)
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == 2, result.output
+        line_one = _failure_lines(result)[-1]
+        expected = _REFUSALS[site] or (
+            f"Cannot write {tmp_path / 'saneless.toml'}: Permission denied"
+        )
+        assert line_one == expected
+        records = [
+            record
+            for record in _cli_error_records(caplog)
+            if record.getMessage().startswith(
+                ("saneless scan failed", "saneless auto-profiles failed")
+            )
+        ]
+        assert len(records) == 1, caplog.text
+        assert expected in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("error", "fragment"),
+    [
+        (errno.EADDRINUSE, "Stop the program that is using that port"),
+        (errno.EACCES, "not allowed to listen on that port"),
+        (errno.EADDRNOTAVAIL, "Set output.web_host (or pass --host)"),
+        (errno.EAFNOSUPPORT, "Check output.web_host and output.web_port"),
+    ],
+)
+def test_a_bind_failure_next_step_fits_its_cause(error: int, fragment: str) -> None:
+    """
+    The bind advice follows the errno, so it cannot send anyone the wrong way.
+
+    A port in use, a port this user may not take and an address this machine
+    does not have are three different fixes; anything else gets advice that
+    names both settings without guessing which is wrong.
+    """
+    step = cli_module._bind_next_step(OSError(error, os.strerror(error)))
+
+    assert fragment in step
+    assert step.endswith("then start saneless serve again.")
 
 
 def _refusing_paperless() -> type:
@@ -4969,7 +7947,7 @@ def _refusing_paperless() -> type:
     Build a PaperlessClient stand-in whose construction fails the test.
 
     ``scan`` builds the client after the scanner, so reaching it at all would
-    mean the D-16 guard ran too late.
+    mean the token refusal ran too late.
 
     Returns:
         A class that raises if it is ever constructed.
@@ -4980,7 +7958,7 @@ def _refusing_paperless() -> type:
         """A paperless client that must not be reached."""
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            """Fail loudly: D-16 refuses before this point."""
+            """Fail loudly: the token refusal comes before this point."""
             msg = "PaperlessClient was built despite a placeholder token"
             raise AssertionError(msg)
 
@@ -4991,8 +7969,8 @@ def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
     """
     Build a scanner class that records every construction and device query.
 
-    "Before the scanner is opened" is the whole point of D-16, so it is
-    asserted from a counter rather than assumed from the exit code.
+    "Before the scanner is opened" is the whole point of the token refusal,
+    so it is asserted from a counter rather than assumed from the exit code.
 
     Args:
         opens: The list every call appends its name to.
@@ -5017,7 +7995,12 @@ def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
     return _CountingScanner
 
 
-def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settings:
+def _token_settings(
+    tmp_path: Path,
+    value: str,
+    consume_dir: str = "",
+    url: str = "http://paperless.invalid",
+) -> Settings:
     """
     Build settings carrying ``value`` as the paperless-ngx token.
 
@@ -5025,6 +8008,7 @@ def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settin
         tmp_path: The test's own temporary directory.
         value: The configured token, placeholder or not.
         consume_dir: A fallback consume directory, when the test needs one.
+        url: The configured paperless-ngx address; empty means unset.
 
     Returns:
         Settings otherwise identical to the suite's defaults.
@@ -5032,20 +8016,16 @@ def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settin
     """
     return _make_settings(
         tmp_path,
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=value,
-            consume_dir=consume_dir,
-        ),
+        paperless=PaperlessConfig(url=url, token=value, consume_dir=consume_dir),
     )
 
 
 class TestScanTokenRefusal:
     """
-    ``saneless scan`` refuses a placeholder token before paper moves (D-16).
+    ``saneless scan`` refuses a placeholder token before paper moves.
 
     The check runs before the scanner is opened, it is unconditional, and the
-    three commands that never talk to paperless-ngx are untouched (APPL-07).
+    three commands that never talk to paperless-ngx are untouched.
     """
 
     def test_a_blank_token_is_a_placeholder_and_exits_2_before_the_scanner(
@@ -5099,7 +8079,7 @@ class TestScanTokenRefusal:
     def test_a_consume_dir_fallback_does_not_soften_the_placeholder_refusal(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """D-16: a configured fallback must not make the surfaces disagree."""
+        """A configured consume-dir fallback does not soften the token refusal."""
         opens: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
@@ -5116,7 +8096,7 @@ class TestScanTokenRefusal:
     def test_the_placeholder_refusal_names_the_title_and_profile_then_advises(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """It is a ConfigError, so it wears the D-08 shape and the D-12 advice."""
+        """As a ConfigError it names the title and profile, then gives the advice."""
         runner, _ = _patch_cli(
             monkeypatch,
             settings=_token_settings(tmp_path, "changeme"),
@@ -5136,7 +8116,7 @@ class TestScanTokenRefusal:
     def test_the_placeholder_refusal_never_echoes_the_value(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """ASVS V7: the token is passed to the predicate, never rendered."""
+        """The token is passed to the predicate, never rendered."""
         secret = "your-token-here"
         runner, _ = _patch_cli(
             monkeypatch,
@@ -5150,6 +8130,53 @@ class TestScanTokenRefusal:
         assert result.exit_code == 2
         assert secret not in result.output
         assert secret not in result.stderr
+
+    def test_an_unset_url_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An empty ``paperless.url`` refuses like a placeholder token.
+
+        The upload would fail for certain, so feeding the stack first would
+        only waste the paper and leave the PDF in ``failed/``.
+        """
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(tmp_path, "a-real-token", url=""),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+        lines = result.stderr.splitlines()
+        assert lines[0] == (
+            "Scanning 'Tax return' with profile 'default': "
+            "the paperless-ngx address in paperless.url has not been set"
+        )
+        assert lines[1] == f"Try: {error_next_step(ErrorCategory.CONFIG)}"
+
+    def test_a_consume_dir_fallback_does_not_soften_the_unset_url_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No copy is made for an unset URL, so a scan must not start either."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(
+                tmp_path, "a-real-token", consume_dir=str(tmp_path), url=""
+            ),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
 
     def test_devices_is_unaffected_by_a_placeholder_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5180,13 +8207,14 @@ class TestScanTokenRefusal:
 
         assert result.exit_code == 0, result.output
 
+    @pytest.mark.usefixtures("patched_search_paths")
     def test_auto_profiles_is_unaffected_by_a_placeholder_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``auto-profiles`` only reads the scanner, so it still exits 0."""
-        runner, _ = _patch_cli(
-            monkeypatch, settings=_token_settings(tmp_path, "changeme")
-        )
+        settings = _token_settings(tmp_path, "changeme")
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["auto-profiles"])
 
@@ -5198,7 +8226,7 @@ def cli_local_zone(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[str],
     """
     Give one test control of the process's local zone, then restore it.
 
-    The same technique plan 30-01's ``local_zone`` fixture uses: ``local_time``
+    The same technique as test_vocabulary's ``local_zone``: ``local_time``
     renders whatever zone the C library reports, so pinning ``TZ`` and calling
     ``time.tzset()`` is the only way to assert an exact string on a host in an
     unknown zone. The trailing ``tzset`` is what makes the C library notice the
@@ -5232,12 +8260,11 @@ def _jobs_header_title_width(header: str) -> int:
         The Title column's width in characters.
 
     """
-    after_profile = cli_module._TIME_COL_WIDTH + 1 + 15 + 1
-    return header[after_profile:].index("Status") - 1
+    return header.index("Status") - header.index("Title") - 1
 
 
 class TestJobsTableWidth:
-    """The human ``jobs`` table renders local time and still fits (APPL-12)."""
+    """The human ``jobs`` table renders local time and still fits."""
 
     @staticmethod
     def _settings_for(tmp_path: Path) -> Settings:
@@ -5260,7 +8287,7 @@ class TestJobsTableWidth:
         return recorded
 
     def test_the_cli_and_the_web_share_one_formatter_object(self) -> None:
-        """D-35: cli.py imports the function, it does not re-derive the format."""
+        """cli.py imports the formatter; it does not re-derive the format."""
         assert cli_module.local_time is vocabulary_module.local_time
 
     def test_the_table_renders_local_time_with_the_zone_named(
@@ -5287,10 +8314,17 @@ class TestJobsTableWidth:
         assert len(local_time(datetime.now(tz=UTC))) <= cli_module._TIME_COL_WIDTH
         assert cli_module._TIME_COL_WIDTH == 22
 
-    def test_the_title_column_is_24_at_80_columns(
+    def test_the_title_column_is_15_at_80_columns(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Unchanged from before this plan: the zone token fits in the slack."""
+        """
+        At 80 columns the title keeps its floor of 15.
+
+        The Status column is wide enough for "Waiting: blank pages found",
+        and the Profile column gives up one character so the title does not
+        drop below its floor.  The zone token fits in the timestamp column's
+        own slack.
+        """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
         self._one_job(settings.output.db_path)
@@ -5300,7 +8334,7 @@ class TestJobsTableWidth:
 
         assert result.exit_code == 0, result.output
         lines = result.output.strip().split("\n")
-        assert _jobs_header_title_width(lines[0]) == 24
+        assert _jobs_header_title_width(lines[0]) == 15
         assert all(len(line) <= 80 for line in lines)
 
     def test_a_narrow_terminal_floors_the_title_column_at_15(
@@ -5320,7 +8354,7 @@ class TestJobsTableWidth:
 
 
 class TestJobsJsonContract:
-    """``jobs --json`` stays UTC ISO-8601: it is a machine contract (D-34)."""
+    """``jobs --json`` stays UTC ISO-8601: it is a machine contract."""
 
     @staticmethod
     def _settings_for(tmp_path: Path) -> Settings:
@@ -5373,6 +8407,9 @@ class TestJobsJsonContract:
 
         result = runner.invoke(cli, ["jobs", "--json"])
 
+        assert result.exit_code == 0, result.output
+        listed = json.loads(result.output)
+        assert [row["id"] for row in listed] == [recorded.id]
         assert local_time(recorded.created_at) not in result.output
 
 
@@ -5393,7 +8430,7 @@ def _raise_runtime_error(message: str) -> None:
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeLogging:
     """
-    ``serve`` streams to stderr and writes no log file (D-34..D-40, DLVR-04).
+    ``serve`` streams to stderr and writes no log file.
 
     Every test here patches in the **real** ``configure_logging``: a stub that
     attaches nothing can neither prove a handler was attached nor prove one
@@ -5435,7 +8472,7 @@ class TestServeLogging:
     def test_serve_attaches_no_file_handler_and_creates_no_log_directory(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A service writes no file: the platform owns retention (D-35, D-40)."""
+        """A service writes no file: the platform owns retention."""
         settings = self._serve_settings(tmp_path)
         TestServeCommand._stub_create_app(monkeypatch)
         _fake_server_run(monkeypatch)
@@ -5464,7 +8501,7 @@ class TestServeLogging:
         The Serving on line reaches stderr exactly once, whatever the level.
 
         A service's log stream is stderr too, so printing the line and also
-        logging it put the same fact on the same stream twice; a log record
+        logging it would put the same fact on the same stream twice; a record
         alone would vanish at ``log_level = "WARNING"``.
         """
         settings = self._serve_settings(tmp_path)
@@ -5486,7 +8523,7 @@ class TestServeLogging:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Exactly one stream handler carries the service's records (D-36).
+        Exactly one stream handler carries the service's records.
 
         The handlers are counted by difference against a snapshot, because
         pytest keeps capture handlers of its own on the root logger. That the
@@ -5554,10 +8591,10 @@ class TestServeLogging:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
     ) -> None:
         """
-        The serve stream renders tracebacks with and without ``-v`` (D-36 amended).
+        The serve stream renders tracebacks with and without ``-v``.
 
-        D-06's traceback-free rule was justified by "stderr is the user's
-        terminal now". For a service the stream *is* the log, journald is
+        A one-shot command keeps tracebacks off stderr because stderr is the
+        user's terminal. For a service the stream *is* the log, journald is
         nobody's terminal, and no file carries the traceback instead, so a
         traceback-free stream would discard every one of them.
         """
@@ -5584,7 +8621,7 @@ class TestServeLogging:
         """
         An exit-5 line under ``serve`` does not tell the operator to restart.
 
-        The stream already rendered the traceback (D-36 amended), so "Run
+        The stream already rendered the traceback, so "Run
         again with -v to see the traceback" would send someone to restart a
         running service to see what is printed directly above the line.
         """
@@ -5607,15 +8644,54 @@ class TestServeLogging:
         assert "Full details in" not in result.stderr
         assert "Traceback" in result.stderr
 
+    def test_serve_logs_an_expected_failure_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A port that is taken is a setup problem, reported with no traceback.
+
+        The real ``configure_logging`` runs, so the stream handler that would
+        render a traceback is really attached: a stub that attaches nothing
+        would pass this test whatever the guard logged.  The port is held by a
+        real listening socket, so the bind failure is the real one.  The
+        record still names the failure, and the failure line is printed once.
+        """
+        settings = self._serve_settings(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder,
+            _restored_root_logging(),
+        ):
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            port = holder.getsockname()[1]
+            result = runner.invoke(
+                cli, ["serve", "--host", "127.0.0.1", "--port", str(port)]
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.stderr
+        lines = result.stderr.splitlines()
+        failure = [
+            line
+            for line in lines
+            if line.startswith(f"Cannot bind to 127.0.0.1:{port}")
+        ]
+        assert len(failure) == 1, result.stderr
+        assert lines[-1].startswith("Try: ")
+        assert lines[-2] == failure[0]
+        assert "saneless serve failed" in result.stderr
+
     def test_one_shot_command_still_attaches_the_file_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A one-shot command's logging is untouched by the mode split (D-34).
+        A one-shot command gets the rotating file handler, unlike ``serve``.
 
-        The regression guard: ``jobs`` still gets the rotating file handler and
-        still records ``log_file``, so "Full details in <log_file>" keeps
-        working. If this fails, the service mode leaked into CLI mode.
+        ``jobs`` records ``log_file``, so "Full details in <log_file>" works.
+        A failure here means the service mode leaked into CLI mode.
         """
         log_file = tmp_path / "logs" / "saneless.log"
         settings = _make_settings(
@@ -5643,3 +8719,350 @@ class TestServeLogging:
         assert attached_to == [str(log_file)]
         assert obj["log_file"] == log_file
         assert log_file.parent.is_dir()
+
+
+_HOSTILE_DEVICE_NAME = "dev\x1b"
+_HOSTILE_BROKEN_NAME = "broken\x1b[2J"
+
+
+class _HostileScanner(StubScannerBackend):
+    """
+    A LAN device whose every reported string carries terminal controls.
+
+    The second device's probe fails, so the stderr line naming it is exercised
+    too.
+    """
+
+    def __init__(self, host: str = "") -> None:
+        """Accept host parameter for API compatibility."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Return a device whose strings hold ESC and CSI, and one that fails."""
+        return [
+            DeviceInfo(_HOSTILE_DEVICE_NAME, "Vend\x1b", "\x1b[2J", "scanner\x9b"),
+            DeviceInfo(_HOSTILE_BROKEN_NAME, "V", "M", "scanner"),
+        ]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Report control characters in every label, or fail for the second."""
+        if device_id == _HOSTILE_BROKEN_NAME:
+            msg = "Could not open the device"
+            raise ScanError(msg)
+        return DeviceCapabilities(
+            sources=["Flat\x1b[2Jbed"],
+            resolutions=[300],
+            modes=["co\x9blor"],
+            option_names=("src\x1bopt",),
+        )
+
+
+def _control_free(text: str) -> bool:
+    """Return whether ``text`` holds no ESC, CSI or other terminal control."""
+    return not any(ch in text for ch in ("\x1b", "\x9b", "\x85", "\x7f"))
+
+
+class TestControlCharactersAtCliSinks:
+    """Human-readable CLI output never carries a raw control character."""
+
+    def test_devices_table_neutralises_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device name, vendor and model with ESC print as visible escapes."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert _control_free(result.stderr), repr(result.stderr)
+        assert "dev\\x1b" in result.stdout
+        assert "\\x1b[2J" in result.stdout
+
+    def test_devices_capabilities_neutralise_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Capability labels, both "Capabilities for" lines and the log hold none."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.cli"):
+            result = runner.invoke(cli, ["devices", "--capabilities"])
+
+        assert result.exit_code == 1, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert _control_free(result.stderr), repr(result.stderr)
+        assert "Capabilities for dev\\x1b:" in result.stdout
+        assert "Flat\\x1b[2Jbed" in result.stdout
+        assert "co\\x9blor" in result.stdout
+        assert "src\\x1bopt" in result.stdout
+        assert "Capabilities for broken\\x1b[2J:" in result.stderr
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages
+        assert all(_control_free(message) for message in messages), messages
+
+    def test_devices_json_keeps_the_raw_name_for_the_machine_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--json`` round-trips the raw name; ``json.dumps`` escapes it."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        result = runner.invoke(cli, ["devices", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        data = json.loads(result.stdout)
+        assert data[0]["name"] == _HOSTILE_DEVICE_NAME
+
+    @staticmethod
+    def _stored_hostile_job(tmp_path: Path) -> Settings:
+        """
+        Store one job whose title and profile carry terminal controls.
+
+        Returns:
+            Settings whose database holds that job.
+
+        """
+        settings = _make_settings(
+            tmp_path,
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        store = JobStore(db_path=settings.output.db_path)
+        store.create_job(profile="p\x1b", title="t\x1b[31m")
+        store.close()
+        return settings
+
+    def test_jobs_table_neutralises_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A stored title or profile holding ESC prints as a visible escape."""
+        settings = self._stored_hostile_job(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert "t\\x1b[31m" in result.stdout
+        assert "p\\x1b" in result.stdout
+
+    def test_jobs_json_keeps_the_raw_title_despite_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``jobs --json`` round-trips the stored title unchanged."""
+        settings = self._stored_hostile_job(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        data = json.loads(result.stdout)
+        assert data[0]["title"] == "t\x1b[31m"
+        assert data[0]["profile"] == "p\x1b"
+
+
+# A scanner failure naming a device as LAN discovery could report it.
+_HOSTILE_SCAN_FAILURE = "Could not open scanner net:evil\x1b]0;owned\x07:0: busy"
+
+
+class _HostileProbeScanner(StubScannerBackend):
+    """A device whose capability probe fails naming it with a terminal escape."""
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Fail the way a device named with an escape would."""
+        raise ScanError(_HOSTILE_SCAN_FAILURE)
+
+
+class TestControlCharactersInFailureSinks:
+    """A failure's text reaches the terminal and the log with its controls escaped."""
+
+    @pytest.mark.parametrize(
+        ("category", "exc_type"),
+        [pair for pair in _ADVISED_CATEGORIES if pair[0] is not ErrorCategory.CONFIG],
+    )
+    def test_failure_line_escapes_controls(
+        self, category: ErrorCategory, exc_type: type[SanelessError]
+    ) -> None:
+        """The one stderr line for a failure carries no live control character."""
+        line = _failure_line(exc_type(_HOSTILE_SCAN_FAILURE), category)
+
+        assert _control_free(line), repr(line)
+        assert "net:evil\\x1b]0;owned\\x07:0" in line
+
+    def test_failure_line_keeps_a_configuration_error_as_written(self) -> None:
+        """The loader's multi-line configuration report is printed unchanged."""
+        report = "Configuration error in saneless.toml:\n  web.port: bad"
+
+        assert _failure_line(ConfigError(report), ErrorCategory.CONFIG) == report
+
+    def test_failure_log_line_escapes_controls(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ERROR record for a failure quotes its text with controls escaped."""
+        ctx = click.Context(cli, obj={"logging_configured": True})
+        ctx.invoked_subcommand = "scan"
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        cli_module._log_failure(ctx, ScanError(_HOSTILE_SCAN_FAILURE))
+
+        [record] = [r for r in caplog.records if r.name == "saneless.cli"]
+        assert _control_free(record.getMessage()), record.getMessage()
+
+    def test_capability_probe_log_line_escapes_controls(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The WARNING for a failed capability probe quotes the reason escaped."""
+        caplog.set_level(logging.WARNING, logger="saneless.cli")
+
+        reason = cli_module._probe_capabilities(_HostileProbeScanner(), "net:0")
+
+        assert reason == _HOSTILE_SCAN_FAILURE
+        [record] = [r for r in caplog.records if r.name == "saneless.cli"]
+        assert _control_free(record.getMessage()), record.getMessage()
+
+
+# Enough history that either rendering overflows the pipe's buffer: the
+# command is still writing when its reader goes away, as under
+# `saneless jobs | head`, rather than finished before the reader closed.
+_CLOSED_PIPE_JOBS = 3000
+
+_CLOSED_PIPE_CHILD_SECONDS = 60
+
+# The shell's code for a process its reader went away from: 128 + SIGPIPE.
+_CLOSED_PIPE_EXIT = 128 + signal.SIGPIPE
+
+_CLOSED_PIPE_CONFIG = """\
+[paperless]
+url = "http://paperless.invalid:8000"
+token = "closed-pipe-token"
+
+[output]
+tmp_dir = "{tmp_dir}"
+data_dir = "{data_dir}"
+log_file = "{log_file}"
+
+[profiles.default]
+"""
+
+# The console script's shim, the arguments travelling in the environment and
+# taken out of it before the CLI starts, because saneless reads every
+# SANELESS_ variable as a setting.
+_CLOSED_PIPE_CHILD = """
+import json
+import os
+import sys
+
+from saneless import main
+
+config = os.environ.pop("SANELESS_TEST_CONFIG")
+args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
+sys.argv = ["saneless", "--config", config, "jobs", *args]
+sys.exit(main())
+"""
+
+
+class TestJobsIntoAClosedPipe:
+    """``saneless jobs | head``: the reader goes away and saneless exits quietly."""
+
+    @pytest.mark.parametrize(
+        ("args", "taken"),
+        [([], "lines"), (["--json"], "bytes")],
+        ids=["table", "json"],
+    )
+    def test_jobs_into_a_closed_pipe_exits_141(
+        self, tmp_path: Path, args: list[str], taken: str
+    ) -> None:
+        """
+        A reader that stops early ends ``jobs`` with 141 and nothing on stderr.
+
+        The reader taking a few lines and closing its end is not a failure of
+        saneless's and not a bug: it is the shell's broken pipe, 128 plus
+        SIGPIPE.  Nothing is printed about it, and the log keeps no traceback,
+        because there is nothing for anyone to fix.  A real process and a real
+        pipe, because the interpreter's own last flush of stdout is part of
+        what has to stay quiet.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        log_file = tmp_path / "logs" / "saneless.log"
+        store = JobStore(db_path=data_dir / "saneless.db")
+        try:
+            for index in range(_CLOSED_PIPE_JOBS):
+                store.create_job(profile="default", title=f"Closed pipe {index}")
+        finally:
+            store.close()
+        config = tmp_path / "saneless.toml"
+        config.write_text(
+            _CLOSED_PIPE_CONFIG.format(
+                tmp_dir=tmp_path / "scratch", data_dir=data_dir, log_file=log_file
+            )
+        )
+        env = {
+            **os.environ,
+            "SANELESS_TEST_CONFIG": str(config),
+            "SANELESS_TEST_ARGS": json.dumps(
+                [*args, "--limit", str(_CLOSED_PIPE_JOBS + 2000)]
+            ),
+        }
+        with subprocess.Popen(
+            [sys.executable, "-c", _CLOSED_PIPE_CHILD],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=Path(__file__).resolve().parents[1],
+        ) as child:
+            assert child.stdout is not None
+            if taken == "lines":
+                read = [child.stdout.readline() for _ in range(3)]
+                assert all(read), read
+            else:
+                assert len(child.stdout.read(40)) == 40
+            child.stdout.close()
+            _, stderr = child.communicate(timeout=_CLOSED_PIPE_CHILD_SECONDS)
+
+        assert child.returncode == _CLOSED_PIPE_EXIT, stderr
+        assert stderr == b"", stderr
+        log = log_file.read_text() if log_file.exists() else ""
+        assert "Traceback" not in log, log
+        assert "Unexpected error" not in log, log
+
+
+# Runs ``saneless.main()`` with the command line replaced by a no-op, then
+# prints which of the unwinder's module and ``ctypes``, which the unwinder
+# needs and nothing else in main imports, were ever imported.  Loading the
+# unwinder imports both, whether main calls the loader or binds it at import.
+_MAIN_UNWINDER_PROBE = """\
+import json
+import sys
+
+import saneless
+import saneless.cli
+
+saneless.cli.cli = lambda: None
+saneless.main()
+print(json.dumps(sorted(m for m in ("ctypes", "saneless.thread_unwinder") if m in sys.modules)))
+"""
+
+
+def test_main_does_not_load_the_thread_unwinder() -> None:
+    """
+    The saneless process prepares nothing for the scanner library.
+
+    Every SANE call runs in a scanner child, and each child loads the C
+    library's thread unwinder for its own backend threads, so ``main`` has no
+    reason to load it here.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", _MAIN_UNWINDER_PROBE],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == []

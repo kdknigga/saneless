@@ -1,2 +1,10 @@
+{# Options only: the refresh swaps them innerHTML into the select.
+   extra_option is the current choice when the list does not name it,
+   selected so an untouched submit carries it.  With no choice the browser
+   selects the first option, which means none. #}
 <option value="">No correspondent</option>
-{% for c in correspondents %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+{% if extra_option %}<option value="{{ extra_option.id }}" selected>{{ extra_option.label }}</option>{% endif %}
+{% for c in correspondents %}<option value="{{ c.id }}"{% if c.id == selected_correspondent %} selected{% endif %}>{{ c.name }}</option>{% endfor %}
+{# Never when included inside the select (help_elsewhere): an element inside
+   a select does not survive the parser. #}
+{% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}

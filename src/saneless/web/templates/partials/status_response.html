@@ -1,17 +1,18 @@
-{# Used by every htmx route that renders status: scan success, the status poll,
-   and flip continue/abort.  The status area is the swap target; the Scan button
-   rides along out-of-band so the server alone decides its state.
-   The #status-message clear is for a successful scan only: a poll or flip
-   response carrying it would erase a 429 shown mid-scan within a second.
-   The strip refresh is scan-only for exactly the same reason: the submit is the
-   one response that has news for it -- the scanner has just become busy, so
-   the strip's paused note is due immediately -- while a poll carrying it would
-   re-render six rows every second for no new information, and a flip answer
-   changes the job, not the appliance's health.
-   Every one of these responses sets terminal_reload, so a job that has just
-   ended reloads the history table and the strip; the full page does not set
-   it, because it has just rendered both. #}
-{% include "partials/status.html" %}
-{% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
+{# The #status-message clear and the strip refresh are for a scan submit
+   only: on a poll the clear would erase a 429 shown mid-scan, and the refresh
+   would re-render the strip every second.
+
+   When an Abort lands after the scan has ended the Scan button must take
+   focus, but htmx focuses the main swap's autofocus after the out-of-band
+   ones, so the status area is told not to ask.
+
+   The title is top-level and first because htmx sets document.title only
+   from a title at the response root.  page_title never names the job's title,
+   which the tab list and history would show to anybody. #}
+<title>{{ page_title }}</title>
+{% import "partials/scan_button.html" as scan_button_state with context %}
+{% set scan_takes_focus = focus_scan and not scan_button_state.scan_disabled %}
+{% with focus_status_area = focus_status_area and not scan_takes_focus %}{% include "partials/status.html" %}{% endwith %}
+{% with oob = true, autofocus_scan = focus_scan %}{% include "partials/scan_button.html" %}{% endwith %}
 {% if clear_message %}<div id="status-message" hx-swap-oob="innerHTML"></div>{% endif %}
 {% if refresh_checks %}{% with oob = true %}{% include "partials/checks.html" %}{% endwith %}{% endif %}

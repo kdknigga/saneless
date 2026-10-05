@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{# Rendered by its own handler, not render_error, whose answer to a request
+   that is not htmx's is JSON a browser would show as text.  Every word comes
+   from the vocabulary through the handler; nothing the request sent is
+   echoed, the title least of all. #}
+{% block title %}{{ page_title }}{% endblock %}
+{% block content %}
+<article>
+    <h2>{{ heading }}</h2>
+    <p class="status-fallback">&#9888; {{ body }}</p>
+    <p><a href="/">{{ back_link }}</a></p>
+</article>
+{% endblock %}

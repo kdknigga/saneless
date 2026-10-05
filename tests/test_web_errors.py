@@ -1,23 +1,22 @@
 """
 Tests for the web layer's single error-rendering path.
 
-Every 4xx and 5xx the application produces is rendered by one function (D-01).
-An htmx request's error is retargeted into the ``#status-message`` slot so it
-never lands in its original target (D-02, D-03); any other request gets the
+Every 4xx and 5xx the application produces is rendered by one function.  An
+htmx request's error is retargeted into the ``#status-message`` slot so it
+never lands in its original target; any other request gets the
 ``{"status": "error", "detail": ...}`` JSON shape with the same status, and a
-429 carries ``Retry-After`` on both branches (D-04).  The error bodies and the
-log lines never carry request input or exception text.
+429 carries ``Retry-After`` on both branches.  The error bodies and the log
+lines never carry request input or exception text.
 
 The routes these tests drive are test-only: they are added to the fixture app
 before the client starts, so the renderer is proven independently of which
 production route raises.
-
-Covers requirements: ROBU-02, ROBU-08.
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -38,10 +37,14 @@ from saneless.config import (
     ProfileConfig,
     Settings,
 )
+from saneless.job import REJECTED_HISTORY_ROWS
 from saneless.vocabulary import (
+    HIDDEN_JOB_TITLE,
+    LOST_CONTACT_LINE,
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    URL_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -54,21 +57,18 @@ from saneless.vocabulary import (
 )
 from saneless.web import errors
 from saneless.web.app import create_app
-from saneless.web.routes import OWNER_COOKIE
-from saneless.worker import ScanWorker
-from tests.conftest import StubScannerBackend, poll_until
+from saneless.web.owner import OWNER_COOKIE
+from saneless.worker import ScanOptions, ScanWorker
+from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
+from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
 
     import httpx2
     from starlette.responses import Response
 
     from saneless.job import Job, JobStore
-
-# Every app built in this module, fixture or helper, talks to a Paperless client
-# whose requests fail inside the process: nothing reaches localhost:8000.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 
 HTMX_HEADERS = {"HX-Request": "true"}
@@ -82,9 +82,9 @@ INPUT_MARKER = "zz-marker"
 BAD_INT = "abc"
 SECRET_MARKER = "zz-secret"
 
-# The log file every app in this module writes to.  D-13 forbids a host
-# filesystem path from reaching a LAN-visible page, so this name is deliberately
-# unlike anything the slot could produce by accident.
+# The log file every app in this module writes to.  A host filesystem path must
+# never reach a LAN-visible page, so this name is deliberately unlike anything
+# the slot could produce by accident.
 LOG_FILE_NAME = "errors-test-do-not-render-me.log"
 
 # The row the test-only history route pretends its refusal wrote.  The renderer
@@ -151,8 +151,7 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the FastAPI app with the test-only error routes added."""
     application = create_app(web_settings, web_scanner)
     # Served on POST as well as GET so the retarget exemption, which is keyed
-    # on the method, can be pinned for every rejection in both directions
-    # (R4-WR-01).
+    # on the method, can be pinned for every rejection in both directions.
     application.add_api_route(
         "/_test/reject/{name}", _raise_rejection, methods=["GET", "POST"]
     )
@@ -168,14 +167,22 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda: [
-        {"id": 1, "name": "receipt"},
-        {"id": 2, "name": "invoice"},
-    ]
-    app.state.paperless.get_correspondents = lambda: [
-        {"id": 1, "name": "ACME Corp"},
-    ]
-    return app.state.paperless
+    stand_in(
+        services_of(app).paperless,
+        "get_tags",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "receipt"},
+            {"id": 2, "name": "invoice"},
+        ],
+    )
+    stand_in(
+        services_of(app).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [
+            {"id": 1, "name": "ACME Corp"},
+        ],
+    )
+    return services_of(app).paperless
 
 
 @pytest.fixture
@@ -229,10 +236,9 @@ def _error_body(
     Return the exact slot body: the message, then the short disclosure.
 
     The disclosure carries the HTTP status code and, when the refused attempt
-    wrote a job row, that row's id -- and nothing else.  Phase 26 D-10 and ASVS
-    V7 forbid exception text, request input and the log path from ever reaching
-    this surface, so this helper is the whole permitted vocabulary of the slot
-    (UI-SPEC S2).
+    wrote a job row, that row's id -- and nothing else.  Exception text,
+    request input and the log path never reach this surface (ASVS V7), so this
+    helper is the whole permitted vocabulary of the slot.
 
     Args:
         rejection: The vocabulary member whose message is shown.
@@ -280,14 +286,59 @@ def _assert_json_error(
     }
 
 
-# --- T4 / T5: every rejection, both branches ---------------------------------
+# The Scan button a refused htmx Scan press carries out-of-band: enabled and
+# with ``autofocus``, so focus goes back to the button the press came from.
+# Compared as attributes, so their order in the markup does not matter.
+SCAN_REFOCUS = {
+    "type": "submit",
+    "id": "scan-btn",
+    "hx-swap-oob": "true",
+    "autofocus": None,
+}
+
+# The rendered Scan button, found by its id in any attribute order.
+_SCAN_BUTTON_ELEMENT = re.compile(
+    r'<button(?=[^>]*\sid="scan-btn")\s[^>]*>(?P<label>.*?)</button>', re.DOTALL
+)
+
+
+def _slot_of_scan_refusal(text: str) -> str:
+    """
+    Return a refused Scan press's slot body, after checking the button it ends with.
+
+    Args:
+        text: The response body.
+
+    Returns:
+        Everything before the out-of-band Scan button, stripped.
+
+    """
+    button = _SCAN_BUTTON_ELEMENT.search(text)
+    assert button is not None, text
+    assert markup_start_tags(button.group(0)) == [("button", SCAN_REFOCUS)]
+    assert button.group("label").strip() == "Scan"
+    assert not text[button.end() :].strip(), text
+    return text[: button.start()].strip()
+
+
+def _assert_scan_refusal(
+    response: httpx2.Response, rejection: RequestRejection, status: int
+) -> None:
+    """Assert a refused htmx Scan press is the slot body plus the Scan button."""
+    assert response.status_code == status
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    assert _slot_of_scan_refusal(response.text) == _error_body(rejection, status)
+
+
+# --- Every rejection, both branches ------------------------------------------
 
 
 @pytest.mark.parametrize("rejection", list(RequestRejection))
 def test_htmx_rejection_is_retargeted_into_the_message_slot(
     client: TestClient, rejection: RequestRejection
 ) -> None:
-    """An htmx error lands in #status-message and nowhere else (D-02, T4)."""
+    """An htmx error lands in #status-message and nowhere else."""
     response = client.get(f"/_test/reject/{rejection.value}", headers=HTMX_HEADERS)
     _assert_htmx_error(response, rejection, rejection_status_code(rejection))
     for forbidden in ("scan-btn", "hx-swap-oob", "status-area", 'role="alert"'):
@@ -298,7 +349,7 @@ def test_htmx_rejection_is_retargeted_into_the_message_slot(
 def test_non_htmx_rejection_is_json(
     client: TestClient, rejection: RequestRejection
 ) -> None:
-    """A request without HX-Request gets the JSON error shape (D-04, T4)."""
+    """A request without HX-Request gets the JSON error shape."""
     response = client.get(f"/_test/reject/{rejection.value}")
     _assert_json_error(response, rejection, rejection_status_code(rejection))
 
@@ -308,7 +359,7 @@ def test_non_htmx_rejection_is_json(
 def test_retry_after_only_on_queue_full(
     client: TestClient, rejection: RequestRejection, *, htmx: bool
 ) -> None:
-    """429 carries Retry-After on both branches; nothing else does (D-04, T5)."""
+    """429 carries Retry-After on both branches; nothing else does."""
     headers = HTMX_HEADERS if htmx else {}
     response = client.get(f"/_test/reject/{rejection.value}", headers=headers)
     if rejection is RequestRejection.QUEUE_FULL:
@@ -322,7 +373,7 @@ def test_retry_after_only_on_queue_full(
 def test_refresh_history_appends_the_hidden_history_loader(
     client: TestClient,
 ) -> None:
-    """A rejection that wrote a job row reloads Job History (D-05, UI-SPEC S2)."""
+    """A rejection that wrote a job row reloads Job History."""
     rejection = RequestRejection.QUEUE_FULL
     response = client.get(
         f"/_test/reject-history/{rejection.value}", headers=HTMX_HEADERS
@@ -330,7 +381,7 @@ def test_refresh_history_appends_the_hidden_history_loader(
     assert response.status_code == 429
     assert response.headers["HX-Retarget"] == "#status-message"
     # History reloads because a row was written, and the disclosure names that
-    # same row -- one fact, not two that could disagree (D-05).
+    # same row -- one fact, not two that could disagree.
     body = _error_body(rejection, 429, REJECTED_ROW_ID)
     assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
 
@@ -341,7 +392,7 @@ def test_no_history_loader_without_refresh_history(client: TestClient) -> None:
     assert "/api/jobs/history" not in response.text
 
 
-# --- R3-CR-02: the status strip's swap target is exempt from the retarget ----
+# --- The status strip's swap target is exempt from the retarget --------------
 
 # What htmx puts in the ``HX-Target`` request header: the target element's id
 # with no leading ``#``.  The strip's polling body carries ``hx-target="this"``
@@ -358,37 +409,22 @@ _TARGETED_HEADER_IDS = ["other-target", "no-target"]
 
 class TestChecksPollTargetIsExemptFromTheRetarget:
     """
-    A failing checks poll is swapped into the strip, not into the message slot.
+    A failing checks poll's GET is swapped into the strip, not the message slot.
 
-    ``render_error`` sets ``HX-Retarget: #status-message`` so an error never
-    lands in the element the request was aimed at (D-02, D-03).  For exactly
-    one element that rule kept a defect alive: htmx 2.0.10 applies
-    ``HX-Retarget`` to the response's target *before* it decides what to swap,
-    so a 4xx from ``GET /api/checks`` was written into ``#status-message`` and
-    ``#checks-body`` was never replaced -- keeping its ``every 2s`` trigger for
-    the life of the tab and overwriting the scan-progress line twice a minute
-    (R3-CR-02).
-
-    The strip is the one element whose error response must land on itself,
-    because it is the one element that polls, and an armed htmx poll ends only
-    when the element leaves the DOM.  These cases pin the exemption to that one
-    id and pin every other target to the unchanged contract.
-
-    The id is not the whole key.  ``Check again`` in the same partial is
-    ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
-    carries the very same header, and an exemption keyed on the header alone
-    let a failing click write the error body over the strip -- five rows and
-    the only button that could bring them back, gone for the life of the tab
-    (R4-WR-01).  The exemption therefore also requires a GET, which is what
-    the strip's poll and its terminal-state reload send and the button does
-    not, and the cases below pin the POST side as firmly as the GET side.
+    The strip is the one element that polls, and an armed htmx poll ends only
+    when its element leaves the DOM.  Retargeted, a failing poll would leave
+    ``#checks-body`` and its ``every 2s`` trigger in place for the life of the
+    tab.  The exemption is keyed on the strip's id *and* on GET: ``Check
+    again`` posts with the same ``HX-Target``, and its failure belongs in the
+    slot, or the error body would overwrite the strip and the button with it.
+    Every other target keeps the ordinary retarget.
     """
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
     def test_a_checks_poll_error_is_not_retargeted(
         self, client: TestClient, rejection: RequestRejection
     ) -> None:
-        """The strip's own target gets neither retarget header (R3-CR-02)."""
+        """The strip's own target gets neither retarget header."""
         status = rejection_status_code(rejection)
         response = client.get(
             f"/_test/reject/{rejection.value}", headers=_CHECKS_TARGET_HEADERS
@@ -412,7 +448,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
     def test_an_exempt_error_still_carries_the_allow_header(
         self, client: TestClient
     ) -> None:
-        """A 405's ``Allow`` survives the exemption (WR-08, RFC 9110 15.5.6)."""
+        """A 405's ``Allow`` survives the exemption (RFC 9110 15.5.6)."""
         response = client.get("/api/scan", headers=_CHECKS_TARGET_HEADERS)
         assert response.status_code == 405
         allowed = {method.strip() for method in response.headers["Allow"].split(",")}
@@ -424,7 +460,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
     def test_every_other_htmx_error_is_still_retargeted(
         self, client: TestClient, headers: dict[str, str]
     ) -> None:
-        """The exemption is an exemption, not a new app-wide contract (D-02)."""
+        """Every other htmx target is still retargeted into the message slot."""
         rejection = RequestRejection.QUEUE_FULL
         response = client.get(f"/_test/reject/{rejection.value}", headers=headers)
         _assert_htmx_error(response, rejection, rejection_status_code(rejection))
@@ -435,7 +471,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
     def test_a_plain_request_is_json_for_either_target(
         self, client: TestClient, target: str
     ) -> None:
-        """Without ``HX-Request`` the target header changes nothing (D-04)."""
+        """Without ``HX-Request`` the target header changes nothing."""
         rejection = RequestRejection.QUEUE_FULL
         response = client.get(
             f"/_test/reject/{rejection.value}", headers={"HX-Target": target}
@@ -445,7 +481,12 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
     def test_the_exempt_id_is_the_id_the_strip_template_ships(
         self, client: TestClient
     ) -> None:
-        """Renaming one of the two fails here rather than un-fixing the defect."""
+        """
+        The exempt id is the id the strip template renders.
+
+        Renaming either one fails here rather than silently ending the
+        exemption.
+        """
         strip = client.get("/api/checks").text
         assert f'id="{errors.CHECKS_POLL_TARGET_ID}"' in strip
 
@@ -454,7 +495,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
         self, client: TestClient, rejection: RequestRejection
     ) -> None:
         """
-        The same target header on a POST gets the ordinary contract (R4-WR-01).
+        The same target header on a POST gets the ordinary contract.
 
         The strip's poll is a GET.  A POST carrying the strip's ``HX-Target``
         is the ``Check again`` button, and its failure belongs in the message
@@ -473,9 +514,8 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
 
         ``CrossOriginGuard`` answers a cross-site POST before the route runs,
         which makes it the one failure of ``POST /api/checks/refresh`` that
-        needs no patching to reach ``render_error``.  Before R4-WR-01 this
-        response carried no retarget and the button's own ``hx-swap=outerHTML``
-        wrote it over the strip.
+        needs no patching to reach ``render_error``.  Without the retarget, the
+        button's own ``hx-swap=outerHTML`` would write the error over the strip.
         """
         rejection = RequestRejection.CROSS_SITE
         response = client.post(
@@ -507,14 +547,14 @@ _TECH_DETAILS = re.compile(
     re.DOTALL,
 )
 
-# How many facts D-13 permits the slot's disclosure to carry: the HTTP status
+# How many facts the slot's disclosure may carry: the HTTP status
 # code, and the id of the row a refused submit wrote.  Nothing else.
 _MAX_DISCLOSED_FACTS = 2
 
 
 class TestRequestErrorDisclosure:
     """
-    The slot's deliberately short "Technical details" (UI-SPEC S2, APPL-04).
+    The slot's deliberately short "Technical details" disclosure.
 
     The exact-body assertions above already prove what the slot renders.  These
     pin the properties that make the disclosure safe rather than merely
@@ -546,7 +586,7 @@ class TestRequestErrorDisclosure:
         self, client: TestClient, rejection: RequestRejection
     ) -> None:
         """
-        With no row written, the status code is the only fact (D-10, ASVS V7).
+        With no row written, the status code is the only fact (ASVS V7).
 
         Parametrised over every rejection so a new member cannot quietly bring
         a second fact with it.
@@ -561,7 +601,7 @@ class TestRequestErrorDisclosure:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A refused submit's own row is the one job id the slot may name (D-05).
+        A refused submit's own row is the one job id the slot may name.
 
         It is the row the user will find in Job History a moment later, not an
         arbitrary request value.
@@ -588,7 +628,7 @@ class TestRequestErrorDisclosure:
         self, lenient_client: TestClient, path: str, headers: dict[str, str]
     ) -> None:
         """
-        Neither an exception's text nor the log file reaches the slot (T-30-53).
+        Neither an exception's text nor the log file reaches the slot.
 
         The disclosure is the affordance that would be tempted to offer both.
         """
@@ -603,10 +643,11 @@ class TestRequestErrorDisclosure:
         Asserted against the template source as well as the responses above,
         so a branch no test happens to drive cannot introduce a second alert.
         """
-        source = (WEB_DIR / "templates" / "partials" / "error.html").read_text(
-            encoding="utf-8"
-        )
-        assert 'role="alert"' not in source
+        tags = template_start_tags(WEB_DIR / "templates" / "partials" / "error.html")
+        assert tags, "no markup in the error partial"
+        assert [
+            tag for tag, attributes in tags if attributes.get("role") == "alert"
+        ] == []
 
 
 # --- Framework-raised errors -------------------------------------------------
@@ -616,7 +657,7 @@ class TestRequestErrorDisclosure:
     "path", ["/does-not-exist", "/static/does-not-exist.js"], ids=["router", "static"]
 )
 def test_not_found_renders_on_both_branches(client: TestClient, path: str) -> None:
-    """Router and StaticFiles 404s go through the one renderer (D-01)."""
+    """Router and StaticFiles 404s go through the one renderer."""
     _assert_htmx_error(
         client.get(path, headers=HTMX_HEADERS), RequestRejection.NOT_FOUND, 404
     )
@@ -639,7 +680,7 @@ def test_schema_and_docs_paths_are_not_found(client: TestClient, path: str) -> N
 
 
 def test_method_not_allowed_renders_on_both_branches(client: TestClient) -> None:
-    """A router 405 goes through the one renderer (D-01)."""
+    """A router 405 goes through the one renderer."""
     rejection = RequestRejection.METHOD_NOT_ALLOWED
     _assert_htmx_error(client.post("/health", headers=HTMX_HEADERS), rejection, 405)
     _assert_json_error(client.post("/health"), rejection, 405)
@@ -649,7 +690,7 @@ def test_method_not_allowed_renders_on_both_branches(client: TestClient) -> None
 def test_method_not_allowed_keeps_the_allow_header(
     client: TestClient, *, htmx: bool
 ) -> None:
-    """WR-08, RFC 9110 section 15.5.6: a 405 names the methods it does allow."""
+    """A 405 names the methods it does allow (RFC 9110 section 15.5.6)."""
     headers = HTMX_HEADERS if htmx else {}
     response = client.get("/api/scan", headers=headers)
     assert response.status_code == 405
@@ -671,14 +712,14 @@ def test_plain_http_exception_maps_by_status(
     _assert_json_error(client.get(path), rejection, status)
 
 
-# --- T7: validation and the catch-all never leak -----------------------------
+# --- Validation and the catch-all never leak ---------------------------------
 
 
 @pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
 def test_title_too_long_is_422_without_echoing_input(
     client: TestClient, caplog: pytest.LogCaptureFixture, *, htmx: bool
 ) -> None:
-    """A title over the cap is TITLE_TOO_LONG and its text is never echoed (ROBU-08)."""
+    """A title over the cap is TITLE_TOO_LONG and its text is never echoed."""
     title = (INPUT_MARKER * 29)[: TITLE_MAX_LENGTH + 1]
     assert len(title) == TITLE_MAX_LENGTH + 1
     headers = HTMX_HEADERS if htmx else {}
@@ -700,7 +741,7 @@ def test_title_too_long_is_422_without_echoing_input(
 def test_invalid_field_is_422_without_echoing_input(
     client: TestClient, caplog: pytest.LogCaptureFixture, *, htmx: bool
 ) -> None:
-    """Any other validation failure is INVALID_REQUEST and echoes nothing (D-01)."""
+    """Any other validation failure is INVALID_REQUEST and echoes nothing."""
     headers = HTMX_HEADERS if htmx else {}
     with caplog.at_level(logging.DEBUG):
         response = client.post(
@@ -720,7 +761,7 @@ def test_invalid_field_is_422_without_echoing_input(
 def test_unhandled_exception_is_500_and_logged_not_leaked(
     lenient_client: TestClient, caplog: pytest.LogCaptureFixture, *, htmx: bool
 ) -> None:
-    """The catch-all renders INTERNAL and logs the traceback server-side (D-01)."""
+    """The catch-all renders INTERNAL and logs the traceback server-side."""
     headers = HTMX_HEADERS if htmx else {}
     with caplog.at_level(logging.ERROR, logger="saneless.web.errors"):
         response = lenient_client.get("/_test/boom", headers=headers)
@@ -777,7 +818,7 @@ def test_error_logs_escape_control_characters_in_the_request_line(
     caplog: pytest.LogCaptureFixture, handler: str
 ) -> None:
     """
-    WR-07: the 422 and 500 log lines escape the method and path with ``%r``.
+    The 422 and 500 log lines escape the method and path with ``%r``.
 
     A percent-encoded newline or terminal escape in the path must not forge a
     log line or rewrite what an operator reads.
@@ -815,14 +856,14 @@ def _job_store(client: TestClient) -> JobStore:
     """Return the served app's job store."""
     app = client.app
     assert isinstance(app, FastAPI)
-    return app.state.job_store
+    return services_of(app).job_store
 
 
 def _worker(client: TestClient) -> ScanWorker:
     """Return the served app's scan worker."""
     app = client.app
     assert isinstance(app, FastAPI)
-    return app.state.worker
+    return services_of(app).worker
 
 
 def _force_health(monkeypatch: pytest.MonkeyPatch, health: WorkerHealth) -> None:
@@ -841,7 +882,7 @@ def _refuse_submit(
     """Make the worker refuse every submit with ``result``; return the offers."""
     offered: list[Job] = []
 
-    def submit(job: Job) -> SubmitResult:
+    def submit(job: Job, _options: ScanOptions) -> SubmitResult:
         offered.append(job)
         return result
 
@@ -864,7 +905,7 @@ def _newest_job_id(client: TestClient) -> str:
 
     Returns:
         The row the refused submit just wrote, which is the only job id the
-        error slot is permitted to name (Phase 26 D-05).
+        error slot is permitted to name.
 
     """
     newest = _job_store(client).list_recent(limit=1)
@@ -876,7 +917,7 @@ def _newest_job_id(client: TestClient) -> str:
 def test_scan_unknown_profile_is_422_without_a_row(
     client: TestClient, *, htmx: bool
 ) -> None:
-    """An unknown profile is refused before any job row exists (ROBU-08, D-19)."""
+    """An unknown profile is refused before any job row exists."""
     before = _job_store(client).list_recent(limit=50)
     headers = HTMX_HEADERS if htmx else {}
     response = client.post(
@@ -886,7 +927,7 @@ def test_scan_unknown_profile_is_422_without_a_row(
     )
     rejection = RequestRejection.UNKNOWN_PROFILE
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert INPUT_MARKER not in response.text
@@ -897,7 +938,7 @@ def test_scan_unknown_profile_is_422_without_a_row(
 def test_scan_title_too_long_is_422_without_a_row(
     client: TestClient, *, htmx: bool
 ) -> None:
-    """A title over the cap is refused before any job row exists (ROBU-08)."""
+    """A title over the cap is refused before any job row exists."""
     title = (INPUT_MARKER * 29)[: TITLE_MAX_LENGTH + 1]
     before = _job_store(client).list_recent(limit=50)
     headers = HTMX_HEADERS if htmx else {}
@@ -906,7 +947,7 @@ def test_scan_title_too_long_is_422_without_a_row(
     )
     rejection = RequestRejection.TITLE_TOO_LONG
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert INPUT_MARKER not in response.text
@@ -914,7 +955,7 @@ def test_scan_title_too_long_is_422_without_a_row(
 
 
 def test_scan_title_at_the_cap_is_not_422(client: TestClient) -> None:
-    """A title exactly at the cap is accepted (ROBU-08)."""
+    """A title exactly at the cap is accepted."""
     title = "t" * TITLE_MAX_LENGTH
     response = client.post(
         "/api/scan",
@@ -925,10 +966,292 @@ def test_scan_title_at_the_cap_is_not_422(client: TestClient) -> None:
     assert 'id="status-area"' in response.text
 
 
+# What paperless-ngx keeps of a title (127) less the longest suffix a split
+# duplex job appends (" (fronts)").  Spelled out rather than imported, so the
+# tests pin the number the operator is told.
+_TITLE_CAP = 118
+
+
+def test_scan_title_one_over_what_paperless_keeps_is_422_naming_the_cap(
+    client: TestClient,
+) -> None:
+    """A 119-character title is TITLE_TOO_LONG, and the sentence names 118."""
+    before = _job_store(client).list_recent(limit=50)
+    response = client.post(
+        "/api/scan", data={"profile": "default", "title": "t" * (_TITLE_CAP + 1)}
+    )
+    _assert_json_error(response, RequestRejection.TITLE_TOO_LONG, 422)
+    assert f"{_TITLE_CAP} characters or fewer" in response.json()["detail"]
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_title_of_what_paperless_keeps_is_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 118-character title is offered to the worker exactly as typed."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    title = "t" * _TITLE_CAP
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": title},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert [job.title for job in offered] == [title]
+
+
+def test_scan_form_title_maxlength_is_what_paperless_keeps(
+    client: TestClient,
+) -> None:
+    """The title input's maxlength is the same 118 the server enforces."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert f'maxlength="{_TITLE_CAP}"' in response.text
+
+
+# One control character from each part of the refused set: a tab, which a
+# person can type into a text input; ESC, which starts a terminal escape
+# sequence; NEL, a C1 control; and DEL, the one control outside both blocks.
+_TITLE_CONTROL_CHARACTERS = ["\t", "\x1b", "\x85", "\x7f"]
+_TITLE_CONTROL_IDS = ["tab", "esc", "nel", "del"]
+
+
+@pytest.mark.parametrize("character", _TITLE_CONTROL_CHARACTERS, ids=_TITLE_CONTROL_IDS)
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_title_control_character_is_422_without_a_row(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    character: str,
+    *,
+    htmx: bool,
+) -> None:
+    """A title holding a control character is refused, not repaired, and not echoed."""
+    title = f"{INPUT_MARKER}a{character}b"
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": title}, headers=headers
+        )
+    rejection = RequestRejection.TITLE_HAS_CONTROL
+    if htmx:
+        _assert_scan_refusal(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert INPUT_MARKER not in response.text
+    assert all(INPUT_MARKER not in r.getMessage() for r in caplog.records)
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_title_control_check_accepts_accents_and_no_break_space(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accented letter and a no-break space are text, not control characters."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    title = "Caf\u00e9\u00a0receipt"
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": title},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert [job.title for job in offered] == [title]
+
+
+# The tag cap the scan form, the tag list and the tag refresh all enforce.
+# Spelled out rather than imported, so the test pins the documented number.
+_TAGS_CAP = 100
+
+
+def _tag_values(count: int) -> list[str]:
+    """Return ``count`` distinct tag ids as the form strings a browser sends."""
+    return [str(tag_id) for tag_id in range(1, count + 1)]
+
+
+def test_scan_tags_cap_accepts_the_cap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submit ticking exactly the capped number of tags is accepted whole."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Many Tags",
+            "tags": _tag_values(_TAGS_CAP),
+        },
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert len(offered) == 1
+    assert offered[0].tags == list(range(1, _TAGS_CAP + 1))
+
+
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_tags_cap_refuses_one_over_without_a_row(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, *, htmx: bool
+) -> None:
+    """One tag over the cap is a 422 before any job row exists or is offered."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Too Many Tags",
+            "tags": _tag_values(_TAGS_CAP + 1),
+        },
+        headers=headers,
+    )
+    rejection = RequestRejection.INVALID_REQUEST
+    if htmx:
+        _assert_scan_refusal(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert offered == []
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_tag_list_tags_cap_accepts_the_cap(client: TestClient) -> None:
+    """The tag list re-renders with exactly the capped number ticked."""
+    response = client.get(
+        "/api/tags", params={"tags": _tag_values(_TAGS_CAP)}, headers=HTMX_HEADERS
+    )
+    assert response.status_code == 200
+
+
+def test_tag_list_tags_cap_refuses_one_over(client: TestClient) -> None:
+    """The tag list refuses one ticked tag over the cap before any work."""
+    response = client.get(
+        "/api/tags",
+        params={"tags": _tag_values(_TAGS_CAP + 1)},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
+def test_tag_refresh_tags_cap_refuses_one_over(client: TestClient) -> None:
+    """The tag refresh refuses one ticked tag over the cap before the cache."""
+    response = client.post(
+        "/api/cache/invalidate",
+        params={"resource": "tags"},
+        data={"tags": _tag_values(_TAGS_CAP + 1)},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
+# A paperless-ngx id is a 32-bit auto-increment key: 1 to 2147483647.  Spelled
+# out rather than imported, so the tests pin the documented range.
+_MAX_ID = 2_147_483_647
+_MALFORMED_IDS = ["0", "-5", str(10**22), str(_MAX_ID + 1)]
+_MALFORMED_ID_NAMES = ["zero", "negative", "22-digit", "one-over"]
+
+
+@pytest.mark.parametrize("field", ["tags", "correspondent"])
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_malformed_id_is_422_without_a_row(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    *,
+    htmx: bool,
+) -> None:
+    """An id no paperless-ngx can have is INVALID_REQUEST before any job row."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Malformed Id", field: value},
+        headers=headers,
+    )
+    rejection = RequestRejection.INVALID_REQUEST
+    if htmx:
+        _assert_scan_refusal(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert offered == []
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_malformed_id_is_neither_echoed_nor_logged(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refused id stays out of the response and the log; only loc and type."""
+    value = "9876543210987654321012"
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Refused", "tags": [value]},
+        )
+    _assert_json_error(response, RequestRejection.INVALID_REQUEST, 422)
+    assert value not in response.text
+    assert value not in caplog.text
+    assert all(value not in r.getMessage() for r in caplog.records)
+
+
+def test_scan_malformed_tag_among_good_ones_is_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One malformed id refuses the whole submit; nothing is dropped quietly."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Mixed", "tags": ["3", "0", "7"]},
+        headers=HTMX_HEADERS,
+    )
+    _assert_scan_refusal(response, RequestRejection.INVALID_REQUEST, 422)
+    assert offered == []
+
+
+def test_scan_largest_paperless_id_is_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The largest id a paperless-ngx key can hold is offered unchanged."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Largest Id",
+            "tags": [str(_MAX_ID)],
+            "correspondent": str(_MAX_ID),
+        },
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert len(offered) == 1
+    assert offered[0].tags == [_MAX_ID]
+    assert offered[0].correspondent == _MAX_ID
+
+
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+def test_tag_list_malformed_tag_is_422(client: TestClient, value: str) -> None:
+    """The tag list refuses a ticked id no paperless-ngx can have."""
+    response = client.get("/api/tags", params={"tags": [value]}, headers=HTMX_HEADERS)
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+def test_tag_refresh_malformed_tag_is_422(client: TestClient, value: str) -> None:
+    """The tag refresh refuses a ticked id no paperless-ngx can have."""
+    response = client.post(
+        "/api/cache/invalidate",
+        params={"resource": "tags"},
+        data={"tags": [value]},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
 def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A full queue is a visible 429 that reloads history (ROBU-02, D-05)."""
+    """A full queue is a visible 429 that reloads history."""
     _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
     response = client.post(
         "/api/scan",
@@ -940,14 +1263,14 @@ def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     assert response.headers["Retry-After"] == "30"
     assert response.headers["HX-Retarget"] == "#status-message"
     body = _error_body(rejection, 429, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, QUEUE_FULL_JOB_ERROR)
 
 
 def test_scan_queue_full_is_429_json(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-htmx submit refused by a full queue is JSON with Retry-After (D-04)."""
+    """A non-htmx submit refused by a full queue is JSON with Retry-After."""
     _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
     response = client.post(
         "/api/scan", data={"profile": "default", "title": "Queue Full"}
@@ -976,7 +1299,7 @@ def test_scan_refused_submit_is_503_with_a_rejected_row(
     rejection: RequestRejection,
     error: str,
 ) -> None:
-    """A submit refused as down or degraded is a 503 with a row (D-05, D-11)."""
+    """A submit refused as down or degraded is a 503 with a row."""
     _refuse_submit(client, monkeypatch, result)
     response = client.post(
         "/api/scan",
@@ -986,7 +1309,7 @@ def test_scan_refused_submit_is_503_with_a_rejected_row(
     assert response.status_code == 503
     assert "Retry-After" not in response.headers
     body = _error_body(rejection, 503, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, error)
 
 
@@ -1009,7 +1332,7 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     rejection: RequestRejection,
     error: str,
 ) -> None:
-    """An unhealthy worker refuses the scan without offering it the job (D-11)."""
+    """An unhealthy worker refuses the scan without offering it the job."""
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, health)
     response = client.post(
@@ -1019,7 +1342,7 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     )
     assert response.status_code == 503
     body = _error_body(rejection, 503, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     assert offered == []
     _assert_rejected_row(client, error)
 
@@ -1039,7 +1362,7 @@ def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
     error: str,
 ) -> None:
     """
-    A refused-before-row submit cannot strand a PENDING row (WR-01, D-05, D-06).
+    A refused-before-row submit cannot strand a PENDING row.
 
     ``finish_job`` failing is the store failing between two statements.  If the
     refusal were recorded as create-then-finish, the create would already have
@@ -1066,7 +1389,7 @@ def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
     assert offered == []
     assert [job for job in store.list_recent(limit=50) if job.is_active] == []
     _assert_rejected_row(client, error)
-    assert response.text.strip().endswith(HISTORY_LOADER)
+    assert _slot_of_scan_refusal(response.text).endswith(HISTORY_LOADER)
 
 
 def test_scan_degraded_store_failing_is_503_without_a_loader(
@@ -1075,10 +1398,10 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    A rejection the store cannot record still renders, without a loader (D-05).
+    A rejection the store cannot record still renders, without a loader.
 
     The refused-before-row path records the rejection in one statement, so when
-    that statement fails no row exists at all -- never a PENDING row (WR-01).
+    that statement fails no row exists at all -- never a PENDING row.
     """
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, WorkerHealth.DEGRADED)
@@ -1096,7 +1419,7 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
             data={"profile": "default", "title": "Store Failing"},
             headers=HTMX_HEADERS,
         )
-    _assert_htmx_error(response, RequestRejection.WORKER_DEGRADED, 503)
+    _assert_scan_refusal(response, RequestRejection.WORKER_DEGRADED, 503)
     assert "/api/jobs/history" not in response.text
     assert offered == []
     assert store.list_recent(limit=50) == before
@@ -1112,7 +1435,8 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
 # How long a rejection owed to the worker may take to land: many fast ticks.
 _OWED_REJECTION_BUDGET = 2.0
 
-_SCAN_BUTTON_TAG = re.compile(r'<button type="submit" id="scan-btn"(?P<attrs>[^>]*)>')
+# The rendered Scan button's opening tag, whatever order its attributes are in.
+_SCAN_BUTTON_TAG = re.compile(r'<button\s(?=[^>]*\bid="scan-btn")(?P<attrs>[^>]*)>')
 
 
 def _fail_first_call(original: Callable[..., object]) -> Callable[..., object]:
@@ -1155,18 +1479,17 @@ def test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker(
     error: str,
 ) -> None:
     """
-    A post-submit rejection the request could not write still lands (WR-01).
+    A post-submit rejection the request could not write still lands.
 
     The row has to exist before ``submit()``, or the worker could dequeue an id
-    with no row (D-05), so a refusal from ``submit()`` needs a second write.
-    When that write fails the row is PENDING with no REJECTED marker (D-06):
-    the status area shows it and the Scan button stays disabled.  The request
-    owes the write to the worker, whose next idle tick records it, so the row
-    reaches ERROR/REJECTED and the button re-enables with no restart.
+    with no row, so a refusal from ``submit()`` needs a second write.  When
+    that write fails, the request owes it to the worker, whose next idle tick
+    records it: the row reaches ERROR/REJECTED and the Scan button re-enables
+    with no restart.
 
     Only ``submit`` is patched, so the ``down`` case keeps a live worker thread
     and proves the owe path.  A truly dead thread never ticks; the next
-    startup's recovery ends that row instead (26-09).
+    startup's recovery ends that row instead.
     """
     _refuse_submit(fast_tick_client, monkeypatch, result)
     store = _job_store(fast_tick_client)
@@ -1215,15 +1538,14 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
     error: str,
 ) -> None:
     """
-    A refused attempt waiting on the worker never renders as the live job (IN-08).
+    A refused attempt waiting on the worker never renders as the live job.
 
     When the request cannot write a refused submit's REJECTED marker it owes
-    the write to the worker (WR-01), and until an idle tick lands it the row is
-    PENDING with no marker.  D-06 says a rejected submit must not take over the
-    status area, so the status lookup skips owed rejections just as it skips
-    written ones, while D-17 still reports a job that actually ran.  The
-    ``client`` fixture's 5 s idle tick keeps the worker from writing the row
-    inside this test, and ``finish_job`` never heals anyway.
+    the write to the worker, and until an idle tick lands it the row is
+    PENDING with no marker.  A rejected submit never takes over the status
+    area, so the status lookup skips owed rejections just as it skips written
+    ones.  The ``client`` fixture's 5 s idle tick keeps the worker from
+    writing the row inside this test, and ``finish_job`` never heals anyway.
     """
     _refuse_submit(client, monkeypatch, result)
     store = _job_store(client)
@@ -1257,7 +1579,253 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
     assert refused.id in worker.owed_rejection_ids()
 
 
-# --- The placeholder-token refusal (APPL-07, D-14, D-15) ---------------------
+# --- A status poll that cannot read its job backs off in place ---------------
+
+# A valid job id that names no row.  The broken store never gets to look it up,
+# and once healed the lookup finds nothing and falls back to the current job.
+_FOLLOWED_ID = "5d3f0c9e-7b1a-4c2e-9f4d-2a6b8e1c0d57"
+
+_AREA_TAG = re.compile(r'<div id="status-area"(?P<attrs>[^>]*)>')
+_HX_GET = re.compile(r'\bhx-get="(?P<url>[^"]*)"')
+_HX_TRIGGER = re.compile(r'\bhx-trigger="(?P<trigger>[^"]*)"')
+
+
+class _BrokenStore:
+    """
+    Make the job store's two status reads raise until ``heal`` is called.
+
+    ``get_job`` serves a followed or in-flight job and ``latest_run_job`` the
+    current route's fallback, so breaking both covers every status poll.  The
+    wrappers delegate once healed, so a test can watch the same page recover.
+    """
+
+    def __init__(self, store: JobStore, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrap the store's reads in place; ``monkeypatch`` restores them."""
+        self.broken = True
+        for name in ("get_job", "latest_run_job"):
+            monkeypatch.setattr(store, name, self._guard(getattr(store, name)))
+
+    def _guard(self, original: Callable[..., object]) -> Callable[..., object]:
+        """Return ``original``, raising a store error while broken."""
+
+        def guarded(*args: object, **kwargs: object) -> object:
+            if self.broken:
+                msg = "disk I/O error"
+                raise sqlite3.OperationalError(msg)
+            return original(*args, **kwargs)
+
+        return guarded
+
+    def heal(self) -> None:
+        """Let every later read through to the real store."""
+        self.broken = False
+
+
+@pytest.fixture
+def broken_store(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> _BrokenStore:
+    """Break the served app's job store reads for the length of a test."""
+    return _BrokenStore(_job_store(client), monkeypatch)
+
+
+def _area(body: str) -> tuple[str, str]:
+    """
+    Return the status area's poll URL, unescaped, and its trigger.
+
+    Args:
+        body: A status poll's response body.
+
+    Returns:
+        The URL the area polls next and its ``hx-trigger`` value.
+
+    """
+    tag = _AREA_TAG.search(body)
+    assert tag is not None, body
+    url = _HX_GET.search(tag.group("attrs"))
+    trigger = _HX_TRIGGER.search(tag.group("attrs"))
+    assert url is not None, body
+    assert trigger is not None, body
+    return html.unescape(url.group("url")), trigger.group("trigger")
+
+
+def _assert_fallback(response: httpx2.Response) -> tuple[str, str]:
+    """
+    Assert a poll answered the lost-contact line inside the status area.
+
+    Args:
+        response: The poll's response.
+
+    Returns:
+        The fallback's next poll URL and its trigger.
+
+    """
+    assert response.status_code == 200, response.text
+    assert "HX-Retarget" not in response.headers
+    assert "HX-Reswap" not in response.headers
+    body = response.text
+    assert 'id="status-area"' in body
+    assert 'tabindex="-1"' in body
+    assert 'class="status-fallback"' in body
+    assert f"&#9888; {html.escape(LOST_CONTACT_LINE)}" in body
+    for forbidden in ("status-message", "scan-btn", "<title>", "disk I/O error"):
+        assert forbidden not in body, forbidden
+    return _area(body)
+
+
+class TestStatusPollBacksOff:
+    """
+    A status poll that cannot read its job stays inside the status area.
+
+    It answers 200 with a fixed amber line, never an error for the alert slot:
+    a poll that failed into ``#status-message`` would re-write the page's one
+    alert every second and leave it standing above "Done" once the store
+    healed.  The interval steps out to a cap, where the unchanged fallback is
+    answered 204, and the poll never stops, so a healed store is picked up.
+    """
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_failure_renders_the_fallback(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The first failing poll renders the line and polls again in 2 s."""
+        with caplog.at_level(logging.ERROR, logger="saneless.web.status_view"):
+            response = client.get(
+                f"/api/jobs/{_FOLLOWED_ID}/status", headers=HTMX_HEADERS
+            )
+        url, trigger = _assert_fallback(response)
+        assert trigger == "every 2s"
+        assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+        assert "attempt=1" in url
+        assert "Failed to render the job status" in caplog.text
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_backs_off_2_5_15(self, client: TestClient) -> None:
+        """Each fallback's own URL steps the interval to 5 s, then 15 s."""
+        url, trigger = _assert_fallback(
+            client.get(f"/api/jobs/{_FOLLOWED_ID}/status", headers=HTMX_HEADERS)
+        )
+        triggers = [trigger]
+        for expected_attempt in (2, 3):
+            url, trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+            assert f"attempt={expected_attempt}" in url
+            assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+            triggers.append(trigger)
+        assert triggers == ["every 2s", "every 5s", "every 15s"]
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_at_the_cap_answers_204(self, client: TestClient) -> None:
+        """At the cap the fallback is unchanged, so its own poll gets no body."""
+        url = f"/api/jobs/{_FOLLOWED_ID}/status"
+        for _ in range(3):
+            url, _trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+        capped = client.get(url, headers=HTMX_HEADERS)
+        assert capped.status_code == 204
+        assert capped.content == b""
+        assert client.get(url, headers=HTMX_HEADERS).status_code == 204
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_current_route_backs_off(self, client: TestClient) -> None:
+        """The current-job poll backs off the same way and keeps its own route."""
+        url = "/api/jobs/current/status"
+        triggers = []
+        for _ in range(3):
+            url, trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+            assert url.startswith("/api/jobs/current/status?")
+            triggers.append(trigger)
+        assert triggers == ["every 2s", "every 5s", "every 15s"]
+        assert client.get(url, headers=HTMX_HEADERS).status_code == 204
+
+    @pytest.mark.usefixtures("broken_store")
+    @pytest.mark.parametrize(
+        "job_id",
+        ["not-a-uuid", '"><img src=x onerror=alert(1)>'],
+        ids=["not_a_uuid", "markup"],
+    )
+    def test_status_poll_non_uuid_id_falls_back_to_current(
+        self, client: TestClient, job_id: str
+    ) -> None:
+        """An id the store could not confirm is echoed only if it is a UUID."""
+        response = client.get(f"/api/jobs/{job_id}/status", headers=HTMX_HEADERS)
+        url, _trigger = _assert_fallback(response)
+        assert url.startswith("/api/jobs/current/status?")
+        assert "onerror" not in response.text
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_echoes_the_canonical_uuid(self, client: TestClient) -> None:
+        """A UUID in another spelling is echoed in its canonical form."""
+        response = client.get(
+            f"/api/jobs/{_FOLLOWED_ID.upper()}/status", headers=HTMX_HEADERS
+        )
+        url, _trigger = _assert_fallback(response)
+        assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+
+    def test_status_poll_heals_to_the_real_rendering(
+        self, client: TestClient, broken_store: _BrokenStore
+    ) -> None:
+        """A healed store's next poll is the real rendering, with no attempt."""
+        url = f"/api/jobs/{_FOLLOWED_ID}/status"
+        for _ in range(3):
+            url, _trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+        broken_store.heal()
+        response = client.get(url, headers=HTMX_HEADERS)
+        assert response.status_code == 200
+        assert "HX-Retarget" not in response.headers
+        body = response.text
+        assert "Ready to scan." in body
+        assert 'id="scan-btn"' in body
+        assert _AREA_TAG.search(body) is not None
+        assert "status-fallback" not in body
+        assert "attempt=" not in body
+
+    def test_status_poll_render_failure_is_caught(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template that fails to render is caught exactly as a store error is."""
+        app = client.app
+        assert isinstance(app, FastAPI)
+        templates = services_of(app).templates
+        original = templates.get_template
+
+        class _Exploding:
+            """A template whose every render raises."""
+
+            def render(self, *_args: object, **_kwargs: object) -> str:
+                """Raise, as a template bug would."""
+                msg = "template exploded"
+                raise RuntimeError(msg)
+
+        def get_template(name: str) -> object:
+            if name == "partials/status_response.html":
+                return _Exploding()
+            return original(name)
+
+        monkeypatch.setattr(templates, "get_template", get_template)
+        for route in ("current", _FOLLOWED_ID):
+            response = client.get(f"/api/jobs/{route}/status", headers=HTMX_HEADERS)
+            _url, trigger = _assert_fallback(response)
+            assert trigger == "every 2s"
+            assert "template exploded" not in response.text
+
+    @pytest.mark.usefixtures("broken_store")
+    @pytest.mark.parametrize(
+        ("attempt", "trigger", "next_attempt"),
+        [(-5, "every 2s", 1), (99, "every 15s", 3)],
+        ids=["below", "above"],
+    )
+    def test_status_poll_attempt_is_clamped(
+        self, client: TestClient, attempt: int, trigger: str, next_attempt: int
+    ) -> None:
+        """An out-of-range attempt is clamped, never refused with a 422."""
+        response = client.get(
+            "/api/jobs/current/status",
+            params={"attempt": str(attempt)},
+            headers=HTMX_HEADERS,
+        )
+        url, answered = _assert_fallback(response)
+        assert answered == trigger
+        assert f"attempt={next_attempt}" in url
+
+
+# --- The placeholder-token refusal -------------------------------------------
 
 # The shipped stand-in: docker-compose.yml and the docker reference both carry
 # it, so it is the placeholder a real installation is most likely to be left
@@ -1273,13 +1841,13 @@ _REFUSED_CREDENTIALS = ["", "   ", _SHIPPED_PLACEHOLDER]
 _REFUSED_CREDENTIAL_IDS = ["blank", "whitespace", "shipped_literal"]
 
 # A credential the predicate accepts.  Deliberately not a real-looking 40-char
-# hex string: the predicate is a fixed literal set, never a shape heuristic
-# (D-14), so anything outside the set is a real token as far as it is concerned.
+# hex string: the predicate is a fixed literal set, never a shape heuristic, so
+# anything outside the set is a real token as far as it is concerned.
 _ACCEPTED_CREDENTIAL = "a-token-nobody-shipped"
 
-# The phrase WORKER_DEGRADED puts on a job row.  D-15 forbids reusing that
-# member here -- "the scan service was unavailable" is untrue when the service
-# is fine and nobody set the token -- so this path asserts it absent.
+# The phrase WORKER_DEGRADED puts on a job row.  This refusal never reuses that
+# member -- "the scan service was unavailable" is untrue when the service is
+# fine and nobody set the token -- so this path asserts it absent.
 _DEGRADED_PHRASE = "the scan service was unavailable"
 
 
@@ -1290,7 +1858,8 @@ def _appliance_with_credential(
     credential: str,
     *,
     consume_dir: str = "",
-) -> Iterator[TestClient]:
+    url: str | None = None,
+) -> Generator[TestClient]:
     """
     Serve one app whose paperless-ngx credential is exactly ``credential``.
 
@@ -1304,6 +1873,7 @@ def _appliance_with_credential(
         scanner: The stub backend the served worker drives.
         credential: The paperless-ngx token this appliance is configured with.
         consume_dir: A configured consume directory, when the test needs one.
+        url: The paperless-ngx address, or None to keep the module's own.
 
     Yields:
         A started TestClient over that app.
@@ -1312,29 +1882,32 @@ def _appliance_with_credential(
     configured = settings.model_copy(
         update={
             "paperless": PaperlessConfig(
-                url=settings.paperless.url,
+                url=settings.paperless.url if url is None else url,
                 token=credential,
                 consume_dir=consume_dir,
             )
         }
     )
     application = create_app(configured, scanner)
-    application.state.paperless.get_tags = list
-    application.state.paperless.get_correspondents = list
+    stand_in(services_of(application).paperless, "get_tags", lambda *, timeout=None: [])
+    stand_in(
+        services_of(application).paperless,
+        "get_correspondents",
+        lambda *, timeout=None: [],
+    )
     with TestClient(application) as tc:
         yield tc
 
 
 class TestPlaceholderTokenRefusal:
     """
-    ``POST /api/scan`` refuses a scan that could never upload (APPL-07, D-15).
+    ``POST /api/scan`` refuses a scan that could never upload.
 
     The one failure certain to waste paper is a paperless-ngx token nobody
     set: the pages are pulled through the scanner and then have nowhere to go.
-    D-15 splits the response deliberately -- the route guard is the
-    enforcement, the disabled button is only a courtesy -- so every test here
-    drives the route directly, with no button in sight, and one of them sends
-    no htmx header at all.
+    The route guard is the enforcement and the disabled button only a
+    courtesy, so every test here drives the route directly, with no button in
+    sight, and one of them sends no htmx header at all.
     """
 
     @pytest.mark.parametrize(
@@ -1372,7 +1945,7 @@ class TestPlaceholderTokenRefusal:
         web_scanner: StubScannerBackend,
         credential: str,
     ) -> None:
-        """The refused attempt is recorded, not silently dropped (D-05)."""
+        """The refused attempt is recorded, not silently dropped."""
         with _appliance_with_credential(
             web_settings, web_scanner, credential
         ) as client:
@@ -1387,11 +1960,14 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        The attempt is visible in Job History end to end (Phase 26 D-05).
+        The attempt is visible in Job History end to end.
 
         Asserted through the history route rather than the store alone,
         because "history shows the attempt" is a claim about the page a
-        household member actually looks at.
+        household member actually looks at.  A submit refused before its row
+        existed records no owner, so the row is nobody's and even the browser
+        that sent it sees the generic title; the refusal itself was shown to
+        that browser in the submit response.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -1402,7 +1978,8 @@ class TestPlaceholderTokenRefusal:
                 headers=HTMX_HEADERS,
             )
             history = client.get("/api/jobs/history").text
-            assert "Refused In History" in history
+            assert HIDDEN_JOB_TITLE in history
+            assert "Refused In History" not in history
             assert '<td class="status-error">' in history
             _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
 
@@ -1439,11 +2016,11 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
     ) -> None:
         """
-        The refusal is unconditional, not contingent on the upload route.
+        A placeholder token refuses the scan even with a consume directory set.
 
         A configured consume directory is the one thing that could look like a
-        reason to let the scan run anyway.  D-15 does not carve that exception:
-        the predicate is the whole condition.
+        reason to let the scan run anyway.  It buys no exception: the
+        predicate is the whole condition.
         """
         with _appliance_with_credential(
             web_settings,
@@ -1463,11 +2040,11 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        WORKER_DEGRADED is not reused for this refusal (D-15, T-30-67).
+        The unset-token refusal never reuses WORKER_DEGRADED's wording.
 
         Saying the scan service was unavailable when the service is fine and
         nobody set the token would send a household member looking for a broken
-        server.  That untruth is what this milestone removes.
+        server.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -1493,7 +2070,7 @@ class TestPlaceholderTokenRefusal:
         curl, a script, and a browser with ``disabled`` stripped are all refused.
 
         This request carries no htmx header and never touched a button, so it
-        stands in for every client the courtesy cannot reach (T-30-64).
+        stands in for every client the courtesy cannot reach.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -1508,10 +2085,10 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        A refused submit owns no job, so it is handed no owner token (D-23).
+        A refused submit owns no job, so it is handed no owner token.
 
         The guard sits ahead of the mint, which is what keeps a browser that
-        never started anything from collecting a session cookie.
+        never started anything from collecting an owner cookie.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -1540,25 +2117,147 @@ class TestPlaceholderTokenRefusal:
             assert OWNER_COOKIE in response.headers.get("set-cookie", "")
 
 
+# Ten times the refused-row cap, so a store that kept every refusal would hold
+# far more than the cap and one that let refusals push out runs would long since
+# have lost the finished scan.
+_FLOOD_SUBMITS = 200
+
+
+def test_a_refused_submit_flood_keeps_history_bounded_and_the_finished_scan(
+    web_settings: Settings, web_scanner: StubScannerBackend
+) -> None:
+    """Refused submits through the route are capped and never evict a real scan."""
+    with _appliance_with_credential(
+        web_settings, web_scanner, _SHIPPED_PLACEHOLDER
+    ) as client:
+        store = _job_store(client)
+        finished = store.create_job("default", "Finished Scan")
+        store.finish_job(finished.id, JobState.DONE)
+        for index in range(_FLOOD_SUBMITS):
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": f"Flood {index:03d}"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+        rows = store.list_recent(limit=_FLOOD_SUBMITS * 2)
+        refused = [job for job in rows if job.error_category is ErrorCategory.REJECTED]
+        assert len(refused) <= REJECTED_HISTORY_ROWS
+        assert refused[0].title == f"Flood {_FLOOD_SUBMITS - 1:03d}"
+        kept = store.get_job(finished.id)
+        assert kept is not None
+        assert kept.state is JobState.DONE
+
+
+class TestUnsetUrlRefusal:
+    """
+    ``POST /api/scan`` refuses a scan when ``paperless.url`` is empty.
+
+    An empty address loads, so ``serve`` can start and say what is missing,
+    but the upload is certain to fail as a configuration error.  Starting
+    the scan anyway would only pull the stack through the feeder for a PDF
+    that ends in ``failed/``.
+    """
+
+    def test_unset_url_submit_is_503_with_its_own_message(
+        self, web_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """The refusal names the address, not the token or the service."""
+        with _appliance_with_credential(
+            web_settings, web_scanner, _ACCEPTED_CREDENTIAL, url=""
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Unset Url"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            body = _error_body(RequestRejection.URL_UNSET, 503, _newest_job_id(client))
+            assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+            assert rejection_message(RequestRejection.TOKEN_UNSET) not in response.text
+            _assert_rejected_row(client, URL_UNSET_JOB_ERROR)
+
+    def test_unset_url_refuses_even_with_a_consume_dir_configured(
+        self, web_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
+    ) -> None:
+        """No copy is made for an unset URL, so the folder buys no exception."""
+        with _appliance_with_credential(
+            web_settings,
+            web_scanner,
+            _ACCEPTED_CREDENTIAL,
+            consume_dir=str(tmp_path),
+            url="",
+        ) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Raw Post"}
+            )
+            _assert_json_error(response, RequestRejection.URL_UNSET, 503)
+            _assert_rejected_row(client, URL_UNSET_JOB_ERROR)
+
+    def test_unset_url_refuses_before_any_job_is_offered_to_the_worker(
+        self,
+        web_settings: Settings,
+        web_scanner: StubScannerBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One row exists, and it is the refusal."""
+        with _appliance_with_credential(
+            web_settings, web_scanner, _ACCEPTED_CREDENTIAL, url=""
+        ) as client:
+            offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Never Offered"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            assert offered == []
+            rows = _job_store(client).list_recent(limit=50)
+            assert len(rows) == 1
+            assert rows[0].error_category is ErrorCategory.REJECTED
+
+
 # --- The client half: htmx-config meta and the #status-message slot ----------
 
 WEB_DIR = Path(__file__).parent.parent / "src" / "saneless" / "web"
 STATUS_MESSAGE_SLOT = '<div id="status-message" role="alert"></div>'
 _HTMX_CONFIG_META = re.compile(r"""<meta name="htmx-config"\s+content='([^']*)'>""")
-# The slot's inset rule. Phase 30 gave the slot a second child -- the
-# "Technical details" disclosure -- so the one rule now names both children on
-# one selector list rather than only the paragraph: a disclosure that hung a rem
-# to the left of the sentence it explains would read as another element's.
-_CSS_RULE = re.compile(
-    r"#status-message > p,\s*#status-message > details \{(?P<body>[^}]*)\}"
-)
+# The slot's inset rule names both of its children, the sentence and the
+# "Technical details" disclosure, on one selector list: a disclosure that hung a
+# rem to the left of the sentence it explains would read as another element's.
+_INSET_SELECTOR = "#status-message > p, #status-message > details"
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_BLOCK = re.compile(r"(?P<selector>[^{}]*)\{(?P<body>[^{}]*)\}")
+
+
+def _css_rules(css: str) -> list[tuple[str, str]]:
+    """
+    Return every innermost rule of a stylesheet, with its comments removed.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        Each rule's selector, whitespace normalised, and its body.
+
+    """
+    return [
+        (" ".join(block.group("selector").split()), block.group("body"))
+        for block in _CSS_BLOCK.finditer(_CSS_COMMENT.sub("", css))
+    ]
+
+
+def _declarations(body: str) -> dict[str, str]:
+    """Return a rule body's declarations as property names and their values."""
+    pairs = [part.split(":", 1) for part in body.split(";") if ":" in part]
+    return {name.strip(): value.strip() for name, value in pairs}
 
 
 def test_status_message_slot_is_one_empty_alert_above_the_status_area(
     client: TestClient,
 ) -> None:
     """
-    The page has one empty alert slot, just above #status-area (D-03).
+    The page has one empty alert slot, just above #status-area.
 
     It is a sibling of the polled status area, so the 1 s outerHTML poll never
     replaces it, and it sits outside the form.
@@ -1577,7 +2276,7 @@ def test_htmx_config_restates_all_three_response_handling_entries(
     client: TestClient,
 ) -> None:
     """
-    The htmx-config meta swaps error bodies without breaking 2xx swaps (D-01).
+    The htmx-config meta swaps error bodies without breaking 2xx swaps.
 
     htmx 2.0.10 merges meta config shallowly, so a meta holding only the
     ``[45]..`` entry would replace the whole array and stop every 2xx swap.
@@ -1596,21 +2295,170 @@ def test_htmx_config_restates_all_three_response_handling_entries(
 
 
 def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
-    """The meta follows the color-scheme meta and precedes <title> (UI-SPEC S1)."""
-    base = (WEB_DIR / "templates" / "base.html").read_text()
-    assert base.count('name="htmx-config"') == 1
-    color_scheme = base.index('<meta name="color-scheme"')
-    htmx_config = base.index('<meta name="htmx-config"')
-    title = base.index("<title>")
-    assert color_scheme < htmx_config < title
+    """The htmx-config meta follows the color-scheme meta and precedes <title>."""
+    tags = template_start_tags(WEB_DIR / "templates" / "base.html")
+    order = [
+        attributes.get("name") if tag == "meta" else tag
+        for tag, attributes in tags
+        if tag == "title"
+        or (tag == "meta" and attributes.get("name") in {"color-scheme", "htmx-config"})
+    ]
+    assert order == ["color-scheme", "htmx-config", "title"]
 
 
 def test_status_message_children_are_inset_like_the_status_area() -> None:
-    """The slot's message and disclosure line up with the status area (D-03)."""
-    css = (WEB_DIR / "static" / "app.css").read_text()
-    assert "!important" not in css
-    rules = _CSS_RULE.findall(css)
-    assert len(rules) == 1
-    body = rules[0]
-    assert "padding-left: 1rem;" in body
-    assert "border-left: var(--pico-border-width) solid transparent;" in body
+    """The slot's message and disclosure line up with the status area."""
+    rules = _css_rules((WEB_DIR / "static" / "app.css").read_text(encoding="utf-8"))
+    assert [selector for selector, body in rules if "!important" in body] == []
+    bodies = [body for selector, body in rules if selector == _INSET_SELECTOR]
+    assert len(bodies) == 1
+    declarations = _declarations(bodies[0])
+    assert declarations.get("padding-left") == "1rem"
+    assert declarations.get("border-left") == (
+        "var(--pico-border-width) solid transparent"
+    )
+
+
+# --- Focus after a refused Scan ----------------------------------------------
+
+# The Scan button a refused htmx submit carries out-of-band, captured whole,
+# whatever order its attributes are in.
+_OOB_SCAN_BUTTON = re.compile(
+    r'<button(?=[^>]*\sid="scan-btn")(?=[^>]*\shx-swap-oob="true")(?P<attrs>\s[^>]*)>'
+)
+_AUTOFOCUS = re.compile(r"\sautofocus\b")
+
+# One refused submit per kind of refusal the button can recover from: the
+# worker's own refusal, a form the validator throws out, and a request the
+# route refuses before it writes anything.
+_RECOVERABLE_REFUSALS = {
+    "queue_full": (
+        {"profile": "default", "title": "Queue Full"},
+        RequestRejection.QUEUE_FULL,
+    ),
+    "title_too_long": (
+        {"profile": "default", "title": "x" * (TITLE_MAX_LENGTH + 1)},
+        RequestRejection.TITLE_TOO_LONG,
+    ),
+    "unknown_profile": (
+        {"profile": "no-such-profile", "title": "Unknown"},
+        RequestRejection.UNKNOWN_PROFILE,
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", list(_RECOVERABLE_REFUSALS))
+def test_rejected_scan_returns_focus_to_the_scan_button(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """
+    A refused Scan hands focus back to an enabled Scan button.
+
+    The press disabled the button while the request was in flight, which
+    dropped focus to the page body.  The refusal re-renders the button,
+    enabled, with ``autofocus``, so a keyboard user can correct and press
+    again.  Focus never moves into ``#status-message``: the slot speaks the
+    error from where it is.  A request that is not htmx still gets the JSON
+    shape and no markup.
+    """
+    data, rejection = _RECOVERABLE_REFUSALS[refusal]
+    _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
+
+    response = client.post("/api/scan", data=data, headers=HTMX_HEADERS)
+
+    status = rejection_status_code(rejection)
+    assert response.status_code == status
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert _error_paragraph(rejection) in response.text
+    buttons = _OOB_SCAN_BUTTON.findall(response.text)
+    assert len(buttons) == 1, response.text
+    assert _AUTOFOCUS.search(buttons[0]) is not None
+    assert "disabled" not in buttons[0]
+    assert response.text.count('id="scan-btn"') == 1
+
+    plain = client.post("/api/scan", data=data)
+    _assert_json_error(plain, rejection, status)
+
+
+@pytest.mark.parametrize(
+    ("credential", "url", "rejection"),
+    [
+        (_SHIPPED_PLACEHOLDER, None, RequestRejection.TOKEN_UNSET),
+        (_ACCEPTED_CREDENTIAL, "", RequestRejection.URL_UNSET),
+    ],
+    ids=["token_unset", "url_unset"],
+)
+def test_blocked_refusal_does_not_offer_the_scan_button(
+    web_settings: Settings,
+    web_scanner: StubScannerBackend,
+    credential: str,
+    url: str | None,
+    rejection: RequestRejection,
+) -> None:
+    """
+    On an appliance that cannot upload, the refusal carries no Scan button.
+
+    The button there is disabled by design, and a disabled button cannot take
+    focus, so there is nothing to hand focus back to.
+    """
+    with _appliance_with_credential(
+        web_settings, web_scanner, credential, url=url
+    ) as blocked:
+        response = blocked.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Blocked"},
+            headers=HTMX_HEADERS,
+        )
+
+    assert response.status_code == rejection_status_code(rejection)
+    assert _error_paragraph(rejection) in response.text
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None
+
+
+@pytest.mark.parametrize(
+    "refusal", ["title_too_long", "unknown_profile"], ids=lambda name: name
+)
+def test_refusals_before_the_block_do_not_offer_the_scan_button(
+    web_settings: Settings, web_scanner: StubScannerBackend, refusal: str
+) -> None:
+    """
+    A refusal checked before the block still carries no Scan button there.
+
+    Some refusals are decided before the appliance's block is, so a forced
+    press on the disabled button meets them instead.  Their button would be
+    enabled and focused, overriding the server's own disabled state, so on a
+    blocked appliance none is sent, as for the block's own refusal.
+    """
+    data, rejection = _RECOVERABLE_REFUSALS[refusal]
+    with _appliance_with_credential(
+        web_settings, web_scanner, _SHIPPED_PLACEHOLDER
+    ) as blocked:
+        response = blocked.post("/api/scan", data=data, headers=HTMX_HEADERS)
+
+    assert response.status_code == rejection_status_code(rejection)
+    assert _error_paragraph(rejection) in response.text
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "data"),
+    [
+        ("GET", "/api/scan", None),
+        ("POST", "/api/flip/abort", {}),
+        ("POST", "/api/multi-page/answer", {"job_id": "x", "prompt": "0"}),
+        ("POST", f"/_test/reject/{RequestRejection.QUEUE_FULL.value}", None),
+    ],
+    ids=["scan_get", "flip_abort", "multi_page_answer", "other_route"],
+)
+def test_other_htmx_errors_carry_no_scan_button(
+    client: TestClient, method: str, path: str, data: dict[str, str] | None
+) -> None:
+    """Only a refused Scan press returns focus to Scan; no other error moves it."""
+    response = client.request(method, path, data=data, headers=HTMX_HEADERS)
+
+    assert response.status_code >= 400
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None

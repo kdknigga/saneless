@@ -1,16 +1,11 @@
 """
 PDF assembly via img2pdf, over the pages the spool already wrote.
 
-Each acquired page is on disk as a PNG before assembly starts, written once
-by ``saneless.spool``, and that file is what img2pdf embeds -- losslessly,
-with no second encode. This module therefore creates no temporary
-image files and owns no page's lifetime: the spool lives in the job's
-workspace, and assembly only reads from it.
-
-Assembly runs **one page per ``img2pdf.convert`` call** and merges the
-single-page PDFs with qpdf, because that is the only shape in which the
-per-page memory bound is true at any page count. The measured figures, and the
-one cost that buys, are in :func:`assemble_pdf`.
+Each page is already a PNG the spool wrote, and img2pdf embeds that file
+losslessly with no second encode, so this module owns no page's lifetime.
+Assembly converts one page at a time and merges the single-page PDFs with qpdf,
+so peak memory does not grow with page count.
+See docs/explanation/decisions/0006-per-page-pdf-and-qpdf-merge.md.
 """
 
 from __future__ import annotations
@@ -19,34 +14,53 @@ import logging
 import re
 import tempfile
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import img2pdf
 import pikepdf
 
-from saneless.exceptions import PdfError, describe
+from saneless.exceptions import DiskSpaceError, PdfError, describe, is_out_of_space
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from saneless.scanner.base import PageRecord
 
-# Everything outside the allow-list becomes a separator.  See
-# sanitise_title_for_filename for why this is an allow-list and not a
-# deny-list, and why auto_profiles._slugify is not reused.
+# Everything outside the allow-list becomes a separator.
 _NON_SLUG_CHARACTERS = re.compile(r"[^a-z0-9]+")
 
-# Cap on the title slug only; the timestamp and job-id segments are fixed
+# Cap on the title slug; the timestamp and job-id segments are fixed
 # width, keeping the composed name far below NAME_MAX.
 _MAX_SLUG_LENGTH = 60
 
 # A uuid4 prefix long enough that a collision needs ~2^16 jobs in one second.
 _JOB_ID_LENGTH = 8
 
+# Cap on the part segment ("fronts", "backs", "partial"), which is saneless's
+# own word and never truncated by the title's cap.
+_MAX_PART_LENGTH = 16
+
 __all__ = ["assemble_pdf", "build_pdf_filename", "sanitise_title_for_filename"]
 
 logger = logging.getLogger(__name__)
+
+
+def _producer() -> str:
+    """
+    Name saneless and its installed version, for every PDF's ``/Producer``.
+
+    Resolved once at import, outside assembly's catch-all, so a source tree
+    with no installed distribution cannot fail every scan as an assembly error.
+    """
+    try:
+        return f"saneless {version('saneless')}"
+    except PackageNotFoundError:
+        return "saneless"
+
+
+_PRODUCER = _producer()
 
 
 def sanitise_title_for_filename(title: str) -> str:
@@ -54,28 +68,17 @@ def sanitise_title_for_filename(title: str) -> str:
     Reduce a user-supplied title to a safe single path segment.
 
     The rule is an **allow-list**, deliberately: everything outside
-    ``[a-z0-9]`` collapses to a single ``-``.  A deny-list can be defeated by
-    a character nobody anticipated; an allow-list cannot.  That is what makes
-    ``/``, ``\``, ``..``, ``~`` and ``\x00`` unrepresentable here by
-    construction rather than by enumeration -- this title arrives from a web
-    form body or a ``saneless scan --title`` argument and its result is joined
+    ``[a-z0-9]`` collapses to a single ``-``, so ``/``, ``\``, ``..``, ``~``
+    and ``\x00`` are unrepresentable by construction.  The result is joined
     onto ``consume_dir`` and ``<data_dir>/failed/``.
 
-    ``auto_profiles._slugify`` is **not** reused for this, and must not be: it
-    is two ``str.replace`` calls that pass ``/``, ``..`` and every control
-    character straight through.  Its input is a trusted SANE source name, not
-    operator input, so it is correct for its own job and unsafe for this one.
+    ``auto_profiles._slugify`` must not be reused: it has no length cap and
+    turns an empty result into a placeholder name.
 
-    The 60-character cap keeps the whole composed name (see
-    :func:`build_pdf_filename`, whose other segments are fixed width) under
-    ``NAME_MAX`` -- 255 bytes on ext4 and overlayfs -- and under eCryptfs's
-    stricter 143-byte limit, so a long title cannot turn into
-    ``OSError: [Errno 36] File name too long`` on a user-controlled path.
-
-    A title with nothing allow-listed in it -- ``"..."``, or a wholly
-    non-Latin one like ``"日本語"`` -- returns the empty string and the caller
-    drops the segment.  Substituting a literal ``untitled`` is rejected: it
-    would be a lie about what the operator typed.
+    The cap keeps the whole composed name under ``NAME_MAX`` and under
+    eCryptfs's stricter 143-byte limit.  A title with nothing allow-listed in
+    it returns the empty string, and the caller drops the segment rather than
+    invent a name the operator never typed.
 
     Args:
         title: The title as typed by the operator. Wholly untrusted.
@@ -90,39 +93,35 @@ def sanitise_title_for_filename(title: str) -> str:
     return slug[:_MAX_SLUG_LENGTH].strip("-")
 
 
-def build_pdf_filename(job_id: str, title: str) -> str:
+def build_pdf_filename(job_id: str, title: str, *, part: str = "") -> str:
     """
     Compose the unique file name for one job's assembled PDF.
 
-    The shape is ``{YYYYmmdd-HHMMSS}-{job id}-{title slug}.pdf``, with either
-    of the last two segments dropped entirely when it sanitises away, so the
-    name never carries a dangling ``-`` before its extension.
+    The shape is ``{YYYYmmdd-HHMMSS}-{job id}-{title slug}-{part}.pdf``, with
+    any of the last three segments dropped entirely when it sanitises away, so
+    the name never carries a dangling ``-`` before its extension.
 
-    **Uniqueness comes from the job id, not from the timestamp.** The job id is
-    a uuid4 -- ``job.id`` from the worker, and one minted per run by ``saneless
-    scan``; the timestamp is only there to make a directory listing sort
-    usefully. Two jobs submitted in the same second with the same title would
-    collide on the timestamp alone, and a collision is not cosmetic here:
-    ``shutil.move`` onto an explicit destination path overwrites silently, so
-    two same-named PDFs preserved into ``failed/`` would destroy one scan.
+    ``part`` is a segment of its own, after the title slug, because a suffix
+    inside the slug would be cut off a long title, giving both halves of a
+    duplex job one name.
 
-    Only the first ``_JOB_ID_LENGTH`` characters of the id are used, so two
-    uuid4s that agree on that prefix, in the same second, under the same title,
-    still collide. At eight hex characters that is a 1-in-4-billion coincidence
-    per same-second same-title pair, and it is the bound this guarantee really
-    carries -- not an absolute.
+    **Uniqueness comes from the job id, not from the timestamp**, which only
+    makes a directory listing sort usefully.  A clash matters: preservation
+    never replaces a file in ``failed/``, so a clashing PDF lands under a
+    numbered name that no longer says which job it was.  The id prefix makes
+    that a 1-in-4-billion coincidence per same-second same-title pair, not an
+    impossibility.
 
-    The job id is put through the same sanitiser as the title. In production it
-    is a uuid4, every character of which already survives the allow-list
-    untouched, so this costs nothing there -- but the id is a path segment like
-    any other, and a path segment that is merely *expected* to be safe is not a
-    control this function owns.
+    The job id is a path segment like any other, so it goes through the same
+    sanitiser as the title.
 
     Args:
-        job_id: The job's identifier, a uuid4 from either entry point. Empty
-            only in tests, which construct a request without one; the segment
-            is then dropped, and with it the uniqueness this function promises.
+        job_id: The job's identifier, a uuid4.  When empty the segment is
+            dropped, and with it the uniqueness this function promises.
         title: The title as typed by the operator. Wholly untrusted.
+        part: Which of the job's PDFs this is, for example ``(fronts)``;
+            sanitised like the title and never truncated by the title's cap.
+            Empty for the job's one document.
 
     Returns:
         A single ``.pdf`` file name -- never a path, and never a name that
@@ -131,10 +130,16 @@ def build_pdf_filename(job_id: str, title: str) -> str:
     """
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     job_segment = sanitise_title_for_filename(job_id)[:_JOB_ID_LENGTH].strip("-")
+    part_segment = sanitise_title_for_filename(part)[:_MAX_PART_LENGTH].strip("-")
     segments = [
-        part
-        for part in (timestamp, job_segment, sanitise_title_for_filename(title))
-        if part
+        segment
+        for segment in (
+            timestamp,
+            job_segment,
+            sanitise_title_for_filename(title),
+            part_segment,
+        )
+        if segment
     ]
     return "-".join(segments) + ".pdf"
 
@@ -143,116 +148,77 @@ def assemble_pdf(
     records: Sequence[PageRecord],
     output_dir: Path,
     filename: str,
-    dpi: int,
+    *,
+    title: str,
 ) -> Path:
     """
     Assemble spooled pages into a single PDF using img2pdf.
 
-    The pages are already files: the spool wrote each one as it was acquired,
-    and img2pdf embeds those very files. There is no longer a temporary
-    directory of re-saved copies here, because that second encode produced a
-    PNG that was byte-for-byte pointless -- the spooled one already *is* the
-    PDF's page content.
+    The order of ``records`` is the document order and the only source of it:
+    the spool directory is never sorted or globbed, because after a
+    manual-duplex interleave its file names do not sort into document order.
 
-    The order of ``records`` is the document order and the only source of it.
-    The spool directory is never sorted and never globbed: after a
-    manual-duplex interleave the file names do not sort into document order,
-    and a file sitting in that directory without a record does not belong in
-    this PDF.
+    ``filename`` is required, so each caller names its own file; build it with
+    :func:`build_pdf_filename`.
 
-    ``filename`` is **required**, with no default. Giving it one -- the single
-    hardcoded name this function used to write every PDF to -- would have kept
-    every existing caller compiling while silently preserving the collision
-    this argument exists to remove: every document reaching paperless carried
-    the same original filename, and two preserved scans overwrote each other.
-    So the type level forces each caller to name its own file.
-    Build the name with :func:`build_pdf_filename` rather than composing one.
+    **Each page is laid out at its own record's ``dpi``**, the resolution the
+    device read back, which ``crop_to_paper_size`` also used, so the crop and
+    the MediaBox cannot disagree.  The PNG's pHYs chunk is deliberately not
+    read: PNG stores pixels per metre as an integer, so it degrades 300 to
+    299.9994.
 
-    ``dpi`` is likewise supplied by the caller -- as the resolution the scanner
-    reported actually using, read back from the device rather than the one the
-    profile requested -- and is deliberately **not** read from the images. On
-    this path PIL carries no DPI at all: images arrive from ``dev.snap()`` and
-    go through ``crop_to_paper_size``, whose ``Image.crop()`` returns a fresh
-    image whose ``.info`` is measured as ``{}``. A "prefer the image's own DPI"
-    branch would therefore be unreachable dead code -- and a PNG round-trip
-    degrades 300 to 299.9994 anyway, because PNG stores pixels per metre as an
-    integer. That same read-back value is what ``crop_to_paper_size`` uses for
-    its crop arithmetic, so the crop shape and the MediaBox cannot disagree.
-
-    A fixed-DPI layout function applies that DPI to **every** page
-    unconditionally, so a page's size in points is determined entirely by its
-    pixel count. That is correct here because one pipeline run scans every page
-    at one resolution: a half-size raster becomes a half-size page rather than
-    being rescaled to match its neighbours.
-
-    **Memory is bounded by converting one page at a time.** Each page gets its
-    own ``img2pdf.convert(..., outputstream=...)`` call into its own single-page
-    PDF in a scratch directory, and qpdf merges those through
-    :class:`pikepdf.Job`, copying each page's streams lazily. Measured, not
-    assumed, on 48 synthetic A4 300 DPI colour pages: one ``convert`` whose
-    bytes were then written out peaked at 1395 MB, and the same ``convert``
-    with ``outputstream=`` at 787 MB -- both still linear in page count,
-    because ``convert`` reads every input fully into memory and finalises the
-    whole document before ``outputstream`` is written a byte. Per-page convert
-    plus the qpdf merge measured flat at **131 MB for both 12 and 48 pages**,
-    with byte-identical ``/FlateDecode`` image streams, the same
-    ``/MediaBox [0 0 595.2 841.92]`` and the same total wall clock. That is a
-    settled answer: the shape is not a tuning knob, it is what makes the memory
-    sentence true end to end, and ``outputstream=`` on its own does not.
+    **Memory stays flat as page count grows** because each page gets its own
+    ``img2pdf.convert(..., outputstream=...)`` call and qpdf merges the
+    single-page PDFs lazily; ``outputstream=`` alone is not enough.
+    See docs/explanation/decisions/0006-per-page-pdf-and-qpdf-merge.md.
 
     The accepted cost is the GIL. ``pikepdf.Job.run()`` holds it for roughly
-    12 ms per page, so a 500-page job stalls its thread for about 6 s during
-    assembly. That thread is the worker's, already blocked for the whole scan,
-    so the visible effect is one briefly frozen status poll -- and the
-    alternative is gigabytes of resident memory.
+    12 ms per page, so a 500-page job stalls every Python thread in the
+    process for about 6 s during assembly: web requests and the health
+    endpoint wait, not only the job's own thread.
 
-    The single-page PDFs are named from each record's **position in
-    ``records``**, not from ``PageRecord.sequence``: sequence numbers are
-    assigned per acquisition pass, so after a manual-duplex interleave two
-    records legitimately share the number 1. Naming by position keeps the merge
-    argv unique and in document order by construction, with nothing sorted and
-    nothing globbed.
+    **The document describes itself.**  ``/Info`` carries ``/Title``,
+    ``/Producer`` and ``/Creator``.  Only the first single-page PDF is
+    converted with that metadata, and it is qpdf's primary input rather than
+    ``--empty``, which was measured to leave ``/Info`` empty.
 
-    This function is a module boundary that raises only ``PdfError``, and the
-    caught type is ``Exception``, **deliberately**. img2pdf raises seven
-    unrelated error classes -- each a direct ``Exception`` subclass with no
-    shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``;
-    Pillow raises ``OSError`` and ``SystemError`` while a page is read; and
-    ``pikepdf.Job.run()`` raises pikepdf's own exception types, such as
-    ``pikepdf.PdfError``, when qpdf refuses a file. So any tuple of types would
-    leak whichever one was left off it. The catch is narrow in *span* --
-    directory creation, the per-page converts and the merge, nothing else --
-    and broad in *type*. pikepdf needed **no new** ``except`` clause for that
-    reason: its errors are ordinary ``Exception`` subclasses and this boundary
-    already covered them, so every one of them still leaves this function
-    as a ``PdfError``.
-    Nothing is masked: the original is always chained on ``__cause__`` and its
-    text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
-    from ``BaseException`` and pass through untouched.
+    **A recovered merge is not silent.**  When qpdf had to repair an input
+    (``pikepdf.Job.has_warnings``), the PDF is still returned, but one
+    WARNING names the page count and the PDF.
+
+    The single-page PDFs are named by position in ``records``, not by
+    ``PageRecord.sequence``, which repeats across the passes of a manual
+    duplex.
+
+    The catch is ``Exception``, **deliberately**, narrow in span and broad in
+    type: img2pdf, Pillow and pikepdf raise many unrelated types with no
+    shared base, so any tuple would leak one.  A failure whose chain holds an
+    out-of-space ``OSError`` leaves as ``DiskSpaceError``; every other one as
+    ``PdfError``, chained on ``__cause__``.
 
     Args:
         records: The spooled pages to include, in document order. Must not be
-            empty. Each record's PNG is embedded exactly as the spool wrote
-            it, losslessly and with no re-encode.
+            empty.
         output_dir: Directory where the output PDF will be written.
         filename: File name for the PDF, including its ``.pdf`` extension.
-            Must be a single path segment; :func:`build_pdf_filename`
-            guarantees that.
-        dpi: Resolution the pages were actually scanned at, as read back from
-            the device. Determines the page size the PDF declares.
+            Must be a single path segment.
+        title: The document's title, written to ``/Info`` as ``/Title``.
 
     Returns:
         Path to the generated PDF file.
 
     Raises:
-        PdfError: When ``records`` is empty, or when anything goes wrong while
-            the PDF is being assembled or written. The message names the page
-            count, the target PDF path and the original failure's text.
+        DiskSpaceError: When assembling or writing the PDF runs out of space
+            or quota. The message names the page count, the target PDF path
+            and the original failure's text.
+        PdfError: When ``records`` is empty, or when anything else goes wrong
+            while the PDF is being assembled or written. The message names
+            the page count, the target PDF path and the original failure's
+            text.
 
     """
     if not records:
-        # The pipeline's _require_pages already refuses an empty batch; this
-        # keeps img2pdf's "Unable to process empty list" ValueError unreachable
+        # Keeps img2pdf's "Unable to process empty list" ValueError unreachable
         # from any caller of this public function.
         msg = "Could not assemble a PDF: no pages were given"
         raise PdfError(msg)
@@ -261,45 +227,59 @@ def assemble_pdf(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
-        # default_layout_fun unpacks it, and an int silently yields wrong
-        # geometry.  Without it img2pdf lays pages out at its default_dpi
-        # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
-        layout_fun = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
-
         with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
             work_dir = Path(tmp_dir)
+            # Only the first page carries the document metadata: that file is
+            # the merge's primary input, and qpdf keeps the primary's /Info.
+            metadata = {
+                "title": title,
+                "producer": _PRODUCER,
+                "creator": "saneless",
+            }
             singles: list[str] = []
             for position, record in enumerate(records, start=1):
                 single = work_dir / f"{position:04d}.pdf"
-                # convert returns None once outputstream= is supplied -- that
-                # is its documented contract, not a failure, so there is
-                # nothing here to guard against.
+                page_metadata = metadata if position == 1 else {}
+                # An (x_dpi, y_dpi) 2-tuple, not a scalar: an int silently
+                # yields wrong geometry.
+                layout_fun = img2pdf.get_fixed_dpi_layout_fun((record.dpi, record.dpi))
                 with single.open("wb") as stream:
                     img2pdf.convert(
                         [str(record.path)],
                         layout_fun=layout_fun,
                         outputstream=stream,
+                        **page_metadata,
                     )
                 singles.append(str(single))
 
-            # An in-process qpdf API, not a shell invocation: every element of
-            # this argv is a literal or a file this call just wrote inside its
-            # own scratch directory, so no operator string reaches it.
-            pikepdf.Job(
-                ["qpdf", "--empty", "--pages", *singles, "--", str(pdf_path)]
-            ).run()
+            # An in-process qpdf API, not a shell: every argv element is a
+            # literal or a file this call just wrote.  The first single is the
+            # primary input, so its /Info is kept; the pages come from --pages
+            # alone, so it is not merged twice.
+            job = pikepdf.Job(
+                ["qpdf", singles[0], "--pages", *singles, "--", str(pdf_path)]
+            )
+            job.run()
+            if job.has_warnings:
+                logger.warning(
+                    "qpdf reported warnings while merging %d page(s) into %s; "
+                    "the PDF may be damaged",
+                    len(records),
+                    pdf_path,
+                )
 
         logger.info("Assembled %d page(s) into %s", len(records), pdf_path)
-    except PdfError:
-        # Already the boundary's own type: wrapping it again would only
-        # repeat the message.
+    except PdfError, DiskSpaceError:
+        # Already a boundary type: wrapping it would repeat the message, or
+        # report a full disk as a PDF fault.
         raise
     except Exception as exc:
         msg = (
             f"Could not assemble {len(records)} page(s) into {pdf_path}: "
             f"{describe(exc)}"
         )
+        if is_out_of_space(exc):
+            raise DiskSpaceError(msg) from exc
         raise PdfError(msg) from exc
 
     return pdf_path

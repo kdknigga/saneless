@@ -7,8 +7,8 @@ moves.  Two cases matter to the operator:
 
 * the lists were fetched once and Paperless then went away: the page keeps
   showing the last good lists, and the log says why once per TTL;
-* the lists were never fetched: the page renders them empty, and the log
-  now says why.
+* the lists were never fetched: the page says they could not be loaded,
+  and the log says why.
 
 Nothing in this file sleeps.
 """
@@ -16,24 +16,24 @@ Nothing in this file sleeps.
 from __future__ import annotations
 
 import functools
+import html
 import logging
 from typing import TYPE_CHECKING
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from saneless.vocabulary import TAGS_UNAVAILABLE
 from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.cache import MetadataCache
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, services_of, stand_in
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from saneless.config import Settings
 
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 _TTL_SECONDS = 60
 # What the offline client's fetch failure starts with; the rest names the URL
@@ -58,13 +58,6 @@ class _FakeClock:
 
 
 type _Clocked = tuple[TestClient, _FakeClock]
-
-
-def _app(client: TestClient) -> FastAPI:
-    """Return the client's app, checked so the type checkers know it."""
-    app = client.app
-    assert isinstance(app, FastAPI)
-    return app
 
 
 @pytest.fixture
@@ -99,12 +92,14 @@ def test_an_outage_keeps_the_last_good_tag_list(
 ) -> None:
     """Tags fetched once are still rendered after Paperless stops answering."""
     client, clock = clocked
-    paperless = _app(client).state.paperless
+    paperless = services_of(client.app).paperless
     offline_get_tags = paperless.get_tags
-    paperless.get_tags = lambda: [{"id": 1, "name": "receipt"}]
+    stand_in(
+        paperless, "get_tags", lambda *, timeout=None: [{"id": 1, "name": "receipt"}]
+    )
     assert "receipt" in client.get("/api/tags").text
 
-    paperless.get_tags = offline_get_tags
+    stand_in(paperless, "get_tags", offline_get_tags)
     clock.advance(_TTL_SECONDS + 1)
     with caplog.at_level(logging.WARNING):
         first = client.get("/api/tags")
@@ -117,13 +112,13 @@ def test_an_outage_keeps_the_last_good_tag_list(
     assert len(records) == 1
     assert _CAUSE in records[0].getMessage()
     assert "Token" not in records[0].getMessage()
-    assert _warnings(caplog, "saneless.web.routes") == []
+    assert _warnings(caplog, "saneless.web.metadata_view") == []
 
 
-def test_tags_never_fetched_render_empty_and_log_the_cause(
+def test_tags_never_fetched_say_so_and_log_the_cause(
     clocked: _Clocked, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """With no previous list the tags render empty, and the warning says why."""
+    """With no previous list the tags say they could not load, and the log why."""
     client, _clock = clocked
 
     with caplog.at_level(logging.WARNING):
@@ -131,10 +126,12 @@ def test_tags_never_fetched_render_empty_and_log_the_cause(
 
     assert response.status_code == 200
     assert "receipt" not in response.text
-    records = _warnings(caplog, "saneless.web.routes")
+    assert html.escape(TAGS_UNAVAILABLE) in response.text
+    assert "No tags in paperless-ngx yet." not in response.text
+    records = _warnings(caplog, "saneless.web.metadata_view")
     assert len(records) == 1
     message = records[0].getMessage()
-    assert "using empty list" in message
+    assert "answering unavailable" in message
     assert _CAUSE in message
     assert "Token" not in message
     assert records[0].exc_info is None

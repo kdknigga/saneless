@@ -1,60 +1,73 @@
 """
-End-to-end proof of Phase 23: the real worker driving the real pipeline.
+Every scan outcome is persisted correctly by the real worker on the real pipeline.
 
-What makes this module different from every other test file in the repository:
-it is the only one that runs the real :func:`saneless.pipeline.run_pipeline`
-inside the real :class:`saneless.worker.ScanWorker`.  All 49 ``ScanWorker(...)``
-construction sites in ``tests/test_worker.py`` replace the pipeline entry
-point in the worker's own module namespace, which makes them tests of the
-worker's *handling* of a result rather than tests of the result.  This module
-patches run_pipeline nowhere, and an acceptance grep enforces that the
-patch target's dotted name does not appear below.
+This is the only module that runs the real :func:`saneless.pipeline.run_pipeline`
+inside the real :class:`saneless.worker.ScanWorker`.  The ``ScanWorker(...)``
+tests in ``tests/test_worker.py`` replace the pipeline entry point in the
+worker's own module namespace, which makes them tests of the worker's
+*handling* of a result rather than tests of the result.  This module patches
+run_pipeline nowhere.
 
 Exactly two things are stubbed, and nothing else:
 
 * **the scanner** -- a ``MagicMock(spec=ScannerBackend)`` spooling PIL images
   into the pipeline's own sink, because there is no SANE device in CI.  It is
   the real ``SpooledPageSink`` that writes them and the real records that come
-  back, so the pages this module's PDFs embed are real files;
+  back, so the pages this module's PDFs embed are real files.  The multi-page
+  cases use ``DistinctPageScanner`` instead, the same seam with pages that can
+  be told apart, so a kept PDF can be read back page by page;
 * **the HTTP layer** -- an ``httpx2.MockTransport`` passed through
   ``PaperlessClient(..., transport=...)``, the seam ``tests/test_paperless.py``
   uses throughout.  It sits *below* ``httpx2.Client``, so the real
   ``upload_document`` and ``poll_task`` bodies execute, retries and all.
+  The two client-side misconfiguration cases stub even less: a request the
+  transport refuses never reaches a mock, so they run the production transport,
+  one of them against a real socket on 127.0.0.1.
 
 Everything else is production code: real PDF assembly, real empty-page
 filtering, real preservation into ``<data_dir>/failed/``, a real file-backed
 SQLite job store, and a real background thread.  Every assertion reads the
 **persisted job row** through ``store.get_job`` rather than a mock's call list,
 because a row in the database is the thing a user's web page and ``saneless
-jobs`` actually render (T-23-38).
+jobs`` actually render.
 
 **On speed.**  Apart from the one-second flip timeout below, all the cases
 together sleep for well under a second, using only seams that already exist:
 
-* ``max_retries=1`` makes both exponential-backoff pauses in
-  ``upload_document`` unreachable (measured 3.00 s at 3 retries, 1.00 s at 2,
-  0.00 s at 1).  The consume-directory case is the one that needs it.
-* ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
-  monotonic deadline has already passed when the first poll comes back without
-  a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
-* ``flip_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
-  config accepts, so the flip wait costs one second -- the only wall clock
-  this module spends.  See ``_FLIP_TIMEOUT_BUDGET``.
+* ``PaperlessTiming(send_budget=0.0)`` gives ``upload_document`` exactly one
+  attempt, so no before-send backoff pause is ever reached; at the default
+  60 s budget a refused connection would wait it out.  The consume-directory
+  case is the one that needs it.  The two misconfiguration cases keep the
+  default budget on a ``FakeClock`` instead, and assert that it never waited.
+* ``paperless_task_timeout`` is 1 for the poll-timeout case, the smallest value
+  config accepts, and that case's polls run on a ``FakeClock``, so the second
+  elapses through ``poll_task``'s own backoff sleeps without any wall clock.
+  See ``_TIMEOUT_BUDGET``.
+* The outcome cases' task polls run on a ``FakeClock`` through the same
+  ``PaperlessTiming`` seam, so the proxy-blip case's one backoff wait, after
+  its 502, costs no real time.
+* ``operator_wait_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
+  config accepts, so the flip wait costs one second.  See
+  ``_FLIP_TIMEOUT_BUDGET``.  The two multi-page cases that wait a question
+  out use the same one second, and they are the only other wall clock this
+  module spends.
 * The other cases reach a terminal status, or fall back, on the first
   request, before any sleep, and cost nothing.
 
 The sleep primitive itself is **not** patched anywhere here, and no flat
-pause appears in this module -- an acceptance grep enforces both.  Patching it
-in ``saneless.paperless`` would disable the ``min(delay, remaining)`` deadline
-clamp that plan 23-04 added, which is part of what these cases prove; Phase 32
-(M-34) owns that sweep.  No ``sleep_fn`` parameter and no configurable backoff
-base were added either: those would be production seams existing only for
-tests, for a problem two existing constructor parameters already solve.
+pause appears in this module.  Patching it in ``saneless.paperless`` would
+disable the ``min(delay, remaining)`` deadline clamp, which is part of what
+these cases prove.  The upload's and the poll's own waits go through the
+client's ``PaperlessTiming`` seam, which exists because a 60 s budget cannot be waited
+out under pytest's 60 s timeout; where a case needs no retry it simply gets a
+zero budget.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import contextlib
+import logging
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
@@ -72,26 +85,46 @@ from saneless.config import (
 )
 from saneless.exceptions import ScanError
 from saneless.job import JobStore
-from saneless.paperless import PaperlessClient
+from saneless.paperless import PaperlessClient, PaperlessTiming
 from saneless.scanner.base import ScannerBackend
 from saneless.vocabulary import (
+    RESTART_REASON,
     TERMINAL_STATES,
     ErrorCategory,
     JobState,
+    PassAnswer,
+    PassWait,
     ScanOutcome,
+    SubmitResult,
+    pass_wait_state,
+    timeout_finish_warning,
 )
-from saneless.worker import ScanWorker
-from tests.conftest import spooling_in_turn
+from saneless.worker import ScanOptions, ScanWorker
+from tests.conftest import poll_until, spooling_in_turn, wait_for_state
+from tests.fake_clock import FakeClock
+from tests.golden_support import (
+    DistinctPageScanner,
+    RecordingPaperless,
+    embedded_streams,
+    loopback_paperless,
+    png_idat,
+    production_debug_logging,
+)
+from tests.multi_page_support import multi_page_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from pathlib import Path
 
     from saneless.job import Job
     from saneless.scanner.base import PageSink, ScanBatch, ScanSettings
+    from saneless.vocabulary import PassPrompt
 
 _DOCUMENTS_PATH = "/api/documents/post_document/"
 _TASKS_PATH = "/api/tasks/"
+
+_PAPERLESS_URL = "http://paperless.invalid:8000"
+_TOKEN = "e2e-token"
 
 _DEVICE = "test:device:001"
 _TITLE = "Quarterly Report"
@@ -99,10 +132,10 @@ _TITLE = "Quarterly Report"
 # The scans run under a profile that is deliberately NOT the one named
 # "default".  auto_profiles.is_bare_default matches a profile set of exactly
 # one untouched profile called "default", and on that match the worker's startup
-# generation (D-14) would build profiles from the stub scanner and swap them in
-# while these runs read them.  It writes only to settings.config_path (D-16),
-# which is None for these directly-built settings, so nothing would reach the
-# disk (D-17) -- but the swap alone would change the profile set under test.
+# generation would build profiles from the stub scanner and swap them in
+# while these runs read them.  It writes only to settings.config_path, which
+# is None for these directly-built settings, so nothing would reach the
+# disk -- but the swap alone would change the profile set under test.
 # Settings requires a "default" profile to exist, so it is defined alongside
 # this one: two entries make is_bare_default return on its length check and
 # startup generation skip before it asks the scanner anything.
@@ -110,10 +143,10 @@ _PROFILE = "e2e"
 
 _SIMPLEX_SOURCE = "Flatbed"
 # A manual-duplex profile names a real feeder source and says ``duplex =
-# "manual"``: source is a pure SANE value and no longer selects the strategy.
+# "manual"``: source is a pure SANE value and does not select the strategy.
 _DUPLEX_SOURCE = "ADF"
-# The deprecated one-key form, kept as its own case so DPLX-02's "still loads
-# AND scans" is proven through the real pipeline, not only at config load.
+# The deprecated one-key form, kept as its own case so that it still loads
+# AND scans is proven through the real pipeline, not only at config load.
 _LEGACY_DUPLEX_SOURCE = "ADF Manual Duplex"
 
 # The shipped default, used by every case that does not time out a poll: their first
@@ -121,28 +154,26 @@ _LEGACY_DUPLEX_SOURCE = "ADF Manual Duplex"
 # number is the honest thing to run with.
 _PRODUCTION_TIMEOUT = 300
 
-# Zero, not the 0.05 s the plan suggested.  OutputConfig.paperless_task_timeout
-# is typed ``int``, so pydantic rejects 0.05 outright (a float with a fractional
-# part is not a lax-mode int) and assigning it afterwards would be a type lie
-# that ty and pyrefly are right to reject.  Widening the production field to
-# float purely for a test was not worth it.  Zero costs no wall clock at all and
-# proves the same property end to end: poll_task computes
-# ``deadline = monotonic() + timeout``, issues its first poll, sees no terminal
-# status, finds no time remaining and raises PaperlessTimeoutError -- which is
-# the raise this case exists to follow into the preservation guard.  The
-# ``min(delay, remaining)`` backoff clamp itself is proven by
-# ``tests/test_paperless.py``'s dedicated wall-clock test at the unit level.
-_TIMEOUT_BUDGET = 0
+# One second, the smallest value config accepts: zero is refused at load, since
+# a zero budget would fail every accepted upload.  The field is typed ``int``, so
+# a fractional float like 0.05 is refused too, and assigning one afterwards would
+# be a type lie that ty and pyrefly are right to reject.  The second costs no wall
+# clock: this case's polls run on the ``FakeClock`` through ``PaperlessTiming``,
+# so ``poll_task`` computes ``deadline = clock() + 1``, polls, sees no terminal
+# status, and its ``min(delay, remaining)`` backoff sleeps move the fake clock on
+# until no time remains and it raises PaperlessTimeoutError -- the raise this
+# case exists to follow into the preservation guard.
+_TIMEOUT_BUDGET = 1
 
 # The shipped flip wait, for every case whose operator answers the prompt: the
 # answer arrives first, so the bound never elapses.
 _PRODUCTION_FLIP_TIMEOUT = 600
 
-# One second, the smallest value config accepts.  Zero used to be the zero-cost
-# seam here, but OutputConfig now rejects it (WR-01: a zero wait fails every
-# manual-duplex job right after pass A), and the field is typed ``int``, so a
-# fractional float like 0.05 is rejected too.  This one second is the only wall
-# clock this module spends, and it proves the same property end to end: nothing
+# One second, the smallest value config accepts.  OutputConfig rejects zero,
+# since a zero wait would fail every manual-duplex job right after pass A, and
+# the field is typed ``int``, so a fractional float like 0.05 is rejected too.
+# This second, and the same second the multi-page cases wait, is the only wall
+# clock this module spends, and it proves the property end to end: nothing
 # answered within the bound, so the coordinator resolves TIMED_OUT and the
 # pipeline raises before pass B.  Every terminal wait on a run that waits this
 # out uses ``case.flip_timeout + 2.0``, keeping the 2 s margin on top of it.
@@ -150,9 +181,13 @@ _FLIP_TIMEOUT_BUDGET = 1
 
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
+_BLIP_TASK = "e2e-task-after-a-proxy-blip"
+_DUPLICATE_TASK = "e2e-task-duplicate"
+# The document paperless-ngx already holds, in every duplicate case.
+_EXISTING_DOCUMENT = 42
 _PAPERLESS_MESSAGE = "Document consumption failed: unsupported PDF producer"
 
-# The mid-batch fault HARD-02 is about, shaped like the SANE backend's own
+# A mid-batch scanner fault, shaped like the SANE backend's own
 # per-page error text so the end-to-end message is the one a user would read.
 _SCANNER_MESSAGE = "Scanner error on page 4: Document feeder jammed"
 _SCANNER_FAILURE = ScanError(_SCANNER_MESSAGE)
@@ -207,7 +242,7 @@ def _v10_tasks(task_id: str, status: str, error_message: str) -> dict[str, objec
     v10 paginates the list into ``{"count", "next", "previous", "results"}``,
     spells its statuses in lowercase, and carries the failure text in
     ``result_data["error_message"]`` rather than a flat ``result`` string.
-    OUTC-11's tolerance for all three differences is exercised at the unit
+    The client's tolerance for all three differences is exercised at the unit
     level; this is the e2e layer proving it against the real pipeline.
 
     Args:
@@ -312,21 +347,178 @@ def _never_finishing_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     return handler
 
 
-def _server_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+def _proxy_blip_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
-    Refuse every upload with a 500, so the consume directory is the only route.
+    Accept the upload, answer the first poll 502, then report SUCCESS.
 
-    A poll reaching this handler would mean the fallback was not taken and the
-    client invented a task id, so the tasks path is left to ``_unexpected``.
+    A reverse proxy answers 502 while paperless-ngx behind it restarts.  The
+    upload was already accepted, so the poll must wait the blip out and file
+    the document, not fail a job paperless-ngx is about to finish.
 
     Returns:
-        A handler answering the upload path with a retryable server error.
+        A fresh handler with its own poll counter.
+
+    """
+    polls: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            return httpx2.Response(200, json=_BLIP_TASK)
+        if request.url.path == _TASKS_PATH:
+            polled = str(request.url.params.get("task_id", ""))
+            if polled != _BLIP_TASK:
+                return _unexpected(request)
+            polls.append(polled)
+            if len(polls) == 1:
+                return httpx2.Response(502, text="<html>502 Bad Gateway</html>")
+            return httpx2.Response(200, json=_v9_tasks(polled, "SUCCESS"))
+        return _unexpected(request)
+
+    return handler
+
+
+def _refused_connection_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Refuse the connection for every upload, so the consume directory is the route.
+
+    A refused connection is a failure before anything was sent: paperless-ngx
+    cannot have received the document, which is the only failure a consume
+    folder copy may follow without risking a second filing.  A poll reaching
+    this handler would mean the fallback was not taken and the client invented
+    a task id, so the tasks path is left to ``_unexpected``.
+
+    Returns:
+        A handler raising ``httpx2.ConnectError`` on the upload path.
+
+    """
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            msg = "connection refused"
+            raise httpx2.ConnectError(msg, request=request)
+        return _unexpected(request)
+
+    return handler
+
+
+def _after_send_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Answer every upload with a 500, as a paperless-ngx that read it might.
+
+    An answer means the body may have been read and stored, so the client must
+    neither resend it nor copy it to the consume folder.  A poll reaching this
+    handler would mean the client invented a task id, so the tasks path is left
+    to ``_unexpected``.
+
+    Returns:
+        A handler answering 500 on the upload path.
 
     """
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
             return httpx2.Response(500, text="paperless-ngx is restarting")
+        return _unexpected(request)
+
+    return handler
+
+
+def _duplicate_answer(shape: str) -> object:
+    """
+    Build the poll answer of a task paperless-ngx refused as a duplicate.
+
+    Args:
+        shape: ``v9-2x`` for paperless-ngx 2.x, whose failure text names the
+            title and ``(#N)`` and whose ``related_document`` is a string;
+            ``v9-3x`` for 3.x speaking v9, which lists ``duplicate_documents``;
+            ``v10`` for the paginated ``result_data`` shape with no text.
+
+    Returns:
+        The decoded body, ready to hand to ``httpx2.Response(json=...)``.
+
+    """
+    existing = _EXISTING_DOCUMENT
+    if shape == "v9-2x":
+        return [
+            {
+                "task_id": _DUPLICATE_TASK,
+                "status": "FAILURE",
+                "result": (
+                    f"Not consuming {_TITLE}.pdf: It is a duplicate of "
+                    f"{_TITLE} (#{existing})."
+                ),
+                "related_document": str(existing),
+            }
+        ]
+    if shape == "v9-3x":
+        return [
+            {
+                "task_id": _DUPLICATE_TASK,
+                "status": "FAILURE",
+                "result": f"Not consuming: It is a duplicate of document #{existing}",
+                "duplicate_documents": [
+                    {"id": existing, "title": _TITLE, "deleted_at": None}
+                ],
+            }
+        ]
+    task = {
+        "task_id": _DUPLICATE_TASK,
+        "status": "failure",
+        "result_data": {"duplicate_of": existing, "duplicate_in_trash": False},
+    }
+    return {"count": 1, "next": None, "previous": None, "results": [task]}
+
+
+def _duplicate_handler(
+    shape: str,
+) -> Callable[[], Callable[[httpx2.Request], httpx2.Response]]:
+    """
+    Accept the upload, then refuse its task as a duplicate in one wire shape.
+
+    Args:
+        shape: The shape ``_duplicate_answer`` builds.
+
+    Returns:
+        A handler factory, as ``_Case.handler_factory`` takes one.
+
+    """
+
+    def factory() -> Callable[[httpx2.Request], httpx2.Response]:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path == _DOCUMENTS_PATH:
+                return httpx2.Response(200, json=_DUPLICATE_TASK)
+            if request.url.path == _TASKS_PATH:
+                if request.url.params.get("task_id") != _DUPLICATE_TASK:
+                    return _unexpected(request)
+                return httpx2.Response(200, json=_duplicate_answer(shape))
+            return _unexpected(request)
+
+        return handler
+
+    return factory
+
+
+def _backs_refused_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Accept the (fronts) upload, then refuse the (backs) upload with a 400.
+
+    The fronts are in paperless-ngx by then, so the run must not end as a
+    plain failed upload that invites a rescan.  No task is polled: the backs
+    upload fails before either poll, so the tasks path is left to
+    ``_unexpected``.
+
+    Returns:
+        A fresh handler with its own upload counter.
+
+    """
+    uploads: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            uploads.append(request.method)
+            if len(uploads) == 1:
+                return httpx2.Response(200, json="e2e-task-fronts")
+            return httpx2.Response(400, json={"document": ["refused the backs"]})
         return _unexpected(request)
 
     return handler
@@ -347,7 +539,7 @@ class _Case:
             not a handler, so per-case counters start fresh every run.
         expected_state: The persisted JobState the run must end in.
         expected_outcome: The persisted ScanOutcome, or None when the run
-            failed -- D-01: a failure raises, so the column stays NULL rather
+            failed -- a failure raises, so the column stays NULL rather
             than claiming a measurement nobody made.
         expected_pages: (scanned, removed, uploaded), all None on a failure.
         expected_failed_pdfs: How many PDFs must survive in <data_dir>/failed/.
@@ -360,7 +552,7 @@ class _Case:
         scan_passes: Page count per scan_pages call.  Two entries means two
             passes, and two different numbers means a duplex mismatch.
         task_timeout: settings.output.paperless_task_timeout for this case.
-        flip_timeout: settings.output.flip_timeout_seconds for this case.
+        flip_timeout: settings.output.operator_wait_timeout_seconds for this case.
         with_consume_dir: Whether the client is given a consume directory.
         awaits_flip: Whether the run parks in AWAITING_FLIP at all.
         operator_flips: Whether the test answers the flip prompt with
@@ -370,6 +562,8 @@ class _Case:
             means the warning column must be NULL.
         error_contains: Fragments the persisted error must contain; empty means
             the error column must be NULL.
+        expected_category: The persisted ErrorCategory the row must carry;
+            None leaves the category unchecked.
 
     """
 
@@ -390,6 +584,7 @@ class _Case:
     operator_flips: bool = True
     warning_contains: str | None = None
     error_contains: tuple[str, ...] = ()
+    expected_category: ErrorCategory | None = None
 
 
 _CASES = [
@@ -411,6 +606,7 @@ _CASES = [
         expected_failed_pdfs=1,
         expected_consume_pdfs=0,
         error_contains=(_FAILURE_TASK, "FAILURE", _PAPERLESS_MESSAGE),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
     ),
     _Case(
         label="poll-timeout",
@@ -422,10 +618,32 @@ _CASES = [
         expected_consume_pdfs=0,
         task_timeout=_TIMEOUT_BUDGET,
         error_contains=(_PENDING_TASK, "did not finish"),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
+    ),
+    _Case(
+        label="poll-502-then-success",
+        handler_factory=_proxy_blip_handler,
+        expected_state=JobState.DONE,
+        expected_outcome=ScanOutcome.SUCCESS,
+        expected_pages=(2, 0, 2),
+        expected_failed_pdfs=0,
+        expected_consume_pdfs=0,
+    ),
+    _Case(
+        label="after-send-500",
+        handler_factory=_after_send_error_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        expected_failed_pdfs=1,
+        expected_consume_pdfs=0,
+        with_consume_dir=True,
+        error_contains=("500", "may have reached paperless-ngx"),
+        expected_category=ErrorCategory.UNCONFIRMED_SEND,
     ),
     _Case(
         label="consume-dir-fallback",
-        handler_factory=_server_error_handler,
+        handler_factory=_refused_connection_handler,
         expected_state=JobState.FALLBACK,
         expected_outcome=ScanOutcome.FALLBACK,
         expected_pages=(2, 0, 2),
@@ -448,6 +666,38 @@ _CASES = [
         awaits_flip=True,
         warning_contains="Page count mismatch: 3 fronts, 2 backs",
     ),
+    *(
+        _Case(
+            label=f"duplicate-{shape}",
+            handler_factory=_duplicate_handler(shape),
+            expected_state=JobState.DONE,
+            expected_outcome=ScanOutcome.SUCCESS,
+            expected_pages=(2, 0, 2),
+            expected_failed_pdfs=0,
+            expected_consume_pdfs=0,
+            warning_contains=f"#{_EXISTING_DOCUMENT}",
+        )
+        for shape in ("v9-2x", "v9-3x", "v10")
+    ),
+    _Case(
+        label="duplex-mismatch-per-half-backs-refused",
+        handler_factory=_backs_refused_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        expected_failed_pdfs=2,
+        expected_consume_pdfs=0,
+        source=_DUPLEX_SOURCE,
+        duplex="manual",
+        scan_passes=(3, 2),
+        awaits_flip=True,
+        error_contains=(
+            "The (fronts) half reached paperless-ngx",
+            "the (backs) half failed",
+            "400",
+        ),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
+    ),
     _Case(
         label="legacy-duplex-source",
         handler_factory=_accepting_handler,
@@ -466,11 +716,10 @@ _CASES = [
         expected_state=JobState.ERROR,
         expected_outcome=None,
         expected_pages=(None, None, None),
-        # One, since plan 29-09: the timeout raises before pass B and before
-        # the document's own assembly, but pass A's three fronts are on the
-        # spool and nobody chose to stop, so D-10 keeps them as a ``(fronts)``
-        # partial.  Phase 23's guard, which spans upload and poll only, still
-        # never runs on this path.
+        # One: the timeout raises before pass B and before the document's
+        # own assembly, but pass A's three fronts are on the spool and nobody
+        # chose to stop, so they are kept as a ``(fronts)`` partial.  The
+        # upload-and-poll preservation guard never runs on this path.
         expected_failed_pdfs=1,
         expected_consume_pdfs=0,
         source=_DUPLEX_SOURCE,
@@ -494,9 +743,8 @@ def _pages(count: int) -> list[Image.Image]:
     Draw pages with enough ink that the real empty-page filter keeps them.
 
     Empty-page detection is left enabled, as it is by default in production, so
-    the pages have to be genuinely non-blank or ``_drop_empty_pages`` raises
-    "All pages were blank" and every case fails for the wrong
-    reason.
+    the pages have to be genuinely non-blank or ``_drop_blank_pages`` raises
+    ``AllPagesBlankError`` and every case fails for the wrong reason.
 
     Args:
         count: How many pages to produce.
@@ -551,7 +799,7 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
 
 def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     """
-    Stub a scanner that spools ``pages`` sheets and then jams (HARD-02).
+    Stub a scanner that spools ``pages`` sheets and then jams.
 
     The sheets go into the pipeline's own ``SpooledPageSink``, so the files the
     preservation guard finds are real ones written by production code -- the
@@ -572,26 +820,29 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     ) -> ScanBatch:
         """Spool every sheet that made it through, then raise as SANE would."""
         for page in _pages(pages):
-            sink.add(page)
+            sink.add(page, dpi=settings.resolution)
         raise failure
 
     scanner.scan_pages.side_effect = spool_then_fail
     return scanner
 
 
-def _build_settings(tmp_path: Path, case: _Case) -> Settings:
+def _build_settings(
+    tmp_path: Path, case: _Case, *, paperless_url: str = _PAPERLESS_URL
+) -> Settings:
     """
     Build Settings whose directories are three separate subtrees of tmp_path.
 
     ``failed_dir`` and ``db_path`` both derive from ``data_dir``, so putting
     ``data_dir`` under ``tmp_dir`` would make a correctly preserved scan
     indistinguishable from a leaked temporary directory, and would trip the
-    temp-cleanup assertions the pipeline tests rely on (T-23-40).  No absolute
+    temp-cleanup assertions the pipeline tests rely on.  No absolute
     path outside ``tmp_path`` appears anywhere in this module.
 
     Args:
         tmp_path: pytest's per-test directory.
         case: The case being built, for its source, duplex mode and timeouts.
+        paperless_url: ``paperless.url``; ``""`` is the unset state.
 
     Returns:
         Settings pointing at scratch, durable state and consume directories
@@ -602,19 +853,24 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
     # sqlite3.connect does not create parent directories and db_path creates
     # nothing, so the store would fail to open without this.
     data_dir.mkdir(parents=True, exist_ok=True)
+    consume_dir = tmp_path / "consume"
+    # The fallback never creates its folder, as paperless-ngx's volume would
+    # already be mounted there.
+    if case.with_consume_dir:
+        consume_dir.mkdir()
     return Settings(
         scanner=ScannerConfig(device=_DEVICE),
         paperless=PaperlessConfig(
-            url="http://paperless.invalid:8000",
-            token="e2e-token",
-            consume_dir=tmp_path / "consume" if case.with_consume_dir else None,
+            url=paperless_url,
+            token=_TOKEN,
+            consume_dir=consume_dir if case.with_consume_dir else None,
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path / "scratch"),
             data_dir=str(data_dir),
             log_file=str(tmp_path / "logs" / "saneless.log"),
             paperless_task_timeout=case.task_timeout,
-            flip_timeout_seconds=case.flip_timeout,
+            operator_wait_timeout_seconds=case.flip_timeout,
         ),
         profiles={
             # Settings' field validator requires this one.  Only the worker
@@ -669,6 +925,9 @@ def _assert_persisted_row(case: _Case, job: Job) -> None:
         assert job.warning is not None
         assert case.warning_contains in job.warning
 
+    if case.expected_category is not None:
+        assert job.error_category is case.expected_category
+
 
 def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) -> None:
     """
@@ -678,8 +937,8 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
         case: The expectations for this run.
         job: The finished job row, for its error message.
         failed_dir: ``<data_dir>/failed/``, created only by a preservation.
-        consume_dir: The paperless-ngx consume directory, created only by a
-            fallback.
+        consume_dir: The paperless-ngx consume directory, which exists only
+            when the case configures one.
 
     """
     preserved = sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []
@@ -689,7 +948,7 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
         assert job.error is not None
         for fragment in case.error_contains:
             assert fragment in job.error
-        # OUTC-04: the error has to name the file the operator must go and
+        # The error has to name the file the operator must go and
         # find, not merely say that something was kept somewhere.
         for pdf in preserved:
             assert pdf.name in job.error
@@ -698,7 +957,7 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
 
     delivered = sorted(consume_dir.iterdir()) if consume_dir.exists() else []
     assert len(delivered) == case.expected_consume_pdfs
-    # OUTC-05: the staged dotfile must have been renamed into place, not left
+    # The staged dotfile must have been renamed into place, not left
     # behind for paperless-ngx's inotify watcher to trip over.
     assert all(item.suffix == ".pdf" for item in delivered)
     assert not any(item.name.startswith(".") for item in delivered)
@@ -712,23 +971,23 @@ class TestFiveOutcomesEndToEnd:
         self,
         case: _Case,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Drive one scan end to end and assert the row it left behind."""
         settings = _build_settings(tmp_path, case)
         consume_dir = tmp_path / "consume"
         store = JobStore(db_path=settings.output.db_path)
+        # The task poll's waits run on a fake clock, so the proxy-blip case's
+        # backoff costs no real time; every other case polls at most once.
+        clock = FakeClock()
         paperless = PaperlessClient(
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            # The measured zero-sleep lever: at 1 attempt neither
-            # exponential-backoff pause in upload_document is reachable, taking
-            # the fallback case from 3.00 s to 0.00 s.  The fallback behaviour
-            # is identical at any retry count -- exhausting them is what
-            # triggers it.
-            max_retries=1,
+            # One attempt, so no before-send backoff pause is reachable.  The
+            # fallback behaviour is identical at any budget -- spending it is
+            # what triggers it.
             transport=httpx2.MockTransport(case.handler_factory()),
+            timing=PaperlessTiming(send_budget=0.0, clock=clock.now, sleep=clock.sleep),
         )
         worker = ScanWorker(
             _build_scanner(case.scan_passes),
@@ -744,7 +1003,7 @@ class TestFiveOutcomesEndToEnd:
                 # The persisted AWAITING_FLIP is observed first because the
                 # coordinator only accepts an answer once armed, and the worker
                 # arms it as it announces AWAITING_FLIP: a Continue sent any
-                # earlier is dropped, not queued (CR-01).
+                # earlier is dropped, not queued.
                 wait_for_state(store, job.id, JobState.AWAITING_FLIP, 2.0)
                 worker.continue_flip(job.id)
             # A 2 s budget, far below pytest-timeout's 60 s SIGALRM.  The
@@ -752,7 +1011,7 @@ class TestFiveOutcomesEndToEnd:
             # stuck, so letting this run to the global ceiling would print a
             # traceback for this wait loop rather than for the stuck worker.
             # A run that waits out the flip timeout gets that timeout on top,
-            # so the 2 s margin survives the one-second flip wait (WR-01).
+            # so the 2 s margin survives the one-second flip wait.
             budget = 2.0
             if case.awaits_flip and not case.operator_flips:
                 budget = case.flip_timeout + 2.0
@@ -768,19 +1027,17 @@ class TestFiveOutcomesEndToEnd:
 
 class TestAPartialScanSurvivesTheWorker:
     """
-    HARD-02 end to end: a jam mid-stack keeps the sheets already fed.
+    A jam mid-stack keeps the sheets already fed, end to end.
 
     The unit coverage in ``tests/test_pipeline.py`` proves the guard; this
-    exists to prove the *outcome* -- that the persisted row still ends ERROR
-    with the scanner category and a NULL outcome, exactly as a mid-batch
-    failure did before anything was preserved, and that the error a user reads
-    names the file they have to go and find (OUTC-04).
+    proves the *outcome* -- the persisted row ends ERROR with the scanner
+    category and a NULL outcome, and the error a user reads names the file
+    they have to go and find.
     """
 
     def test_partial_scan_preserved_is_recorded_on_the_job_row(
         self,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Three sheets fed, a jam on the fourth, through the real worker."""
         case = next(case for case in _CASES if case.label == "success")
@@ -790,8 +1047,8 @@ class TestAPartialScanSurvivesTheWorker:
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            max_retries=1,
             transport=httpx2.MockTransport(_accepting_handler()),
+            timing=PaperlessTiming(send_budget=0.0),
         )
         worker = ScanWorker(
             _jamming_scanner(3, _SCANNER_FAILURE), paperless, settings, store
@@ -807,7 +1064,7 @@ class TestAPartialScanSurvivesTheWorker:
             store.close()
 
         assert finished.state is JobState.ERROR
-        # D-01: a failure raises, so the pipeline measured nothing and the
+        # A failure raises, so the pipeline measured nothing and the
         # outcome and page columns stay NULL rather than claiming a count.
         assert finished.outcome is None
         assert (
@@ -815,8 +1072,8 @@ class TestAPartialScanSurvivesTheWorker:
             finished.pages_removed,
             finished.pages_uploaded,
         ) == (None, None, None)
-        # Unchanged by the new branch: still a scanner failure, so still exit 1
-        # at the CLI and still the scanner category on the row.
+        # Keeping the sheets does not change the failure: it is a scanner
+        # failure, so exit 1 at the CLI and the scanner category on the row.
         assert finished.error_category is ErrorCategory.SCANNER
 
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
@@ -830,24 +1087,20 @@ class TestAPartialScanSurvivesTheWorker:
 
 
 class TestFlipTimeoutReleasesTheWorker:
-    """A flip wait that runs out fails its job and frees the worker (DPLX-05)."""
+    """A flip wait that runs out fails its job and frees the worker."""
 
     def test_the_next_job_runs_after_a_flip_timeout(
         self,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         After a timed-out flip, a second submitted job still reaches terminal.
 
-        This is roadmap criterion 3's "releases the scanner for the next job",
-        and what that phrase does and does not mean matters.  ``scan_pages``
-        opens and closes the device on every call, so the device *handle* is
-        already released between pass A and pass B whether or not anyone ever
-        flips.  What an unbounded wait actually held was the single worker
-        thread, queueing every later job behind a forgotten prompt -- M-07's
-        real complaint.  So the proof is a second job getting through, not a
-        handle being closed.
+        ``scan_pages`` opens and closes the device on every call, so the
+        device *handle* is released between pass A and pass B whether or not
+        anyone flips.  What an unbounded wait would hold is the single worker
+        thread, queueing every later job behind a forgotten prompt.  So the
+        proof is a second job getting through, not a handle being closed.
         """
         case = next(case for case in _CASES if case.label == "flip-timeout")
         settings = _build_settings(tmp_path, case)
@@ -856,8 +1109,8 @@ class TestFlipTimeoutReleasesTheWorker:
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            max_retries=1,
             transport=httpx2.MockTransport(_accepting_handler()),
+            timing=PaperlessTiming(send_budget=0.0),
         )
         # Pass A of the timed-out job, then the single pass of the simplex job
         # that follows it.  No third batch: the timed-out job must never reach
@@ -889,3 +1142,478 @@ class TestFlipTimeoutReleasesTheWorker:
         assert "flip wait timed out" in timed_out.error
         assert finished.state is JobState.DONE
         assert finished.pages_scanned == 2
+
+
+# A configuration failure after the scan: the document is assembled, the upload
+# cannot even be attempted, and the PDF is kept in failed/ -- never copied to
+# the consume directory, which is configured in both cases below.
+_MISCONFIGURED = _Case(
+    label="misconfigured",
+    handler_factory=_accepting_handler,
+    expected_state=JobState.ERROR,
+    expected_outcome=None,
+    expected_pages=(None, None, None),
+    expected_failed_pdfs=1,
+    expected_consume_pdfs=0,
+    with_consume_dir=True,
+)
+
+
+def _scan_once(
+    settings: Settings,
+    paperless: PaperlessClient,
+) -> Job:
+    """
+    Run one simplex scan through the real worker and return its finished row.
+
+    Args:
+        settings: The settings the worker runs under.
+        paperless: The client the worker uploads with.
+
+    Returns:
+        The job row, re-read once it reached a terminal state.
+
+    """
+    store = JobStore(db_path=settings.output.db_path)
+    worker = ScanWorker(_build_scanner((2,)), paperless, settings, store)
+    try:
+        worker.start()
+        job = store.create_job(_PROFILE, _TITLE)
+        worker.submit(job)
+        # 2 s, less than the 3 s two backoff pauses would take: a client that
+        # retried would miss this budget.
+        return wait_for_state(store, job.id, TERMINAL_STATES, 2.0)
+    finally:
+        worker.stop()
+        paperless.close()
+        store.close()
+
+
+class TestClientSideMisconfigurationEndToEnd:
+    """
+    A request the client cannot send fails the scan as a configuration error.
+
+    These two cases leave the in-memory transport the rest of this module uses:
+    a refused header value is refused by h11, below where ``MockTransport``
+    plugs in, and an unset URL is refused by the real transport's scheme check.
+    So each runs the production transport -- the first against a real socket
+    on 127.0.0.1 -- with the production send budget, on a fake clock that
+    proves no attempt was retried.
+    """
+
+    def test_padded_token_fails_as_configuration_without_leaking(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A token with a trailing space ends ERROR/CONFIG, token nowhere."""
+        # Letters outside [0-9a-f], so no random job id in the DEBUG log can
+        # contain the stripped token by chance.
+        token = "tok-QzXwPadded "
+        settings = _build_settings(tmp_path, _MISCONFIGURED)
+        # caplog before the production configuration, so the root level it
+        # restores at teardown is the one from before that lowered it.
+        caplog.set_level(logging.DEBUG)
+        clock = FakeClock()
+        with production_debug_logging(), loopback_paperless() as server:
+            finished = _scan_once(
+                settings,
+                PaperlessClient(
+                    url=server.url,
+                    token=token,
+                    consume_dir=settings.paperless.consume_dir,
+                    timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
+                ),
+            )
+        assert server.hits == []
+        assert clock.waits == []
+        assert finished.error_category is ErrorCategory.CONFIG
+        assert finished.error is not None
+        assert "paperless.token" in finished.error
+        for text in (finished.error, caplog.text):
+            assert token not in text
+            assert token.strip() not in text
+        _assert_persisted_row(_MISCONFIGURED, finished)
+        _assert_files(
+            replace(_MISCONFIGURED, error_contains=("paperless.token",)),
+            finished,
+            settings.output.failed_dir,
+            tmp_path / "consume",
+        )
+
+    def test_unset_url_fails_as_configuration_without_fallback(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``paperless.url = ""`` is not a consume-folder setup: ERROR/CONFIG."""
+        settings = _build_settings(tmp_path, _MISCONFIGURED, paperless_url="")
+        caplog.set_level(logging.DEBUG)
+        clock = FakeClock()
+        with production_debug_logging():
+            finished = _scan_once(
+                settings,
+                PaperlessClient(
+                    url=settings.paperless.url,
+                    token=settings.paperless.token.get_secret_value(),
+                    consume_dir=settings.paperless.consume_dir,
+                    timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
+                ),
+            )
+        assert clock.waits == []
+        assert finished.error_category is ErrorCategory.CONFIG
+        assert finished.error is not None
+        assert _TOKEN not in finished.error
+        assert _TOKEN not in caplog.text
+        _assert_persisted_row(_MISCONFIGURED, finished)
+        _assert_files(
+            replace(_MISCONFIGURED, error_contains=("paperless.url",)),
+            finished,
+            settings.output.failed_dir,
+            tmp_path / "consume",
+        )
+
+
+# --------------------------------------------------------------------------
+# Multi-page documents: the real worker asking between passes, and every way
+# a wait there can end without the operator pressing Finish.
+# --------------------------------------------------------------------------
+
+# The operator-wait bound for the cases that wait a question out: one second,
+# the smallest value config accepts, as for the flip timeout above.
+_MULTI_PAGE_TIMEOUT = 1
+
+# The waits every multi-page case observes: a prompt being published, a job
+# reaching a terminal state that no wait holds up.
+_MULTI_PAGE_BUDGET = 2.0
+
+_MULTI_PAGE = ScanOptions(multi_page=True)
+
+
+@contextlib.contextmanager
+def _multi_page_worker(
+    settings: Settings, scanner: DistinctPageScanner, recorder: RecordingPaperless
+) -> Generator[tuple[ScanWorker, JobStore]]:
+    """
+    Run the real worker over ``scanner`` and an in-memory paperless-ngx.
+
+    The worker is stopped before the store and the client are closed, and
+    stopping it again after a test already has is safe.
+
+    Args:
+        settings: Settings from ``multi_page_settings``: a flatbed "default"
+            profile beside two others, so startup never generates profiles.
+        scanner: The scanner the worker opens for every pass.
+        recorder: The in-memory paperless-ngx every request goes to.
+
+    Yields:
+        The started worker and its job store.
+
+    """
+    settings.output.data_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(db_path=settings.output.db_path)
+    paperless = PaperlessClient(
+        url=settings.paperless.url,
+        token=settings.paperless.token.get_secret_value(),
+        consume_dir=settings.paperless.consume_dir,
+        transport=httpx2.MockTransport(recorder),
+        timing=PaperlessTiming(send_budget=0.0),
+    )
+    worker = ScanWorker(scanner, paperless, settings, store)
+    try:
+        worker.start()
+        yield worker, store
+    finally:
+        worker.stop()
+        paperless.close()
+        store.close()
+
+
+def _submit_multi_page(worker: ScanWorker, store: JobStore, title: str) -> Job:
+    """
+    Create a job row on the flatbed profile and queue it as a multi-page scan.
+
+    Args:
+        worker: The running worker.
+        store: Its job store.
+        title: The document title.
+
+    Returns:
+        The queued job.
+
+    """
+    job = store.create_job("default", title)
+    assert worker.submit(job, _MULTI_PAGE) is SubmitResult.ACCEPTED
+    return job
+
+
+def _next_question(
+    worker: ScanWorker, store: JobStore, job_id: str, *, after: int
+) -> PassPrompt:
+    """
+    Wait for the job's next multi-page question and return it, unanswered.
+
+    The worker publishes a fresh prompt for every wait, so "next" means a
+    prompt numbered above ``after``.  While it is open the stored row must
+    already name the wait, because that row is what the web page and
+    ``saneless jobs`` render.
+
+    Args:
+        worker: The running worker.
+        store: Its job store.
+        job_id: The multi-page job.
+        after: The number of the last question already seen; 0 for the first.
+
+    Returns:
+        The open question.
+
+    """
+
+    def asked() -> bool:
+        """Report whether a question newer than ``after`` is open."""
+        prompt = worker.pass_prompt(job_id)
+        return prompt is not None and prompt.number > after
+
+    assert poll_until(asked, _MULTI_PAGE_BUDGET), f"no question after {after}"
+    prompt = worker.pass_prompt(job_id)
+    assert prompt is not None
+    row = store.get_job(job_id)
+    assert row is not None
+    assert row.state is pass_wait_state(prompt.wait)
+    return prompt
+
+
+def _kept(settings: Settings) -> tuple[list[Path], list[Path]]:
+    """
+    Split the PDFs kept in ``failed/`` into documents and passes in flight.
+
+    Args:
+        settings: The run's settings, for ``failed_dir``.
+
+    Returns:
+        The kept documents, then the kept ``(partial)`` passes, each sorted.
+
+    """
+    failed_dir = settings.output.failed_dir
+    kept = sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []
+    return (
+        [pdf for pdf in kept if "partial" not in pdf.name],
+        [pdf for pdf in kept if "partial" in pdf.name],
+    )
+
+
+def _spooled(scanner: DistinctPageScanner, indices: Sequence[int]) -> list[bytes]:
+    """
+    Return what a PDF of exactly these spooled pages, in this order, embeds.
+
+    Args:
+        scanner: The scanner that spooled them.
+        indices: The page indices, in document order.
+
+    Returns:
+        One compressed pixel stream per page, comparable with
+        ``embedded_streams``.
+
+    """
+    return [png_idat(scanner.spooled[index]) for index in indices]
+
+
+class TestMultiPageTimeoutFinishes:
+    """
+    A between-pass question nobody answers finishes the document it has.
+
+    The opposite of the flip timeout on purpose: pages already scanned are
+    the operator's work, so they are uploaded rather than failed -- but with a
+    warning, because nobody said the document was complete.
+    """
+
+    def test_a_timed_out_question_uploads_the_pages_and_frees_the_worker(
+        self, tmp_path: Path
+    ) -> None:
+        """Two passes, "Scan next" once, then silence: a warned upload of both."""
+        settings = multi_page_settings(tmp_path, timeout=_MULTI_PAGE_TIMEOUT)
+        recorder = RecordingPaperless()
+        # Two passes for the forgotten document, one for the job after it.
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            forgotten = _submit_multi_page(worker, store, "Forgotten Pages")
+            first = _next_question(worker, store, forgotten.id, after=0)
+            assert worker.answer_pass(forgotten.id, first.number, PassAnswer.NEXT)
+            second = _next_question(worker, store, forgotten.id, after=first.number)
+            # Nobody answers the second question.
+            timed_out = wait_for_state(
+                store,
+                forgotten.id,
+                TERMINAL_STATES,
+                _MULTI_PAGE_TIMEOUT + _MULTI_PAGE_BUDGET,
+            )
+
+            # A plain single-pass job: held up only if the worker still is.
+            follow_up = store.create_job("default", "Next In Line")
+            assert worker.submit(follow_up) is SubmitResult.ACCEPTED
+            finished = wait_for_state(
+                store, follow_up.id, TERMINAL_STATES, _MULTI_PAGE_BUDGET
+            )
+
+        assert (first.wait, second.wait) == (PassWait.NEXT_PASS, PassWait.NEXT_PASS)
+        assert second.pages_kept == 2
+        assert timed_out.state is JobState.DONE
+        assert timed_out.warning == timeout_finish_warning(2, _MULTI_PAGE_TIMEOUT)
+        assert (
+            timed_out.pages_scanned,
+            timed_out.pages_removed,
+            timed_out.pages_uploaded,
+        ) == (2, 0, 2)
+        assert finished.state is JobState.DONE
+        assert finished.pages_scanned == 1
+        assert len(recorder.uploads()) == 2
+        assert embedded_streams(recorder.document(0)) == _spooled(scanner, (0, 1))
+        assert embedded_streams(recorder.document(1)) == _spooled(scanner, (2,))
+        assert _kept(settings) == ([], [])
+
+
+@dataclass(frozen=True)
+class _StopCase:
+    """
+    One multi-page wait the server stops during, and what it must keep.
+
+    Every case answers the first question "Scan next", so the stop lands at
+    the second question, with one or two pages already accepted.
+
+    Attributes:
+        label: The parametrize id.
+        wait: The question open when the server stops.
+        passes: The page indices each scanner pass feeds.
+        document: The accepted pages the kept document must hold, in order.
+        partial: The pages of an undecided pass, kept beside the document.
+        blank: Pages spooled as blank paper; empty-page detection is on
+            exactly when there are any.
+        fail_on: The failure each 1-based scanner call raises after spooling.
+
+    """
+
+    label: str
+    wait: PassWait
+    passes: tuple[tuple[int, ...], ...]
+    document: tuple[int, ...]
+    partial: tuple[int, ...] = ()
+    blank: frozenset[int] = frozenset()
+    fail_on: Mapping[int, BaseException] = field(default_factory=dict)
+
+
+_STOP_CASES = (
+    _StopCase(
+        label="next-pass",
+        wait=PassWait.NEXT_PASS,
+        passes=((0,), (1,)),
+        document=(0, 1),
+    ),
+    # The blank pass was spooled and never decided on: it is kept as a pass
+    # in flight, beside the document, rather than dropped or merged into it.
+    _StopCase(
+        label="blank-decision",
+        wait=PassWait.BLANK_DECISION,
+        passes=((0,), (1,)),
+        document=(0,),
+        partial=(1,),
+        blank=frozenset({1}),
+    ),
+    # The failed pass contributes nothing, even the page it spooled before
+    # the jam: only the accepted pass is kept.
+    _StopCase(
+        label="retry",
+        wait=PassWait.RETRY,
+        passes=((0,), (1,)),
+        document=(0,),
+        fail_on={2: ScanError("jam")},
+    ),
+)
+
+
+class TestMultiPageStopDuringEachWait:
+    """
+    A server stop during any multi-page wait keeps the pages and uploads nothing.
+
+    A stop is not the operator's decision, so it neither discards the scan
+    like Abort nor finishes it like a timeout: an upload would make the stop
+    wait on paperless-ngx.  The accepted pages go to ``failed/`` and the row
+    records the restart.
+    """
+
+    @pytest.mark.parametrize("case", _STOP_CASES, ids=[c.label for c in _STOP_CASES])
+    def test_a_stop_at_the_question_keeps_the_accepted_pages(
+        self, case: _StopCase, tmp_path: Path
+    ) -> None:
+        """The stop returns in time, the row says why, the pages are in failed/."""
+        settings = multi_page_settings(tmp_path, detection=bool(case.blank))
+        recorder = RecordingPaperless()
+        scanner = DistinctPageScanner(
+            passes=case.passes, blank=case.blank, fail_on=case.fail_on
+        )
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            job = _submit_multi_page(worker, store, _TITLE)
+            first = _next_question(worker, store, job.id, after=0)
+            assert worker.answer_pass(job.id, first.number, PassAnswer.NEXT)
+            waiting = _next_question(worker, store, job.id, after=first.number)
+
+            # Within STOP_JOIN_SECONDS, or its bounded extension while the
+            # pages are being kept: never the operator-wait timeout.
+            assert worker.stop()
+            ended = store.get_job(job.id)
+
+        assert waiting.wait is case.wait
+        assert ended is not None
+        assert ended.state is JobState.ERROR
+        assert ended.error is not None
+        assert ended.error.startswith(f"{RESTART_REASON}. ")
+        documents, partials = _kept(settings)
+        (document,) = documents
+        assert embedded_streams(document) == _spooled(scanner, case.document)
+        assert [embedded_streams(pdf) for pdf in partials] == (
+            [_spooled(scanner, case.partial)] if case.partial else []
+        )
+        for pdf in (*documents, *partials):
+            assert pdf.name in ended.error
+        assert scanner.calls == 2
+        assert recorder.uploads() == []
+
+
+class TestMultiPageNothingKept:
+    """A wait that times out with no page kept has nothing to finish."""
+
+    def test_multi_page_blank_timeout_at_zero_kept_is_all_blank(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The only page looks blank and nobody answers: the all-blank failure.
+
+        A blank-prompt timeout skips the blank pages, which here leaves none,
+        so there is no document to upload.  The job fails as every-page-blank
+        does -- its own category, nothing uploaded -- and the skipped page is
+        kept in ``failed/`` so it is not lost if it was not blank after all.
+        """
+        settings = multi_page_settings(
+            tmp_path, detection=True, timeout=_MULTI_PAGE_TIMEOUT
+        )
+        recorder = RecordingPaperless()
+        scanner = DistinctPageScanner(passes=((0,),), blank={0})
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            job = _submit_multi_page(worker, store, _TITLE)
+            question = _next_question(worker, store, job.id, after=0)
+            # Nobody answers.
+            ended = wait_for_state(
+                store,
+                job.id,
+                TERMINAL_STATES,
+                _MULTI_PAGE_TIMEOUT + _MULTI_PAGE_BUDGET,
+            )
+
+        assert question.wait is PassWait.BLANK_DECISION
+        assert question.pages_kept == 0
+        assert ended.state is JobState.ERROR
+        assert ended.error_category is ErrorCategory.ALL_BLANK
+        documents, partials = _kept(settings)
+        (kept,) = documents
+        assert partials == []
+        assert embedded_streams(kept) == _spooled(scanner, (0,))
+        assert recorder.uploads() == []

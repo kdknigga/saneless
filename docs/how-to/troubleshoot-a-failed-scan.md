@@ -2,27 +2,36 @@
 
 Find out why a saneless command failed, starting from its exit code, and what to check next.
 
-When a command fails it prints one line to stderr and exits with a non-zero code. The web UI shows
-the same failure on the job. The exact wording of the messages may change between releases, so
-this page describes what you see rather than quoting each message in full.
+When a command fails it prints a line to stderr saying what failed, then a `Try:` line with the
+next step to take, and exits with a non-zero code. The web UI shows the same failure on the job.
+The exact wording of the messages may change between releases, so this page describes what you
+see rather than quoting each message in full.
 
 ## Start with the exit code
 
 In a shell, `echo $?` right after the command prints its exit code.
 
-| Exit code | What happened | Where to look |
-|---|---|---|
-| 0 | The command succeeded | -- |
-| 1 | The scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
-| 2 | saneless could not start: configuration, profile or setup | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
-| 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
-| 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
-| 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
-| 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
+| Exit code | Where to look |
+|---|---|
+| 0 | Nothing to look for |
+| 1 | [Scanner errors](#scanner-errors-exit-1) |
+| 2 | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
+| 3 | [Paperless errors](#paperless-errors-exit-3) |
+| 4 | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
+| 5 | [Unexpected errors](#unexpected-errors-exit-5) |
+| 6 | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
+| 7 | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
+| 8 | [Every page looked blank](#every-page-looked-blank-exit-8) |
+| 9 | [The document may already be in paperless-ngx](#the-document-may-already-be-in-paperless-ngx-exit-9) |
+| 10 | [Out of disk space](#out-of-disk-space-exit-10) |
+| 129 | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
+| 130 | [Cancelled scans](#cancelled-scans-exit-130) |
+| 141 | [The output was cut off](#the-output-was-cut-off-exit-141) |
+| 143 | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 
-[Use the CLI for Scripting](cli-scripting.md#exit-codes) shows how to branch on these codes in a
-script, and [CLI Commands](../reference/cli-commands.md#exit-codes) lists the codes each command
-can return.
+[CLI Commands](../reference/cli-commands.md#exit-codes) defines what each code means and lists the
+codes each command can return, and [Use the CLI for Scripting](cli-scripting.md#exit-codes) shows
+how to branch on them in a script.
 
 ## Scanner errors (exit 1)
 
@@ -32,6 +41,11 @@ to search for in your scanner's documentation.
 
 What the common cases mean:
 
+- **No scanner found.** saneless looked for a scanner and found none: `scan` with
+  `scanner.device` empty, or `auto-profiles`. The configuration is not what is wrong. Check that
+  the scanner is switched on and connected, or reachable over the network, then run
+  `saneless devices` to see what SANE can find; see
+  [Scanner Host Discovery](scanner-host-discovery.md) when the scanner is on another machine.
 - **No paper detected in the feeder.** The document feeder was empty when the scan started, or
   the source is set to the feeder on a scanner that has nothing loaded. Load the stack and scan
   again, or pick a flatbed profile.
@@ -41,19 +55,35 @@ What the common cases mean:
   the profile's source matches where the paper is. In a manual duplex scan, an empty second pass
   says so and names how many front pages the first pass scanned; reload the flipped stack and
   scan both sides again.
-- **All pages were blank.** Pages were scanned, but empty-page detection removed every one of
-  them. If the pages were not blank, make detection more conservative or turn it off; see
-  [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank).
-- **The flip wait timed out.** A manual duplex scan waited `flip_timeout_seconds` for someone to
-  flip the stack and nobody answered. A timeout is a failure, not a cancel. The front sides the
-  first pass already scanned are kept: saneless assembles them into a PDF under `failed/` in its
-  data directory and names the path in the error. See
+- **Every page looked blank.** This is not a scanner error and does not exit 1: the scanner
+  returned pages and empty-page detection removed all of them. It exits 8; see
+  [Every page looked blank](#every-page-looked-blank-exit-8).
+- **The flip wait timed out.** A manual duplex scan waited `operator_wait_timeout_seconds` for
+  someone to flip the stack and nobody answered. A timeout is a failure, not a cancel. The front
+  sides the first pass already scanned are kept: saneless assembles them into a PDF under
+  `failed/` in its data directory and names the path in the error. See
   [Manual Duplex](set-up-adf-duplex.md#manual-duplex).
 - **The flip prompt failed.** Reading your answer failed while `saneless scan` was asking you to
   flip the stack, for example with an I/O error or input that could not be decoded. The cause is
   logged with its traceback, and the fronts are kept the same way a flip timeout keeps them. End
-  of input is not a failure: Ctrl-D, or a terminal that closes, at the prompt cancels the scan
-  (exit 130).
+  of input is not a failure: Ctrl-D at the prompt cancels the scan (exit 130). A terminal or SSH
+  session that closes at the prompt is not a cancel either: it is an interruption that keeps the
+  fronts (exit 129).
+- **A multi-page scan failed.** With **Multiple pages** (or `saneless scan --multi-page`), a
+  scanner fault or an empty feeder does not end the scan once the document holds at least one
+  page. saneless asks instead: *"The last scan failed, so none of its pages were added."*, followed
+  by what the scanner reported, with **Scan again**, **Finish document** and **Abort scan** (`n`,
+  `f` and `a` at the terminal). The failed scan adds nothing, so clear the scanner, put back every
+  page from that scan, and scan again. An empty feeder -- Scan next page pressed before the next
+  sheet was loaded -- brings up the same question. Only a failure on the first scan, or while
+  re-scanning the only scan so far, ends the job with exit 1, as any scan failure does. The
+  working directory running out of room still ends the job whatever the page count, with the pages
+  kept so far saved under `failed/`. If nobody answers the question, the document is finished with
+  the pages kept (exit 7). See
+  [Scan a Multi-Page Document](scan-a-multi-page-document.md#when-a-scan-fails-part-way).
+- **The multi-page prompt failed.** Reading your answer at a `saneless scan --multi-page` question
+  failed, for example with an I/O error. The scan fails with exit 1, and the pages kept so far are
+  saved as a PDF under `failed/`, with the path in the error.
 - **The scan stopped part-way through the stack.** The scanner failed after some sheets had
   already been fed -- a jam, a misfeed, a page that took too long, or the working directory
   running out of room. Those sheets are not lost. saneless assembles them into a PDF under
@@ -68,21 +98,64 @@ What the common cases mean:
     detection is deliberately not applied to a preserved scan, so it shows exactly what the feeder
     picked up. saneless never deletes anything from `failed/`; draining it is your job (see
     [Docker volumes](../reference/docker.md#volumes)).
-- **A page took too long.** saneless allows 120 seconds for each page, on the feeder and on the
-  flatbed alike, and the line reads `Page 3 timed out after 120s`. On a network scanner this
-  usually means the link dropped mid-page. Any sheets scanned before it are preserved as above.
-- **saneless says to restart it.** After a page times out, saneless cancels the read and waits for
-  the scanner to acknowledge. When it never does, the device cannot be reused safely, so the next
-  scan is refused before saneless touches the scanner at all, with a line ending:
+- **A page took too long.** Each page has a time limit, on the feeder and on the flatbed alike.
+  The limit scales with the resolution and page size the scanner agreed to, is never below
+  120 seconds and never above an hour: anything at 300 dpi gets 120 seconds, and an A4 colour page
+  at 1200 dpi about 480.
+  The line states the limit and the page it was worked out for, for example:
 
     ```
-    The scan will be possible again as soon as the scanner releases it. Restart saneless if it does not.
+    Page 3 timed out after 480s, the limit for a colour page of 9921 x 14031 pixels at 1200 dpi
     ```
 
-    That wording is literal. A hang that clears itself -- a network scanner that comes back, a
-    driver that finally returns -- releases the device on its own and the next scan works with no
-    restart. If the message keeps appearing, check the link to the scanner first, because the read
-    cannot return while that is down, and then restart saneless.
+    A dropped network link mid-page is one cause, but not the only one: a slow USB or Wi-Fi link,
+  or a high resolution the scanner is slow to deliver, can reach the limit too. Check the link
+  first; if pages at a high resolution keep timing out, lower the profile's `resolution`. Any
+  sheets scanned before it are preserved as above. When the scanner did not answer the cancel
+  either, the line ends `; the scanner did not answer the cancel either, so saneless stopped it`:
+  saneless stopped the scan's process after ten seconds, as below.
+- **The scanner has no source named the one in the profile.** The line names the profile's
+  source and every source the scanner offers, for example:
+
+    ```
+    The scanner has no source named 'Feeder'. It offers 'Flatbed', 'ADF'; set the profile's source to one of those names.
+    ```
+
+    saneless matches a profile's `source` against the scanner's list ignoring case and
+  surrounding spaces, and scans with the scanner's own spelling, so `adf` finds `ADF`. A name
+  that matches none is refused before any paper moves. A feeder name, or a name saneless does
+  not recognise, is never swapped for another source; only a flatbed name may fall back to the
+  scanner's Auto source, and when that sends the scan through the feeder the job ends with a
+  warning (see [Uploaded with a warning](#uploaded-with-a-warning-exit-7)). If two of the
+  scanner's sources differ only in case, the line says the profile's source matches more than
+  one of them and lists them; set `source` to one of them exactly.
+- **The scanner is set to 16 bits per sample.** The line reads `The scanner <device> is set to
+  16 bits per sample, and saneless scans at 8. Choose an 8-bit mode, such as Gray or Color, in
+  the profile.` saneless sets the scanner to 8 bits per sample wherever the scanner allows it,
+  so this appears only when the profile's `mode` can be scanned at 16 bits alone. The scan is
+  refused before any page. Set the profile's `mode` to an 8-bit one.
+- **The scanner stopped answering; saneless stopped it.** Every scan runs in a process of its
+  own, and saneless gives each step other than a page's read 30 seconds: starting the scanner
+  library, opening the scanner, setting up the scan, closing it, restarting the library between
+  passes, and finishing. A step that runs past that ends the process at once, and the line names
+  the step, for example:
+
+    ```
+    The scanner stopped answering while opening the scanner; saneless stopped it
+    ```
+
+    The pages scanned before it are preserved as above. Nothing else needs doing before the next
+  scan: it starts a fresh process with a fresh connection to the scanner, and fails the same way
+  if the scanner is still not answering. Check the link to the scanner first -- a network scanner
+  that went away, a `saned` host that restarted or stopped, a USB cable -- then power-cycle the
+  scanner if it keeps happening at the same step.
+- **The scanning process ended unexpectedly, or died.** The line reads `The scanning process
+  ended unexpectedly (exit status <n>)` or `The scanning process died from <signal>`, then the
+  step. saneless did not stop it: the process that talks to the scanner ended by itself, often
+  in the scanner library. When it ended with an exit status, its own line on saneless's stderr
+  usually names the cause by type; a process that died from a signal writes no such line. The
+  pages scanned before it are preserved, and the next scan starts a fresh process. If it keeps
+  happening at the same step, run the scan with `--verbose` and report it.
 
 To check that saneless can see the scanner at all, run:
 
@@ -93,36 +166,73 @@ saneless devices
 If the scanner is missing from that list, or saneless runs in a container, work through
 [Scanner Host Discovery](scanner-host-discovery.md).
 
+The status strip and `saneless devices` ask SANE for scanners the same fresh way, in a new
+short-lived process each time, so if the strip's Scanner row is red, pressing **Check again** after
+fixing the cause is enough; a restart is only needed after changing saneless's own settings.
+[What the Scanner row says](scanner-host-discovery.md#what-the-scanner-row-says) lists each Scanner
+row, what fixes it, and whether pressing **Check again** or a restart clears it.
+
 ## Configuration errors (exit 2)
 
-A problem with the config file prints a header naming the file, then one line per problem. A TOML
-syntax error names the line and column where parsing stopped. Fix each line listed and run the
-command again; [Validation](../reference/configuration.md#validation) describes the rules.
+A problem with the config file prints a header naming the file, then one line per problem, then a
+`Try:` line. A TOML syntax error names the line and column where parsing stopped. Fix each line
+listed and run the command again; [Validation](../reference/configuration.md#validation)
+describes the rules.
 
-Other causes of exit 2, each on one line:
+Other causes of exit 2, each a line naming the problem and then a `Try:` line with the fix:
 
 - **Unknown profile.** The `--profile` name is not a profile in the loaded config. Check the
   spelling against the `[profiles.NAME]` tables.
 - **Manual duplex without a terminal.** A profile with `duplex = "manual"` needs someone to flip
   the stack, so `saneless scan` refuses it when stdin is not a terminal (cron, a pipe, CI). Run it
   from a terminal or scan from the web UI.
-- **No scanner found.** saneless discovered no scanner to use: `scan` with `scanner.device` empty,
-  or `auto-profiles`. Set `scanner.device`, or fix discovery with `saneless devices`.
-- **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
-  server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
-  gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
-  itself failed, the cause is in the preceding log lines: `serve` streams its log to stderr
-  rather than writing a file.
+- **`--multi-page` without a terminal, or with manual duplex.** `saneless scan --multi-page` asks
+  after every scan whether there is another page, so it is refused when stdin is not a terminal.
+  It is refused for a `duplex = "manual"` profile too, because the two flows cannot be combined:
+  scan without `--multi-page`, or choose another profile.
+- **`serve` cannot start.** The port is already in use, or the web server failed to start. Stop
+  whatever holds the port or pass `--port`; when the web server itself failed, the cause is in the
+  preceding log lines: `serve` streams its log to stderr
+  rather than writing a file. `serve` logs these failures without a traceback: the line and its
+  `Try:` line say what to fix. SANE that will not start does not stop `serve`: the Scanner row
+  reports it, and the log gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)).
 - **The working directory cannot be prepared.** The line names `tmp_dir` (in
   [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
   cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and
   that there is free space.
+- **The working directory is not private.** The line names `output.tmp_dir`, its path and what is
+  wrong with it: it is a symbolic link, it is not a directory, it belongs to another user, or its
+  group or everyone can write to it. saneless keeps scanned pages there and will not use a
+  directory someone else could change. Run `chmod 700` on a directory you own (the line gives the
+  command), remove it so saneless creates it privately, or set `tmp_dir` to another directory.
 - **The job database cannot be used.** The line starts with `Job database error:` and names the
   database path and the reason: the file cannot be opened or is not a SQLite database, or its jobs
   table has a shape this version of saneless does not recognise. Check that the path is right,
   that saneless can read and write it and its directory, and that the file really is saneless's
   job database. If it is damaged, move it aside: saneless then starts with an empty job history,
   and the moved file is kept for inspection or restoring.
+  `saneless jobs` only reads the history, so it also refuses a job database at an older schema,
+  and says so. Only `saneless serve` upgrades a job database: start it once
+  with the same config, even on an install that otherwise only uses the CLI, stop it, then run
+  `saneless jobs` again.
+- **`paperless.url` or `paperless.token` refused.** Spaces and line breaks around either value
+  are ignored. What is left of `paperless.url` must be empty, or an `http://` or `https://`
+  address that names a host and holds no user name or password. What is left of
+  `paperless.token` must be visible ASCII, with no spaces, line breaks or control characters
+  inside it. A value that breaks these rules is refused when the config loads, so every command
+  that reads the config exits 2 and `serve` does not start. The line names the key and the rule,
+  never the value, for example `[paperless] token: Value error, must contain only visible ASCII
+  characters: no spaces, line breaks or control characters inside it`. See
+  [`[paperless]`](../reference/configuration.md#paperless).
+- **`paperless.url` not set.** An empty `paperless.url` loads, so `serve` can start and show what
+  is missing: the status strip's Paperless row and `saneless doctor` say `The paperless-ngx
+  address has not been set.` No scan starts while it is empty: `saneless scan` exits 2 before the
+  scanner is opened, with a line ending `the paperless-ngx address in paperless.url has not been
+  set`, and the web UI greys out the Scan button and refuses the scan. Should a scan still reach
+  the upload with no address, it fails with a line saying `paperless.url is not set, or has no
+  http or https scheme`. It is not retried, and nothing is copied to the consume folder even when
+  one is configured: the PDF is kept in `failed/` in the data directory and the line ends with its
+  path. Set the URL, then upload the kept PDF yourself or scan again.
 
 ## python-sane is not installed (exit 2)
 
@@ -135,16 +245,25 @@ the scanner. The line gives the import's own reason and names the package to ins
 2. Reinstall saneless so python-sane is built against it.
 
 `saneless jobs` and `--help` on any command do not need python-sane and keep working. See
-[Install on Bare Metal](install-bare-metal.md#step-1-install-sane-development-headers).
+[Install on Bare Metal](install-bare-metal.md#step-1-install-git-and-the-sane-development-headers).
 
 ## Paperless errors (exit 3)
 
 The line starts with `Paperless error:`.
 
-- **Unreachable.** saneless tries the upload three times, with a growing pause between attempts,
-  when the connection is refused or reset, times out, is closed by a reverse proxy, or
-  paperless-ngx answers with a server error. If every attempt fails and a consume directory is
-  configured, the PDF is saved there instead. Without one, the scan fails. Check that
+- **Unreachable.** saneless sends the upload again, with a growing pause of at most 5 seconds,
+  for about 60 seconds while every failure proves the upload cannot have reached paperless-ngx:
+  the connection is refused or cannot be made in time, no connection is free, a proxy refuses the
+  tunnel, or sending the file times out. If that goes on for the whole time and a consume
+  directory is configured, the PDF is saved there instead and the scan exits 6, not 3 -- see
+  [Saved to the consume folder](#saved-to-the-consume-folder-exit-6). Without one, the scan
+  fails, and the line says it could not connect for 60s -- or could not deliver the upload for
+  60s, when the last attempt had connected and then stalled sending the file, or found no free
+  connection. An upload that failed after the whole
+  file was sent, or that got a 5xx, is not this case and is never sent again: it is
+  [exit 9](#the-document-may-already-be-in-paperless-ngx-exit-9). That includes a paperless-ngx
+  restart behind a reverse proxy: the proxy answers `502` or `503` while paperless-ngx is down,
+  so the scan ends amber rather than being retried here. Check that
   `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
   machine does not trust also arrives here, reported as unreachable in both the log and the web
   UI -- see **TLS certificate not trusted** below before you go looking at the network.
@@ -152,23 +271,25 @@ The line starts with `Paperless error:`.
   `Paperless error: Could not fetch tags from Paperless at https://paperless.example.com/: [SSL:
   CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)`,
   and the scan exits 3 -- but only without a consume directory. A certificate that cannot be
-  verified is classified as unreachable, so the upload is retried, the retries are exhausted, and
+  verified is classified as unreachable, so the upload is retried for about 60 seconds, and
   with a consume directory configured the PDF is saved there instead: the scan then ends
-  `FALLBACK`, shown as **Saved to folder**, and the command exits 0. That is the dangerous case
-  rather than the benign one -- scans appear to keep succeeding into a folder nobody is watching,
-  so a TLS misconfiguration can run unnoticed indefinitely. Watch for `FALLBACK` /
-  **Saved to folder** in `saneless jobs`.
+  `FALLBACK`, shown as **Saved to folder**, and `saneless scan` prints `Saved to folder: <title>`
+  on stdout, the `Not uploaded: ...` line and the warning on stderr, and exits 6 (see
+  [Saved to the consume folder](#saved-to-the-consume-folder-exit-6)). That is the dangerous case
+  rather than the benign one -- every scan still delivers a document, but into a folder that
+  applies none of its title, tags or correspondent, so a TLS misconfiguration can run unnoticed
+  for a long time. Watch for it where each kind of scan reports: for `saneless scan`, exit 6 and
+  the stderr lines, which a script should treat as a problem to fix rather than a success; for a
+  web scan, **Saved to folder** in the status area and the job history (`saneless jobs` lists
+  web scans only, because a CLI scan is not recorded in the job store).
   **The same failure looks different in the web UI.** The status strip and
   `GET /api/paperless/test` report a bare `unreachable` with no TLS text anywhere, because a
   certificate that cannot be verified means the connection never established, and saneless
   classifies that as unreachable -- it is reported as the **Unreachable.** case above, with the
   SSL detail dropped. If your web UI says Unreachable, this bullet may be why. The message on the
-  scan path is OpenSSL's own and has not changed; what
-  changed is which certificate authorities are trusted. saneless now verifies against the
-  operating system's trust store instead of a certificate bundle shipped inside a Python package.
-  So a private or corporate CA installed on the machine now works where it used to fail, and one
-  installed only by editing that Python bundle now gives you this error, which you may not have
-  been getting before. There are two fixes. Install the CA into the operating system's trust
+  scan path is OpenSSL's own. saneless verifies the certificate against the operating system's
+  trust store, not a certificate bundle inside a Python package, so a private or corporate CA
+  must be trusted by the operating system, or named with `SSL_CERT_FILE`. There are two fixes. Install the CA into the operating system's trust
   store, which is the better option wherever it is available -- in the container, copy the
   certificate to `/usr/local/share/ca-certificates/my-ca.crt` and run `update-ca-certificates`.
   Or point OpenSSL at the certificate file directly with `SSL_CERT_FILE`, described in
@@ -181,10 +302,10 @@ The line starts with `Paperless error:`.
   file is missing, which gives the container a directory.
   Do not turn certificate verification off to make this go away: saneless sends the Paperless API
   token on every request, and an unverified connection hands that token to anyone in the path.
-- **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
-  retried, because retrying cannot help. With a consume directory configured the scan is still
-  saved there, so it does not fail, but every scan goes to the folder and the log says the URL
-  cannot be used. Fix the URL in the config.
+- **Malformed or unset URL.** This is a configuration error (exit 2), not a Paperless error,
+  and it is never retried and never saved to the consume folder. See
+  **`paperless.url` or `paperless.token` refused** and **`paperless.url` not set** under
+  [Configuration errors](#configuration-errors-exit-2).
 - **Upload rejected.** paperless-ngx answered with a 4xx, such as a bad API token or a field it
   refuses. The line gives Paperless's own reason. A rejected upload is never retried and never
   falls back to the consume directory; fix what the reason names and scan again.
@@ -192,23 +313,42 @@ The line starts with `Paperless error:`.
   line names where the upload was sent. It is not retried and never falls back; set
   `paperless.url` to the base of that address (often the `https://` form of the same host) and
   scan again.
-- **The document may already be in Paperless.** A retry after a lost response can reach
-  paperless-ngx twice. On default paperless-ngx settings that stores a second copy you can delete;
-  when paperless-ngx rejects duplicates, the failure says so. Check paperless-ngx before scanning
-  again.
+- **paperless-ngx is too old or too new.** The line reads `Paperless at <url> does not accept API
+  version 9 or 10; saneless needs paperless-ngx 2.16 or later`, and the web UI says *"This
+  paperless-ngx does not speak an API version saneless supports (9 or 10)."* paperless-ngx
+  answered `406`: it refuses every API version saneless speaks. saneless needs paperless-ngx 2.16
+  or later, which speaks version 9, or 10 on 3.x. Upgrade paperless-ngx, then scan again; the
+  status strip and `GET /api/paperless/test` report `incompatible_version` until you do. Nothing
+  was stored, so the kept PDF can be imported or the stack scanned again.
+- **Consume directory missing.** The line reads `consume directory <dir> does not exist — is the
+  paperless-ngx volume mounted?`. The upload could not get through, and the fallback found no
+  directory at `consume_dir`. saneless never creates it, because a directory made where the mount
+  should be is one paperless-ngx never looks at. Mount paperless-ngx's consume volume there, or
+  correct `consume_dir`, and import the kept PDF. Two nearby lines name other causes: `consume
+  directory <dir> is not a directory` means a file is in its place, and `consume directory <dir>
+  cannot be read: ...` means saneless could not examine the path -- usually a permission on it or
+  a parent -- so the folder may well be there.
+- **A duplicate is not a failure.** When paperless-ngx refuses the upload as a duplicate of a
+  document it already holds, the scan ends **Uploaded with a warning** (exit 7), not here; see
+  [Uploaded with a warning](#uploaded-with-a-warning-exit-7).
 
-When the upload fails, the assembled PDF is kept and its path is added to the error.
+When the upload fails, the assembled PDF is kept and its path is added to the error. A kept PDF
+paperless-ngx had already taken is named as such: the failure came while saneless waited for the
+document to be consumed, or it was the other half of a manual-duplex pair that failed. The line
+then says the file had already been accepted as a task, or saved to the consume folder, so check
+paperless-ngx before uploading it, or it will be there twice. If that PDF could not be kept either
+and its page files were kept instead, the line says the same of them.
 [How Consume Directory Fallback Works](../explanation/consume-directory-fallback.md) explains
 which failures retry, when the consume directory is used, and where a kept PDF goes.
 
 ## PDF assembly errors (exit 4)
 
 The line starts with `PDF error:`. saneless scanned the pages but could not write them as a PDF.
+A full disk is not this error: it is [exit 10](#out-of-disk-space-exit-10).
 
-- Check the free disk space where saneless writes its working files (`tmp_dir` in
-  [`[output]`](../reference/configuration.md#output)).
-- Check that saneless can write to that directory.
-- If both are fine, the PDF library refused one of the scanned images, and the line gives its
+- Check that saneless can write to the directory where it writes its working files (`tmp_dir`
+  in [`[output]`](../reference/configuration.md#output)).
+- If it can, the PDF library refused one of the scanned images, and the line gives its
   reason. Try the scan again with a different `mode` or `resolution` in the profile.
 
 The scanned pages are not lost when this fails. saneless writes each page to disk as it arrives,
@@ -224,20 +364,279 @@ between the passes, so the backs came back in reverse: the document is `a-0001`,
 directory by name would put every front page first and every back page last, in the wrong order.
 A simplex scan has only `a-` files and sorts correctly.
 
+## Saved to the consume folder (exit 6)
+
+stdout reads `Saved to folder: <title>`, and stderr reads `Not uploaded: saved to the consume
+folder without its title, tags or correspondent`, followed by the warning, which names where the
+PDF was written.
+
+The document was delivered, so do not scan the stack again. saneless could not reach paperless-ngx
+through its API, even after retrying for about 60 seconds, and a consume directory is configured,
+so it wrote the PDF there instead. paperless-ngx picks the file up from that folder and applies its own matching rules
+to it, not the title, tags and correspondent chosen for this scan.
+
+- In paperless-ngx, find the new document and set its title, tags and correspondent by hand.
+- Then find out why the API upload failed: it is the **Unreachable.** or **TLS certificate not
+  trusted.** case under [Paperless errors](#paperless-errors-exit-3), and every scan will keep
+  going to the folder until it is fixed.
+
+## Uploaded with a warning (exit 7)
+
+stdout reads `Uploaded with a warning: <title>`, and the warning itself is on stderr. The document
+reached paperless-ngx with its title, tags and correspondent, so do not scan the whole stack
+again. The warning is one of these:
+
+- **paperless-ngx already holds this file as document #N.** paperless-ngx refused the upload as a
+  duplicate: it already has this exact file, as the document the warning names, so the scan is not
+  lost and nothing is kept in `failed/`. The warning goes on *"it was not stored again, and this
+  scan's title and tags were not applied to it"*, and adds that the document is in paperless-ngx's
+  trash when it is; restore it from there if you still want it. paperless-ngx 2.x always refuses a
+  duplicate, and 3.x does so only when `PAPERLESS_CONSUMER_DELETE_DUPLICATES` is enabled (it
+  otherwise stores a second document). In a manual duplex scan uploaded as two halves, the
+  warning names the half. Set the title and tags on the existing document by hand if you need
+  them.
+- **Tag N no longer exists in paperless-ngx and was not applied.** A tag or correspondent chosen
+  for the scan, or a profile default, was not in paperless-ngx's lists, even after asking again,
+  so the document was filed without it. The warning names every id it dropped. Pick another in
+  the form, or remove the id from the profile's `default_tags` or `default_correspondent`. A tag
+  the API token's user is not allowed to see counts as missing too; give that user permission to
+  view it if it should apply.
+- **Pages could not be read by the scanner and were skipped.** The warning gives the count. Those
+  sheets are missing from the document in paperless-ngx; open it, find the gaps, and scan just
+  those sheets.
+- **Page count mismatch.** A manual duplex scan got a different number of fronts from backs, so
+  saneless could not interleave them. It uploaded the fronts and the backs as two separate
+  documents, with `(fronts)` and `(backs)` after the title. In paperless-ngx, check both documents
+  and look for a sheet that fed twice or not at all.
+- **The scanner could not read N sheet(s), so the fronts and backs could not be paired
+  reliably.** In a manual duplex scan, one of the passes skipped a sheet it could not read. A
+  skipped sheet moves every later page of that pass by one, so saneless does not interleave the
+  passes even when the two counts agree. It uploaded the fronts and the backs as two separate
+  documents, with `(fronts)` and `(backs)` after the title, and the warning gives the number of
+  sheets. The `(backs)` document is in sheet order, the same order as `(fronts)`, not the reversed
+  order the second pass fed them in. In paperless-ngx, find the sheets missing from either
+  document and scan them again, or scan the whole stack again and delete both documents.
+
+- **Finished after N pages because nobody answered.** A multi-page scan waited
+  `operator_wait_timeout_seconds` for an answer and nobody gave one, so saneless finished the
+  document with the pages it had. The warning says whether the question was about the next page or
+  about blank pages; in the second case, those blank pages were left out. Open the document and scan
+  whatever is missing as a new document.
+- **Finished at N pages: no new scan starts once a document has 500 pages.** A multi-page document
+  reached the page limit, so saneless finished it. Scan any remaining pages as a new document.
+- **Finished at N pages: one scan stops after 500 sheets, so sheet 501 was fed but not kept.**
+  One scan through the feeder keeps at most 500 sheets. A feeder can only tell that the stack
+  goes on by feeding one more sheet, so sheet 501 went through the feeder and was thrown away.
+  The pages before it were uploaded. Take sheet 501 and everything after it from the output
+  tray and the feeder, and scan them as a new document. N counts the pages uploaded, after any
+  blank pages were removed. In a multi-page scan the document is finished at that scan, and the
+  warning counts the document's pages.
+- **Finished at N pages: the scan of the backs stops after 500 sheets, so sheet 501 of the
+  turned-over stack was fed but not kept.** The backs pass of a manual duplex scan reached its
+  cap. The fronts pass ended on its own with fewer sheets, so the turned-over stack held sheets
+  whose fronts were never scanned. The fronts and backs were uploaded as two documents, and N
+  counts the pages of both. Check both documents, and scan any sheet missing from either again,
+  both sides, as a new document.
+- **Finished at N pages: a scan from an Auto source through the feeder stops after 50 sheets, so
+  sheet 51 was fed but not kept.** A profile whose `source` is the scanner's Auto source, with
+  `auto_source_mode = "adf"`, keeps at most 50 sheets per scan, because a scanner that has no
+  paper in its feeder may scan its glass again and again as if it were. The warning goes on:
+  *"If the feeder was already empty, the scanner was scanning its glass again; set
+  auto_source_mode = "flatbed" for this profile. Otherwise scan sheet 51 and any remaining pages
+  as a new document."* If you fed fewer than 51 sheets, delete the document, which is the glass
+  scanned over and over, and set `auto_source_mode = "flatbed"`.
+- **The scanner has no source named 'Flatbed', so its Auto source was scanned through the
+  feeder.** The profile asked for a flatbed source the scanner does not list, the scanner's Auto
+  source stood in for it, and because the profile's `auto_source_mode` is `"adf"`, Auto scanned
+  through the feeder rather than the glass. Check that the document is what you meant to scan,
+  then set the profile's `source` to one of the names the scanner lists (see
+  [Configure Scan Profiles](configure-scan-profiles.md)). When Auto stays on the glass, no
+  warning is given, because the scan did what the profile asked.
+- **The backs were not scanned: sheet N is already in the output tray.** A manual duplex scan
+  reached its sheet cap on the fronts pass, so saneless uploaded the fronts it kept, as one
+  document, and did not ask you to flip the stack: the sheet it fed but did not keep would have
+  paired every back with the wrong front. The warning before it names that sheet. Scan the backs
+  of the uploaded sheets, and the remaining sheets, as new documents. See
+  [When a pass reaches its sheet cap](set-up-adf-duplex.md#when-a-pass-reaches-its-sheet-cap).
+- **The scan of the backs stopped at its sheet cap, so the fronts and backs could not be paired
+  reliably.** A manual duplex scan reached its sheet cap on the backs pass. The fronts and backs
+  were uploaded as two documents, `(fronts)` and `(backs)`, even when the counts agree, because
+  the backs pass fed a sheet the fronts pass never did. The warning goes on to name the sheet
+  that was fed but not kept.
+
+A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
+title, tags and correspondent are the larger problem.
+
+## Every page looked blank (exit 8)
+
+The line starts with `Empty-page detection:`. The scanner worked: it returned pages, and
+empty-page detection judged every one of them blank, so nothing was uploaded. The scanner is not
+the thing to check.
+
+The pages are not lost. saneless assembles every page it scanned, before detection removed any,
+into a PDF under `failed/` in its data directory, and the line names the path. If that PDF cannot
+be built -- the disk is short of room, say -- the page files are kept there instead, and the line
+names their directory. Open what was kept:
+
+- **If the pages really are blank**, there is nothing to do. Delete the file.
+- **If they are not blank** -- faint pencil, light print or a mostly empty form -- detection was too
+  eager for this document. Lower `empty_page_coverage_threshold` for the profile, or turn detection
+  off for it with `enable_empty_page_detection = false`, then scan again. Or keep the preserved
+  PDF and upload it yourself.
+
+A multi-page scan fails the same way, with exit 8, when a question times out while the document
+holds no page because every page so far was skipped as blank. The skipped pages are what is kept.
+
+[When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank)
+explains how detection decides.
+
+## The document may already be in paperless-ngx (exit 9)
+
+The line starts with `Paperless error:`, but this is not a failed upload. saneless cannot tell
+whether paperless-ngx has the document, so scanning the stack again could store it twice. Do not
+rescan until you have checked. A script should treat 9 the same way: never rescan on it.
+
+It means one of two things, and the error says which:
+
+- **The upload may have reached paperless-ngx.** saneless sent the whole document, and then the
+  connection dropped or timed out before paperless-ngx answered. The document may have arrived.
+  saneless does not send it again and does not save it to the consume folder, because either
+  could make a second copy.
+- **paperless-ngx received the document but did not confirm filing it.** paperless-ngx accepted
+  the upload, and then its processing task did not finish within `paperless_task_timeout`, or it
+  failed for a reason other than being a duplicate. A long document with OCR can take longer
+  than the timeout, and paperless-ngx may still be working on it.
+
+To check, open paperless-ngx's document list and sort it by the date added. Look for the scan's
+title, or for a document with its pages. When paperless-ngx received the document, give it a few
+minutes to finish before you decide it is not there.
+
+- **If the document is in paperless-ngx**, there is nothing to do. Delete the copy in `failed/`.
+- **If it is not**, a copy is normally kept in `failed/` in saneless's data directory, and the
+  line names it. Import that copy into paperless-ngx yourself, or scan the stack again. Import it
+  only if the document is not in paperless-ngx: the copy is the same document, and importing it
+  next to one that arrived makes a duplicate. If the line names no copy, none was kept -- saneless
+  restarted during the upload and found no PDF to keep, or the copy could not be written -- so
+  scan the stack again.
+
+## Out of disk space (exit 10)
+
+The line starts with `Disk space:`. The server ran out of room while scanning, while writing a
+page, or while assembling the PDF. The scanner and the pages are fine, so neither is the thing to
+check.
+
+The line names the folder that is full. When saneless found the shortfall before writing -- the
+checks before a scan, before each page and before assembling the PDF -- it also names how much
+space the scan needs. When the disk refused a write partway through, it names only the folder and
+the system's reason (`No space left on device`, or a disk quota). Free space on
+the filesystem holding the folder, or point the folder at a filesystem with room: `tmp_dir` for
+the scan in progress, or `data_dir` for the job database and `failed/`. Then scan again.
+
+saneless keeps `min_free_space_mb` (500 MB by default) free for assembling the PDF. It checks that
+reserve before a scan starts and again before each page is written, so a scan that would fill the
+disk stops early with this exit code instead of failing halfway through. Lower the setting only
+if the server really has less room to give; assembling a PDF needs about twice the size of the
+scanned pages on top of it. If the scan had pages when it stopped, the line says whether and where
+they were kept.
+
+## Interrupted by a signal (exit 129 and 143)
+
+The line starts with `Interrupted:`. Something outside saneless stopped the command while it ran:
+
+- **129** is SIGHUP: the terminal or SSH session running the command went away.
+- **143** is SIGTERM: `kill`, a service manager or a container runtime stopped the command.
+
+Each code is 128 plus the signal number, the shell's convention. Nobody chose to stop the scan, so
+it is not treated as a cancel: the pages already scanned are kept, normally as a PDF, under
+`failed/` in the data directory, and the line names the path. A line that names no path kept
+nothing, because there was nothing to keep: the command was not a scan, or the scan was stopped
+before its first page. A `saneless scan --multi-page` run waiting for your answer counts too: the
+pages kept so far are saved, not uploaded. Scan the rest of the stack, or the whole stack again,
+and delete or upload the kept file yourself. The exceptions are a signal that arrives while
+saneless waits for paperless-ngx to consume a document it has already accepted, and one that
+arrives while the document is being sent: the line then says the kept file had already been
+accepted, and names the task, or that it was being sent and may have arrived. Either way, check
+paperless-ngx before uploading it, or it will be there twice.
+
+A signal that arrives once the scan's outcome is settled -- the document already delivered, or a
+failure's pages already being kept -- does not interrupt it. The command finishes what it was doing
+and exits with that outcome's own code, so a delivered scan still exits 0 and a scanner fault still
+exits 1, with its line naming what was kept. After a hangup the terminal is gone, so those closing
+lines cannot be printed; they are logged at INFO instead, and whatever could not be printed is
+discarded as the command exits, so the exit code still stands. The same holds when the output goes
+to a pipe that was closed early.
+
+Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
+[Cancelled scans](#cancelled-scans-exit-130)). That holds even when the scan had already failed and
+saneless was still moving its pages into `failed/`: pressing Ctrl-C then stops the move, and
+whatever had not reached `failed/` yet is lost, so let a failed scan finish reporting first. To run a long scan over SSH without a dropped
+connection interrupting it, start it under `tmux` or `screen`, or with `nohup`: a signal the
+command was started with ignored stays ignored, so under `nohup` a hangup does not interrupt it. Once `saneless serve`
+is running, SIGTERM is a graceful stop that exits 0.
+
+## The output was cut off (exit 141)
+
+Exit 141 is 128 plus SIGPIPE, the shell's code for a broken pipe. The program reading the output
+of `saneless devices`, `jobs`, `auto-profiles` or `doctor` stopped before the command finished
+writing, as `head` does in `saneless jobs | head` once it has its lines. Nothing went wrong, so
+saneless prints nothing about it and keeps no traceback. A shell reports a pipeline's last
+command's status, so you see 141 only with `set -o pipefail`. If you wanted the whole output, run
+the command without the reader that stops early.
+
+`saneless scan` never exits 141. Its progress and closing lines are not what the scan is for, so a
+reader that went away does not change its exit code: a delivered scan still exits 0.
+
+## A scan stopped by a crash or a power cut
+
+Some stops leave saneless no chance to react: `kill -9` (SIGKILL), the out-of-memory killer, a
+container killed after its grace period, or a power cut. The command prints nothing and exits with
+no code of its own, and the pages scanned so far are left in the scan's working directory under
+`tmp_dir`.
+
+They are recovered the next time saneless starts: when `saneless serve` starts, or before the next
+`saneless scan` opens the scanner, whichever comes first.
+
+- The pages become a PDF under `failed/` in the data directory, the same PDF a failed scan keeps:
+  `(partial)` for a one-sided scan, or `(fronts)` and `(backs)` for manual duplex. A page that was
+  only half written when the process died is left out. If no PDF can be built, for example
+  because the disk is short of space, the page files themselves are moved into a folder under
+  `failed/` instead.
+- A warning in the log names the job, its title and the path of what was kept.
+- In the web UI, the job shows as failed with "The server restarted before this scan finished",
+  followed by where its pages were kept. Only the browser that started the scan sees the path. A
+  scan started with `saneless scan` has no job in the web UI, so the log warning is where to look.
+- A web job that was already uploading shows as "May be in paperless-ngx" instead, with "The
+  server restarted while this scan was being uploaded; it may have reached paperless-ngx". Check
+  paperless-ngx's document list before scanning it again.
+- A web job that was waiting for someone -- at the flip prompt, or at a multi-page question -- is
+  marked failed the same way at the next start of `saneless serve`, so the page stops waiting for
+  an answer that can no longer arrive.
+
+Nothing recovered is uploaded. Check the kept file, then upload it yourself or scan the stack
+again, and delete it once the document is in paperless-ngx.
+
+A scan still running is never touched, even by a `saneless scan` started beside it or by a server
+sharing the same `tmp_dir`. Recovery takes only saneless's own `job-*` scratch directories whose
+scan has ended; anything else in `tmp_dir` is left alone.
+
 ## Cancelled scans (exit 130)
 
 Exit 130 means the scan was stopped on purpose, not that something broke:
 
 - You answered no, pressed Ctrl-D or pressed Ctrl-C at the manual duplex flip prompt.
+- You aborted a multi-page scan: **Abort scan** in the web UI, a confirmed `a`, or Ctrl-D or
+  Ctrl-C at a `saneless scan --multi-page` question. Ctrl-C and Ctrl-D do not ask to confirm,
+  however many pages were kept; press `f` to keep them.
 - You pressed Ctrl-C while a one-shot command (`scan`, `devices`, `auto-profiles`, `jobs`) was
   running, or while `serve` was still starting up.
 
 Nothing is uploaded, and nothing is kept in `failed/` either. A failure keeps whatever it can,
 because you cannot get those sheets back without feeding them again; a cancel keeps nothing,
 because you chose to stop and saneless would only be leaving you files to delete. In the web UI, a
-scan cancelled with **Abort scan** at the flip step is shown as Cancelled, in grey rather than as
-an error. A flip wait that times out is not a cancel: it
-fails with exit 1. Ctrl-C on `saneless serve` once the web server is running is a normal stop and
+scan cancelled with **Abort scan** at the flip step or at a multi-page question is shown as
+Cancelled, in grey rather than as an error. A flip wait that times out is not a cancel: it
+fails with exit 1. A multi-page question that times out is not a cancel either: it finishes the
+document with the pages kept (exit 7). Ctrl-C on `saneless serve` once the web server is running is a normal stop and
 exits 0.
 
 ## Unexpected errors (exit 5)
@@ -255,6 +654,5 @@ stream, printed directly above the line, and no hint is offered. Collect it from
 or `journalctl` instead of restarting the service.
 
 Please report it as a bug and attach the log file. Attach the log only, never your config file,
-which holds your Paperless API token. If the log was recorded with `log_level = "DEBUG"`, search it
-for your token before sharing it: debug output from the HTTP client can include the authorization
-header.
+which holds your Paperless API token. saneless keeps the HTTP libraries' own debug output out of
+the log whatever `log_level` says, because it can include the authorization header.

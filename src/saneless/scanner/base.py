@@ -8,13 +8,23 @@ scan settings.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Final, Literal, assert_never
+
+from saneless.exceptions import (
+    ListingAbortedError,
+    ListingCrashedError,
+    ListingNoAnswerError,
+    ListingTimedOutError,
+)
+from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
+    import threading
     from pathlib import Path
 
     from PIL import Image
@@ -22,10 +32,13 @@ if TYPE_CHECKING:
     from saneless.vocabulary import PaperSize
 
 __all__ = [
+    "MAX_PAGES_PER_PASS",
     "DeviceCapabilities",
     "DeviceInfo",
+    "DeviceSurvey",
     "PageRecord",
     "PageSink",
+    "PassCapReached",
     "ScanBatch",
     "ScanSettings",
     "ScannerBackend",
@@ -34,6 +47,12 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# The most pages one acquisition pass, one scan_pages() call, may produce. It
+# bounds each pass on its own, not a whole job: each manual-duplex pass and each
+# pass of a document grown pass by pass gets the full cap. Sized to the largest
+# production hoppers. See docs/explanation/decisions/0007-auto-feeder-page-cap.md.
+MAX_PAGES_PER_PASS: Final = 500
 
 
 class SourceKind(StrEnum):
@@ -65,22 +84,16 @@ def classify_source(source: str) -> SourceKind:
     """
     Classify a SANE source name into a SourceKind.
 
-    This is the ONLY source-classification rule in the codebase. Every
-    question of the form "is this source a feeder?" must be answered by
-    calling this function and inspecting the returned member; do not
-    re-derive the answer from the source string anywhere else.
+    This is the only source-classification rule: answer "is this source a
+    feeder?" by calling it, never by re-reading the source string.
 
-    The branch order below is deliberate and load-bearing:
+    The branch order is load-bearing:
 
-    1. ``"auto"`` is matched by EXACT equality, never as a substring.
-       ``"automatic document feeder"`` starts with the letters ``auto``, so a
-       substring test would classify the single most common real-world feeder
-       name as AUTO and route a ten-page stack down the single-page path.
-    2. ``"duplex"`` is tested before the feeder tokens so that names carrying
-       no feeder token at all -- Fujitsu's ``"Card Duplex"``, this project's
-       ``"Manual Duplex"`` -- classify as duplex rather than falling through.
-    3. The feeder tokens are matched next. ``"feeder"`` deliberately does not
-       match ``"Manual Feed Tray"``: "feed" is not "feeder".
+    1. ``"auto"`` matches by equality only, because ``"automatic document
+       feeder"`` starts with ``auto``.
+    2. ``"duplex"`` is tested before the feeder tokens, so names with no feeder
+       token, such as ``"Card Duplex"`` and ``"Manual Duplex"``, are duplex.
+    3. The feeder tokens come next; ``"Manual Feed Tray"`` is not a feeder.
     4. ``"flatbed"`` is matched last of the positive rules.
 
     Args:
@@ -102,22 +115,10 @@ def classify_source(source: str) -> SourceKind:
         return SourceKind.FEEDER
     if "flatbed" in lower:
         return SourceKind.FLATBED
-    # ANSWERED, not deferred. UNKNOWN keeps single-page routing, so
-    # uses_feeder is False.
-    #
-    # The proposed "safer" default -- "if the device exposes a source option, treat
-    # anything that is not the flatbed entry as multi-page" -- is DECLINED.
-    # It is a bet about scanners nobody has seen, and it trades a cheap,
-    # visible failure for an expensive one.
-    #
-    # The residual risk is accepted knowingly: a genuinely new feeder name
-    # yields a one-page PDF until someone adds a token to _FEEDER_TOKENS
-    # above. That is visible to the operator and is fixed by one entry in a
-    # tuple. The opposite failure -- treating a flatbed as a feeder and
-    # re-scanning the platen until something stops it -- is the expensive one,
-    # and it is bounded separately by _MAX_ADF_PAGES in sane_backend.py.
-    #
-    # This is a settled answer. Do not re-open it as an unmade decision.
+    # An unrecognised source keeps single-page routing (uses_feeder is False),
+    # so it never enters the feeder loop for being unrecognised. A new feeder
+    # name is supported by adding its token to _FEEDER_TOKENS.
+    # See docs/explanation/decisions/0001-unknown-sources-scan-one-page.md.
     return SourceKind.UNKNOWN
 
 
@@ -130,39 +131,70 @@ class DeviceInfo:
     model: str
     device_type: str
 
+    def __post_init__(self) -> None:
+        """
+        Escape control characters in the fields that are only ever shown.
 
-@dataclass
+        A LAN device chooses its own vendor, model and type strings, so an ESC
+        in them would reach the operator's terminal live. ``name`` is kept byte
+        for byte, because it goes back to ``sane.open`` and into the
+        configuration; it is escaped where it is displayed instead.
+        """
+        self.vendor = neutralise_controls(self.vendor)
+        self.model = neutralise_controls(self.model)
+        self.device_type = neutralise_controls(self.device_type)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceSurvey:
+    """
+    What one list-then-open found: the Scanner health check's evidence.
+
+    Every failure is recorded as an exception's class name and nothing else.
+    The check reports these, and nothing it causes to be logged may carry a
+    device id or an exception's text, since a ``net:`` id is a LAN address and
+    the text of a SANE error can repeat it.
+
+    Attributes:
+        devices: The devices listed, empty when the listing raised.
+        list_error: The class name of the exception the listing raised, or
+            ``None`` when it did not raise.
+        configured_opened: Whether opening the configured device worked, or
+            ``None`` when no open was attempted, because no device was
+            configured or the listing already included it.
+        open_error: The class name of the exception the open raised, or
+            ``None`` when it did not raise or was not attempted.
+        start_error: The class name of the failure that kept the scanner
+            library from starting, or ``None`` when it started.
+
+    """
+
+    devices: tuple[DeviceInfo, ...]
+    list_error: str | None = None
+    configured_opened: bool | None = None
+    open_error: str | None = None
+    start_error: str | None = None
+
+
+@dataclass(kw_only=True)
 class DeviceCapabilities:
     """
     Available options and constraints reported by a scanner device.
 
-    ``resolutions`` and ``resolution_range`` are two different facts, not two
-    spellings of one. A SANE device constrains its resolution option with
-    *either* a word list *or* a ``(min, max, step)`` range, never both, so at
-    most one of these two fields is ever populated and **neither is derived
-    from the other**. Expanding a range into a list of plausible DPIs would
-    print saneless's own invention rather than the device's answer, and
-    inferring a range from a word list would claim the device accepts every
-    value between the listed ones. Whichever shape the device actually gave is
-    the one that gets filled in; an option it leaves unconstrained fills
-    neither. The two therefore cannot disagree with each other.
-
-    The range keeps the ``float`` members the device reported -- measured
-    against the SANE ``test`` backend, ``(1.0, 1200.0, 1.0)``. Callers wanting
-    whole dpi coerce at the point of use rather than at the point of reading,
-    so nothing here quietly rounds off what the scanner said.
-
-    ``resolution_range`` is defaulted and sits with the other defaulted fields.
-    Moving it above ``raw_options`` would reorder the dataclass and break the
-    positional construction call sites across the suite rely on.
+    A SANE device constrains resolution with either a word list or a
+    ``(min, max, step)`` range, never both, so at most one of ``resolutions``
+    and ``resolution_range`` is populated and neither is derived from the
+    other. The range keeps the ``float`` members the device reported, such as
+    the SANE ``test`` backend's ``(1.0, 1200.0, 1.0)``; callers wanting whole
+    dpi round at the point of use.
 
     Attributes:
         sources: The scan sources the device offers.
         resolutions: The exact resolutions the device offers, when it
             constrains the option with a word list. Empty otherwise.
         modes: The scan modes the device offers.
-        raw_options: The device's option tuples, as ``get_options()`` returns
-            them.
+        option_names: The names of the options the device reports, in the
+            order it reports them.
         resolution_range: The ``(min, max, step)`` the device reports, when it
             constrains the option with a range. None otherwise.
 
@@ -171,33 +203,65 @@ class DeviceCapabilities:
     sources: list[str]
     resolutions: list[int]
     modes: list[str]
-    raw_options: list[tuple] = field(default_factory=list)
+    option_names: tuple[str, ...] = ()
     resolution_range: tuple[float, float, float] | None = None
 
 
-@dataclass
+@dataclass(frozen=True, kw_only=True)
 class ScanSettings:
-    """Settings for a scan operation."""
+    """
+    Settings for a scan operation.
+
+    Frozen, so nothing between ``run_pipeline`` and the backend can change the
+    settings resolved for a job.
+
+    Attributes:
+        source: The source name, as the profile gives it.
+        resolution: The requested resolution in dpi.
+        mode: The requested scan mode.
+        auto_source_mode: Where an ``Auto`` source is routed, mirroring
+            ``ProfileConfig.auto_source_mode``.
+        duplex: The profile's duplex choice, mirroring
+            ``ProfileConfig.duplex``.
+        paper_size: The paper size to frame the page to.
+
+    """
 
     source: str
     resolution: int
     mode: str
-    auto_source_mode: str = "flatbed"
-    # Manual duplex: resolve a document feeder from the device's own source
-    # list instead of validating ``source`` verbatim. The backend
-    # prefers ``source`` when the device reports it and it feeds, falls back
-    # to the first reported feeder, and refuses when there is none -- it never
-    # substitutes ``Auto``, which is how manual duplex once took two platen
-    # snapshots and reported success.
-    #
-    # A plain bool, not a scanner-side DuplexMode enum: inside the scanner
-    # that enum's NONE and HARDWARE members would behave identically, one
-    # behaviour with two spellings. The bool also keeps ProfileConfig.duplex's
-    # Literal as the only spelling of "duplex", with one conversion point in
-    # run_pipeline. Like auto_source_mode it is a plain value, because the
-    # scanner package deliberately does not depend on the job-state enums.
-    resolve_feeder_source: bool = False
+    auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
+    # The profile's own Literal, so the scanner package does not depend on the
+    # job-state enums. "manual" makes the backend pick a feeder from the
+    # device's sources and refuse when there is none, never substituting Auto.
+    # "hardware" stays distinct from "none" because some devices select duplex
+    # through a separate ADF-mode option that must be set.
+    duplex: Literal["none", "hardware", "manual"] = "none"
     paper_size: PaperSize = "full"
+
+
+@dataclass(frozen=True, slots=True)
+class PassCapReached:
+    """
+    One acquisition pass stopped at its page cap, and which sheet it dropped.
+
+    Reaching the cap is not a failure: the pages already scanned are kept, and
+    this records where the pass stopped so the operator knows where to resume.
+
+    Attributes:
+        cap: The most pages the pass could keep.
+        sheet_not_kept: The number of the fed sheet that was acquired past the
+            cap and discarded, counted from one over every sheet fed in the
+            pass, readable or not. The overrun is only seen on that sheet, so
+            it is always ``cap + 1``.
+        auto_source: Whether the lower bound for a source that is not a named
+            feeder applied, rather than the per-pass cap a named feeder gets.
+
+    """
+
+    cap: int
+    sheet_not_kept: int
+    auto_source: bool
 
 
 @dataclass(frozen=True)
@@ -205,48 +269,38 @@ class ScanBatch:
     """
     The pages one acquisition produced, and what the device actually did.
 
-    Three fields, and the per-page structure is now ``pages`` itself: the
-    ordered page records are that design, and every
-    per-page fact -- which file a sheet landed in, what was measured about it,
-    where it sat in the pass -- belongs on ``PageRecord`` rather than here.
-    What survives at batch level is exactly the two things the device reports
-    about the pass as a whole, so this stays the one channel carrying
-    ``actual_resolution`` and ``pages_rejected`` alongside the records and
-    there is no second route out of the backend. Do not extend this casually:
-    a fact that is per-page belongs on the record. It deliberately carries no
-    geometry either, because a scan area the device clamped falls back to the
-    existing crop rather than being reported back out.
-
-    ``frozen=True`` is a departure from the plain ``@dataclass`` used by
-    ``DeviceInfo``, ``DeviceCapabilities``, ``ScanSettings`` and
-    ``pipeline.ScanResult``. There is no frozen precedent in this codebase, so
-    the choice is stated rather than inherited: this is a report of what a
-    device has already done, and nothing downstream has any business rewriting
-    it afterwards.
+    Only facts about the pass as a whole live here; a per-page fact belongs on
+    ``PageRecord``. The batch is the backend's only channel out besides the
+    records, and it carries no geometry: a scan area the device clamped falls
+    back to the existing crop.
 
     Attributes:
-        pages: The page records the sink produced, in document order. The
-            order of this tuple is the document order, and
-            ``PageRecord.sequence`` -- not the filesystem, not a glob, not a
-            sort -- is the proof of it. After a manual-duplex
-            interleave the spooled file names do not sort into document order
-            at all, so recovering order from the directory is not a shortcut
-            but a bug.
+        pages: The page records the sink produced, in document order. Order
+            comes from this tuple and ``PageRecord.sequence``, never from the
+            spool directory: after a manual-duplex interleave the file names
+            do not sort into document order.
         actual_resolution: The resolution the device reported back, in whole
-            dpi. Not the requested one -- SANE substitutes silently -- and it
-            is the value both the crop arithmetic and the PDF's declared page
-            size have to agree on.
+            dpi, which SANE may substitute silently for the requested one. The
+            crop arithmetic and the PDF's page size both use it.
         pages_rejected: How many fed sheets failed their integrity checks and
-            were skipped. This is deliberately NOT the pipeline's blank-page
-            removal count: that one is empty-page detection and is rendered to
-            users as pages removed for being blank, so reporting a sheet the
-            device could not read through it would be a new small lie.
+            were skipped. Not the blank-page removal count, which users see as
+            pages removed for being blank.
+        substituted_source: The source the profile asked for, when the device
+            offered no such source and its ``Auto`` source was used in its
+            place *and* ``auto_source_mode`` sent that ``Auto`` through the
+            document feeder. None otherwise, including when ``Auto`` stood in
+            for a flatbed and scanned the glass as asked.
+        cap_reached: The page cap the pass stopped at and the sheet it fed but
+            did not keep, when the device was still feeding at the cap. None
+            when the feed ended on its own.
 
     """
 
     pages: tuple[PageRecord, ...]
     actual_resolution: int
     pages_rejected: int
+    substituted_source: str | None = None
+    cap_reached: PassCapReached | None = None
 
 
 @dataclass(frozen=True)
@@ -254,27 +308,15 @@ class PageRecord:
     """
     One acquired page, after it was written to the spool.
 
-    Facts, never verdicts. Every field here is something that was measured
-    while the page was in memory; nothing here is a judgement about what the
-    page means. In particular there is deliberately **no** ``is_blank`` field:
-    blank-page policy belongs to the pipeline, under the profile's toggle,
-    and ``pipeline._drop_empty_pages`` applies the profile's
-    ``empty_page_mean_threshold`` / ``empty_page_stddev_threshold`` to the
-    ``mean`` and ``stddev`` stored here. A verdict baked in at acquisition
-    would freeze one profile's thresholds into the record and make the toggle
-    a lie.
+    Facts, never verdicts: there is deliberately no ``is_blank`` field. The
+    pipeline's blank-page filter applies the profile's threshold to
+    ``ink_coverage`` and ``paper_white``, so a verdict baked in here would
+    freeze one profile's threshold into the record.
 
-    ``sequence`` is 1-based and is assigned at acquisition, by the sink, in the
-    order the device produced the sheets. It is the proof of document order,
-    and it exists so that order is never recovered by sorting or globbing the
-    spool directory: the two passes of a manual-duplex job spool into
-    distinguishable file names for debuggability only, and after the interleave
-    the file names no longer sort into document order at all.
-
-    ``frozen=True`` for the same reason ``ScanBatch`` is frozen: this is a
-    report of what has already happened on disk, and nothing downstream has any
-    business rewriting it afterwards. The interleave reorders records; it never
-    edits one.
+    Document order comes from ``sequence``, never from sorting or globbing the
+    spool directory, whose file names do not sort into document order after a
+    manual-duplex interleave. The interleave reorders records; it never edits
+    one.
 
     Attributes:
         sequence: The 1-based position this page had in its acquisition pass,
@@ -283,9 +325,17 @@ class PageRecord:
             the PDF's page content is built from -- nothing re-encodes it.
         size: The page's ``(width, height)`` in pixels, as the device produced
             it and as the PNG stores it.
-        mode: The page's Pillow mode, ``"L"`` or ``"RGB"`` for a SANE snap.
-        mean: Greyscale mean luminance, measured once at spool time.
-        stddev: Greyscale standard deviation, measured once at spool time.
+        mode: The page's Pillow mode as spooled: ``"1"``, ``"L"`` or
+            ``"RGB"``. A SANE snap arrives as ``"L"`` or ``"RGB"``; any other
+            mode the sink accepts is converted to one of those first.
+        dpi: The resolution the device read back for this page, not the one
+            the profile asked for. Every PDF lays the page out at it: the
+            document, a mismatch half and a preserved partial alike.
+        ink_coverage: The share of the page, inside a thin trimmed margin,
+            that is ink, in percent (0-100), measured once at spool time by
+            ``pages.measure_ink``.
+        paper_white: The paper's grey level (0-255) in the page's darkest
+            channel, measured at the same moment.
 
     """
 
@@ -293,8 +343,9 @@ class PageRecord:
     path: Path
     size: tuple[int, int]
     mode: str
-    mean: float
-    stddev: float
+    dpi: int
+    ink_coverage: float
+    paper_white: int
 
 
 class PageSink(ABC):
@@ -302,46 +353,31 @@ class PageSink(ABC):
     Where the backend puts each page it acquires.
 
     The backend acquires one page, crops it if it has to, hands it here, and
-    forgets it. It never accumulates a list of images, which is the whole of
-    the memory bound: peak memory is a property of who holds a page, not
-    of how the pages are produced. The concrete implementation is
-    pipeline-owned (``saneless.spool.SpooledPageSink``), because where a page
-    lands and what is measured about it are pipeline concerns; this module
-    declares only the shape the two sides agree on.
+    forgets it, so it never holds more than one decoded page. The pipeline
+    owns the implementation (``saneless.spool.SpooledPageSink``) and decides
+    where a page lands. See docs/explanation/decisions/0005-page-sink-contract.md.
 
-    This is an ``ABC`` and not a ``typing.Protocol``, following the rule
-    already stated in ``pipeline.FlipCoordinator``'s docstring and observable
-    in the tree: ``Protocol`` describes shapes this project does not own
-    (``SaneDevice`` for python-sane's handle), while ``ABC`` defines seams the
-    project implements itself (``ScannerBackend``). A page sink is a seam this
-    project implements.
-
-    Two alternatives were rejected:
-
-    1. Going back to a generator. The backend moved away from one because a
-       generator can only hand back images: its return value -- the resolution
-       the device settled on and the sheets it rejected -- is discarded by the
-       ``list()`` every caller wrapped it in. Streaming pages out is not worth
-       throwing those two facts away again.
-    2. A bare callback with no declared contract. The type checkers could not
-       see what it promised, so neither a wrong argument nor a wrong return
-       value would have been caught anywhere.
+    An ``ABC``, not a ``typing.Protocol``, by the convention CONTRIBUTING.md
+    states for seams this project implements itself.
     """
 
     @abstractmethod
-    def add(self, image: Image.Image) -> PageRecord:
+    def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
         """
         Take ownership of one acquired page and materialise it.
 
         The sink owns the page from this call onwards: it decides where the
         page lands, writes it, and measures it. The caller must not retain the
-        image afterwards -- a retained reference is exactly the accumulation
-        this seam exists to prevent, and it would put peak memory back to
-        growing with the page count.
+        image afterwards, or peak memory grows with the page count again.
+
+        ``dpi`` has no default because only the caller knows it: a default
+        would lay out a page read back at 150 dpi as if it were 300.
 
         Args:
             image: The page the device produced, already cropped if the
                 requested paper size required it.
+            dpi: The resolution the device read back, which the page is
+                recorded and laid out at.
 
         Returns:
             A PageRecord describing where the page was written and what was
@@ -376,6 +412,92 @@ class ScannerBackend(ABC):
 
         """
 
+    def open_and_close(self, device_id: str) -> None:
+        """
+        Open a device and close it again, which is the first thing a scan does.
+
+        The Scanner health check calls this to learn whether a configured
+        device the backend did not list can be used, without scanning.  Nothing
+        the check causes to be logged may name a device id or carry an
+        exception's text, since a ``net:`` id is a LAN address, so a backend
+        whose own open or close logging could break that rule overrides this.
+        The default goes through ``get_capabilities``.
+
+        Args:
+            device_id: SANE device identifier string.
+
+        """
+        self.get_capabilities(device_id)
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        List the devices, then open a configured device the listing lacks.
+
+        This is the Scanner health check's list-then-open.  A configured id
+        the listing does not include may still be usable, since a scan opens
+        it without listing first, so it is opened and closed again to find
+        out.  An id the listing includes is not opened.
+
+        The default calls ``get_devices`` and then ``open_and_close``, so a
+        test double needs neither override; a real backend lists and opens in
+        one isolated step.
+
+        A listing that crashed, was stopped at its deadline or on ``abort``,
+        or gave no usable answer is not a failed listing: it propagates, so
+        the caller can report it as what it was.
+        Any other failure, of the listing or of the open, is recorded by
+        class name.  Nothing is logged here; the caller logs type names.
+
+        Args:
+            open_if_unlisted: The configured device id, or ``""`` when none
+                is configured.
+            abort: Set by another thread to stop the listing part way; the
+                backend passes it to its listing.  The default makes two
+                calls that cannot be stopped part way, and ignores it.
+
+        Returns:
+            What the listing and the open found.
+
+        Raises:
+            ListingCrashedError: The listing died from a signal.
+            ListingTimedOutError: The listing did not finish in time.
+            ListingNoAnswerError: The listing gave no usable answer.
+            ListingAbortedError: The listing was stopped on ``abort``.
+
+        """
+        _ = abort
+        devices: tuple[DeviceInfo, ...] = ()
+        list_error: str | None = None
+        try:
+            devices = tuple(self.get_devices())
+        except (
+            ListingCrashedError,
+            ListingTimedOutError,
+            ListingNoAnswerError,
+            ListingAbortedError,
+        ):
+            raise
+        except Exception as exc:
+            list_error = type(exc).__name__
+        if not open_if_unlisted or any(
+            device.name == open_if_unlisted for device in devices
+        ):
+            return DeviceSurvey(devices=devices, list_error=list_error)
+        try:
+            self.open_and_close(open_if_unlisted)
+        except Exception as exc:
+            return DeviceSurvey(
+                devices=devices,
+                list_error=list_error,
+                configured_opened=False,
+                open_error=type(exc).__name__,
+            )
+        return DeviceSurvey(
+            devices=devices, list_error=list_error, configured_opened=True
+        )
+
     @abstractmethod
     def scan_pages(
         self, device_id: str, settings: ScanSettings, sink: PageSink
@@ -383,27 +505,12 @@ class ScannerBackend(ABC):
         """
         Acquire pages from scanner, handing each one to the sink.
 
-        This returns a completed batch rather than yielding pages. A generator
-        can only hand back images, and its return value is discarded by the
-        ``list()`` every caller wrapped it in, so the two facts the backend
-        measures -- the resolution the device settled on, and the sheets it
-        could not read -- had no way out of the backend at all.
+        The backend never holds more than one decoded page and never decides
+        where a page is stored.
+        See docs/explanation/decisions/0005-page-sink-contract.md.
 
-        The *input* is a sink for the matching reason. The backend must
-        never hold more than one decoded page: peak memory is a property of
-        who holds a page, not of how the pages are produced, and a backend
-        that accumulated them would put peak memory back where it was
-        measured at 1395 MB for 48 pages. Where a page lands is not the
-        backend's business either -- the workspace, the ``tmp_dir`` under it
-        and the job id in its name are all pipeline facts -- so the caller
-        supplies the concrete sink and the backend only fills it.
-
-        Two alternatives were rejected. Going back to a generator streams
-        pages out but throws away the two measured facts again, which is why
-        the backend moved away from one. A bare callback with no declared
-        contract was rejected because neither type checker could see what it
-        promised, so neither a wrong argument nor a wrong return value would
-        have been caught anywhere.
+        The PDF assembly that follows keeps the same one-page memory bound.
+        See docs/explanation/decisions/0006-per-page-pdf-and-qpdf-merge.md.
 
         Args:
             device_id: SANE device identifier string.
@@ -420,29 +527,53 @@ class ScannerBackend(ABC):
 
         """
 
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """
+        Return a context manager that scopes one scan job.
+
+        Every ``scan_pages`` call made inside it belongs to the same job, so a
+        backend that scans through a helper process can keep one for the whole
+        job and release it when the job ends.  The default does nothing.
+
+        Args:
+            abort: Set by another thread to stop the job part way.
+            live: Set while the backend holds something that must be released
+                before the server stops, such as a running helper process.
+
+        Returns:
+            The context manager; it yields nothing.
+
+        """
+        _ = abort, live
+        return contextlib.nullcontext()
+
     def close(self) -> None:
         """
-        Release whatever this backend holds process-wide.
+        Release whatever this backend still holds.
 
-        Deliberately **not** an ``@abstractmethod``, and the default body does
-        nothing but say so. Most backends hold no process-global resource at
-        all, so requiring the method would force an empty override onto every
-        test stub and buy nothing; the one implementation that does hold one,
-        ``SaneBackend``, overrides it to run the process-level SANE shutdown.
-        Declaring it here is what lets an entry point shut a backend down
-        through this abstraction instead of by naming the concrete class.
-
-        An implementation logs a close failure and never raises it. That is
-        the rule ``SaneBackend._open_device``'s ``finally`` block already
-        follows for ``dev.close()``, and it holds for the same reason: an
-        exception raised out of a close would replace the error that ended the
-        scan, which is the one the operator actually needs to see.
-
-        The DEBUG line is the body: a bare docstring would be an empty method
-        on an ABC, which ruff's ``B027`` flags precisely because such a method
-        is usually an unfinished override, and this project adds no ``noqa``
-        to say otherwise. Logging which backend declined to close says it in
-        code instead, and it is the line that tells an operator reading a
-        shutdown log that nothing was skipped by accident.
+        The default does nothing; ``SaneBackend`` overrides it to end a scan
+        child left running by a job that did not end its session.  An
+        implementation logs a close failure and never raises it, because an
+        exception out of a close would replace the error that ended the scan.
         """
         logger.debug("close() is a no-op for %s", type(self).__name__)
+
+    def reinitialise(self) -> None:
+        """
+        Restart the library this backend drives, before a later pass.
+
+        Called before every pass of a multi-page scan after the first, inside
+        the job's scan session and never with a device handle open.  The second
+        pass of a manual-duplex scan does not call it.
+
+        The default does nothing. ``SaneBackend`` overrides it to restart SANE
+        inside the job's scan child, so a later pass starts from a fresh
+        library; with no child running there is nothing to restart, because
+        the next pass starts a fresh child.
+        """
+        logger.debug("reinitialise() is a no-op for %s", type(self).__name__)

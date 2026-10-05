@@ -1,27 +1,14 @@
-{# The ONLY copy of the Scan button markup.  index.html includes
-   it inline; partials/status_response.html includes it with oob = true so every
-   status response re-renders it from server state.  Keep type="submit"
-   id="scan-btn" as the first two attributes, in that order: the _SCAN_BUTTON
-   regex in tests/test_web_state_rendering.py depends on it.  Never include this
-   inside partials/status.html -- the page includes that partial too, so the
-   page would carry a duplicate id="scan-btn".
-
-   The blocked flag below is the second, independent source of disabled: a
-   paperless-ngx token nobody set means an upload is impossible before any paper
-   moves, so the button says no.  It lives HERE for the same reason the partial
-   itself exists -- this is the one place the button is rendered from, and every
-   status response re-renders it from server state, so the blocked flag and the
-   markup that expresses it cannot drift apart.  If the blocked state were
-   expressed anywhere else, it would have to be recomputed at each of those
-   sites and kept in step with this one.
-
-   The flag adds a disabled source and nothing more: the label and aria-busy
-   still come from the job's state alone, and the label stays Scan when there
-   is no job.  The reason line lives in index.html,
-   because a disabled button is not focusable and cannot be reliably hovered,
-   so the explanation has to be visible text rather than a tooltip. #}
+{# The only copy of the Scan button: index.html includes it inline and every
+   status response includes it with oob = true, so the server alone decides
+   its state.  Never include it inside partials/status.html, which the page
+   also includes: id="scan-btn", which the scan form's hx-disabled-elt names,
+   would be duplicated.  scan_disabled is a top-level assignment so
+   partials/status_response.html can import it rather than restate the rule.
+   autofocus applies only when the button is enabled, because a disabled
+   button cannot take focus. #}
+{% set scan_disabled = scan_blocked or (job and job.is_active) or lists_loading %}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
-        {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
-        {% if scan_blocked or (job and job.is_active) %}disabled{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
-    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
+        {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% elif lists_loading %}aria-describedby="scan-hold-reason"{% endif %}
+        {% if scan_disabled %}disabled{% endif %}{% if autofocus_scan and not scan_disabled %} autofocus{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
+    {{ (job.state if job and job.is_active else none) | scan_button_label }}
 </button>

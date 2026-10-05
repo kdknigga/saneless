@@ -1,6 +1,6 @@
 # Environment Variables
 
-All configuration can be set via environment variables, which override values from the TOML config file.
+All configuration can be set via environment variables. A set variable overrides the same setting in the TOML config file; see [Where saneless reads settings](configuration.md#where-saneless-reads-settings) for the full order.
 
 ## Naming Convention
 
@@ -11,14 +11,6 @@ SANELESS_{SECTION}__{FIELD}
 ```
 
 For example, `scanner.host` in TOML becomes `SANELESS_SCANNER__HOST`.
-
-## Priority Order
-
-Settings are resolved in this order (highest to lowest priority):
-
-1. Environment variables (`SANELESS_*`)
-2. TOML config file
-3. Built-in defaults
 
 ## Variable Reference
 
@@ -34,14 +26,14 @@ Settings are resolved in this order (highest to lowest priority):
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
 | `SANELESS_PAPERLESS__URL` | `paperless.url` | string | `http://paperless:8000` |
-| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `abc123def456` |
+| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `your-api-token-here` |
 | `SANELESS_PAPERLESS__CONSUME_DIR` | `paperless.consume_dir` | string | `/consume` |
 
 ### Output
 
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
-| `SANELESS_OUTPUT__TMP_DIR` | `output.tmp_dir` | string | `/tmp/saneless` |
+| `SANELESS_OUTPUT__TMP_DIR` | `output.tmp_dir` | string | `/tmp/saneless-1000` |
 | `SANELESS_OUTPUT__DATA_DIR` | `output.data_dir` | string | `/var/lib/saneless` |
 | `SANELESS_OUTPUT__LOG_FILE` | `output.log_file` | string | `/var/log/saneless.log` |
 | `SANELESS_OUTPUT__LOG_LEVEL` | `output.log_level` | string | `DEBUG` |
@@ -51,12 +43,14 @@ Settings are resolved in this order (highest to lowest priority):
 | `SANELESS_OUTPUT__HISTORY_MAX_ROWS` | `output.history_max_rows` | int | `500` |
 | `SANELESS_OUTPUT__PAPERLESS_TASK_TIMEOUT` | `output.paperless_task_timeout` | int | `300` |
 | `SANELESS_OUTPUT__PAPERLESS_CACHE_TTL_SECONDS` | `output.paperless_cache_ttl_seconds` | int | `60` |
-| `SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS` | `output.flip_timeout_seconds` | int | `600` |
+| `SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS` | `output.operator_wait_timeout_seconds` | int | `600` |
 | `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` | `output.min_free_space_mb` | int | `500` |
 | `SANELESS_OUTPUT__WEB_HOST` | `output.web_host` | string | `0.0.0.0` (the default: all network interfaces) |
 | `SANELESS_OUTPUT__WEB_PORT` | `output.web_port` | int | `8080` |
 
 `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` is the free disk space saneless keeps in reserve for assembling the PDF. It is checked twice: once before a scan starts, and again before each page is written to disk, against that page's size *plus* this reserve. A scan that runs out of room fails naming the page number and the path, and the pages already scanned are preserved. See [`[output]`](configuration.md#output) for every field in this section.
+
+`SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS` was renamed from `SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS`, with no alias: the old variable is rejected at startup like any other unknown `SANELESS_OUTPUT__` variable, and the error suggests `operator_wait_timeout_seconds`.
 
 ### Web
 
@@ -64,8 +58,21 @@ Settings are resolved in this order (highest to lowest priority):
 |----------|-------------|------|---------|
 | `SANELESS_WEB__SHOW_TAGS` | `web.show_tags` | bool | `false` |
 | `SANELESS_WEB__SHOW_CORRESPONDENT` | `web.show_correspondent` | bool | `false` |
+| `SANELESS_WEB__ALLOWED_HOSTS` | `web.allowed_hosts` | JSON list of strings | `'["scan.example.com", ".home.example"]'` |
 
-Both default to `true`. Setting one to `false` hides that control on the scan form; the profile's `default_tags` and `default_correspondent` still apply, so hiding a control changes the form and never the scan. The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
+The two `SHOW_*` variables default to `true`. Setting one to `false` hides that control on the scan form; the profile's `default_tags` and `default_correspondent` still apply, so hiding a control changes the form and never the scan.
+
+The allowed-hosts variable must be a JSON list, even for one name: `'["scan.example.com"]'`. A bare `scan.example.com` is not valid JSON and stops saneless starting. The names it lists are added to the ones saneless always answers to; see [Allowed host names](configuration.md#allowed-host-names).
+
+The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
+
+### JSON values
+
+A field that holds a list or a table -- `default_tags`, `allowed_hosts`, or a whole section such as `SANELESS_PAPERLESS` -- is read from its variable as JSON, for example `SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS='[3, 7]'`. A comma-separated `3,7` is not JSON, and neither is a bare `scan.example.com`: either stops saneless at startup with exit code 2. The error gives the variable a line of its own, naming it and never echoing its value, and the config file's own errors are still listed with it:
+
+```text
+environment variable 'SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS': must be JSON (a list or table is written as JSON, for example [3, 7])
+```
 
 ### Not a saneless variable: `TZ`
 
@@ -84,7 +91,7 @@ A container's clock reports UTC unless `TZ` is set, so **without it every one of
 | `SSL_CERT_FILE` | path | `/etc/ssl/certs/my-ca.crt` |
 | `SSL_CERT_DIR` | path | `/etc/ssl/my-ca-dir` |
 
-These are OpenSSL's own variables, not `SANELESS_` settings, and saneless never reads them -- the TLS layer beneath its HTTP client does. They name the certificate authorities to trust when saneless connects to paperless-ngx over `https://`, and they **replace** the operating system's trust store rather than adding to it: once either is set, the OS trust store is not consulted at all, so the file or directory you name must carry every CA saneless needs -- not just the private one. A container that sets `SSL_CERT_FILE` to a single private CA therefore trusts exactly that one CA, so a `paperless.url` that is publicly signed -- now, or later when it moves behind Let's Encrypt -- fails inside the container while working everywhere else. Their behaviour is unchanged: the previous HTTP client honoured them too. What changed is the default, which is now the operating system's trust store rather than a certificate bundle shipped inside a Python package. Set one of these only when your paperless-ngx certificate is signed by a private or corporate CA that is not installed on this machine; installing that CA into the OS trust store is the better fix wherever you can do it. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#paperless-errors-exit-3) describes the failure they resolve, under **TLS certificate not trusted**.
+These are OpenSSL's own variables, not `SANELESS_` settings, and saneless never reads them -- the TLS layer beneath its HTTP client does. They name the certificate authorities to trust when saneless connects to paperless-ngx over `https://`, and they **replace** the operating system's trust store rather than adding to it: once either is set, the OS trust store is not consulted at all, so the file or directory you name must carry every CA saneless needs -- not just the private one. A container that sets `SSL_CERT_FILE` to a single private CA therefore trusts exactly that one CA, so a `paperless.url` that is publicly signed -- today, or later when it moves behind Let's Encrypt -- fails inside the container while working everywhere else. With neither set, saneless trusts the operating system's trust store. Set one of these only when your paperless-ngx certificate is signed by a private or corporate CA that is not installed on this machine; installing that CA into the OS trust store is the better fix wherever you can do it. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#paperless-errors-exit-3) describes the failure they resolve, under **TLS certificate not trusted**.
 
 Prefer `SSL_CERT_FILE`. It takes a single PEM file and needs nothing else. `SSL_CERT_DIR` takes a directory and carries a trap: OpenSSL reads only files named `<8-hex-hash>.<n>` in it, so dropping a bare `.pem` into the directory fails exactly as if you had set nothing at all, with no diagnostic anywhere to tell you why. Run `c_rehash` over the directory, or make the link yourself with `ln -s my-ca.pem "$(openssl x509 -hash -noout -in my-ca.pem).0"`.
 
@@ -98,8 +105,10 @@ A path that does not exist, or one that is a directory where `SSL_CERT_FILE` exp
 
 - **saneless logs where its settings came from.** At startup it writes one INFO line naming the config file it loaded (or saying there was none) and the dotted names of the settings that came from environment variables, for example `paperless.url, paperless.token`. Names only, never values.
 
-- **Docker deployments** commonly use environment variables for `SANELESS_PAPERLESS__URL`, `SANELESS_PAPERLESS__TOKEN`, and `SANELESS_SCANNER__HOST` while mounting a TOML file for profile definitions.
+- **In a container**, keep the paperless-ngx URL and token in the mounted `saneless.toml` rather than in `SANELESS_PAPERLESS__URL` and `SANELESS_PAPERLESS__TOKEN`: a set variable silently overrides the file (see [Where saneless reads settings](configuration.md#where-saneless-reads-settings)), so a token left in the compose file goes on winning after you change the one in `saneless.toml`. `SANELESS_SCANNER__HOST` is the variable a container usually sets.
+
+- **A relative path follows the config file.** A relative `SANELESS_OUTPUT__TMP_DIR`, `SANELESS_OUTPUT__DATA_DIR`, `SANELESS_OUTPUT__LOG_FILE` or `SANELESS_PAPERLESS__CONSUME_DIR` is resolved against the directory of the config file that was loaded, exactly as the same value in the file would be, or against the working directory when no config file was loaded. The log and `saneless doctor` show the absolute result. See [`[output]`](configuration.md#output).
 
 - **Multiple scanner hosts** can be specified in `SANELESS_SCANNER__HOST` using colon separation: `192.168.1.50:192.168.1.51`.
 
-- **`SANELESS_OUTPUT__DATA_DIR` is durable state, `SANELESS_OUTPUT__TMP_DIR` is not.** `data_dir` holds the job database (`saneless.db`) and the `failed/` directory of scans that could not be delivered to paperless-ngx; it defaults to `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) and must survive restarts. `tmp_dir` is scratch space for the scan in progress and can be thrown away. The official container image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so you only need to set it yourself if you mount the volume somewhere else.
+- **`SANELESS_OUTPUT__DATA_DIR` is durable state, `SANELESS_OUTPUT__TMP_DIR` is not.** `data_dir` holds the job database (`saneless.db`) and the `failed/` directory of scans that could not be delivered to paperless-ngx; it defaults to `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) and must survive restarts. `tmp_dir` is scratch space for the scan in progress and can be thrown away. The official container image does not set this variable. It sets `XDG_STATE_HOME=/var/lib` instead, so inside the container `data_dir` defaults to `/var/lib/saneless`, the image's data volume, and you only need to set `SANELESS_OUTPUT__DATA_DIR` if you mount the volume somewhere else. Setting it still overrides that default, and `[output] data_dir` in `saneless.toml` with it.

@@ -1,0 +1,8 @@
+{# Which profile's defaults the control is showing, so start_scan can apply
+   the submitted profile's defaults when a submit lands before the control
+   followed a profile change.  The page renders a reserved value naming no
+   profile until the lazy list load answers; it is re-rendered out of band
+   only in the swap that replaces the control's defaults, never before.
+   autocomplete is off so form restore cannot bring back a value the server
+   did not render. #}
+<input type="hidden" id="{{ marker_id }}" name="{{ marker_name }}" value="{{ marker_profile }}" autocomplete="off"{% if oob %} hx-swap-oob="true"{% endif %}>

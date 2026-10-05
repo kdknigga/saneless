@@ -1,5 +1,5 @@
 """
-Pinning tests for the vendored htmx and Pico assets (ROBU-09).
+Pinning tests for the vendored htmx and Pico assets.
 
 The UI must work on a LAN with no internet, so htmx and Pico are served from the
 package under ``/static/vendor/`` and ``base.html`` carries a SHA-384 ``integrity``
@@ -8,19 +8,25 @@ tests recompute every hash from the files on disk and fail before a browser ever
 sees a mismatch, and they compare both the files and the attributes with the
 upstream digests pinned here, so a wrong build cannot pin itself.
 
-They also hold the 23.1 Pico coupling contract: only ``pico.min.css`` 2.1.1 is
+They also hold the app's coupling to Pico: only ``pico.min.css`` 2.1.1 is
 vendored, ``pico.colors.css`` is never used, ``<html>`` carries no ``data-theme``,
-and the ``--saneless-status-fallback`` block in ``app.css`` stays intact.
+and ``app.css`` gives ``--saneless-status-fallback`` a light and a dark value.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, override
 
+import jinja2
+import pytest
+from jinja2 import nodes
+
 from saneless.web.app import STATIC_DIR, TEMPLATE_DIR
+from tests.template_support import template_markup, template_start_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -37,7 +43,7 @@ PICO_BYTES = 83319
 # @picocss/pico 2.1.1, computed from each tarball after checking the tarball
 # against the registry's own sha512 ``dist.integrity``.  Written here by hand,
 # never from the vendored files, so a wrong or tampered build fails even when
-# its integrity attribute was regenerated to match it (IN-04).
+# its integrity attribute was regenerated to match it.
 UPSTREAM_SRI: dict[str, str] = {
     "/static/vendor/htmx-2.0.10.min.js": (
         "sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"
@@ -70,6 +76,87 @@ def _tags(path: Path) -> list[tuple[str, dict[str, str | None]]]:
     return collector.tags
 
 
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_DARK_SCHEME_MEDIA = "@media only screen and (prefers-color-scheme: dark)"
+
+
+def _stylesheet_rules(
+    css: str,
+) -> list[tuple[str | None, str, dict[str, str]]]:
+    """
+    Return every style rule of a stylesheet with the at-rule that encloses it.
+
+    Comments are removed first, so a comment may name any selector or property.
+    Each entry is the enclosing at-rule's prelude (``None`` at the top level),
+    the rule's selector and its declarations, all with whitespace collapsed.
+    """
+    rules: list[tuple[str | None, str, dict[str, str]]] = []
+    enclosing: list[str] = []
+    text = _CSS_COMMENT.sub("", css)
+    start = 0
+    for index, char in enumerate(text):
+        if index < start:
+            continue
+        if char == "{":
+            prelude = " ".join(text[start:index].split())
+            if prelude.startswith("@"):
+                enclosing.append(prelude)
+                start = index + 1
+            else:
+                body_end = text.index("}", index)
+                declarations: dict[str, str] = {}
+                for declaration in text[index + 1 : body_end].split(";"):
+                    if declaration.strip():
+                        prop, _, value = declaration.partition(":")
+                        declarations[prop.strip()] = " ".join(value.split())
+                rules.append(
+                    (enclosing[-1] if enclosing else None, prelude, declarations)
+                )
+                start = body_end + 1
+        elif char == "}":
+            if enclosing:
+                enclosing.pop()
+            start = index + 1
+    return rules
+
+
+_EXTERNAL_URL = re.compile(r"https?://", re.IGNORECASE)
+
+
+class _TextCollector(HTMLParser):
+    """Collect the text content of an HTML document, leaving comments out."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+
+    @override
+    def handle_data(self, data: str) -> None:
+        self.chunks.append(data)
+
+
+def _jinja_strings(source: str) -> list[str]:
+    """
+    Return every string constant written inside a template's Jinja syntax.
+
+    ``template_markup`` drops Jinja expressions and statements, string
+    literals included, so a URL held in ``{% set %}`` or ``{{ '...' }}`` is
+    only visible here.
+    """
+    tree = jinja2.Environment(autoescape=True).parse(source)
+    return [
+        node.value for node in tree.find_all(nodes.Const) if isinstance(node.value, str)
+    ]
+
+
+def _rendered_text(path: Path) -> str:
+    """Return the text a template's markup renders, without Jinja or comments."""
+    collector = _TextCollector()
+    collector.feed(template_markup(path.read_text(encoding="utf-8")))
+    collector.close()
+    return "".join(collector.chunks)
+
+
 def sri_sha384(data: bytes) -> str:
     """Return the Subresource Integrity string for ``data`` using SHA-384."""
     digest = hashlib.sha384(data).digest()
@@ -84,7 +171,7 @@ def _static_path(url: str) -> Path:
 
 
 def test_integrity_matches_vendored_bytes() -> None:
-    """Every integrity attribute in base.html equals sha384 of its file (ROBU-09)."""
+    """Every integrity attribute in base.html equals sha384 of its file."""
     pinned = [
         (attrs, attrs.get("integrity"))
         for _tag, attrs in _tags(BASE_HTML)
@@ -102,7 +189,7 @@ def test_integrity_matches_vendored_bytes() -> None:
 
 def test_vendored_files_and_integrity_match_the_upstream_builds() -> None:
     """
-    The files and base.html's integrity both equal the published digests (IN-04).
+    The files and base.html's integrity both equal the published digests.
 
     Matching each other is not enough: a wrong build with a regenerated
     integrity attribute would pass that check, so both are compared with the
@@ -127,13 +214,32 @@ def test_vendored_file_sizes() -> None:
 
 
 def test_templates_reference_no_external_url() -> None:
-    """No template contains an http:// or https:// URL, so no internet is needed."""
+    """No template renders an http:// or https:// URL, so no internet is needed."""
     templates = sorted(TEMPLATE_DIR.rglob("*.html"))
     assert templates
     for template in templates:
-        text = template.read_text(encoding="utf-8")
-        assert "http://" not in text, f"{template} references http://"
-        assert "https://" not in text, f"{template} references https://"
+        for tag, attrs in template_start_tags(template):
+            for name, value in attrs.items():
+                assert not _EXTERNAL_URL.search(value or ""), (
+                    f"{template}: <{tag} {name}={value!r}>"
+                )
+        text = _rendered_text(template)
+        assert not _EXTERNAL_URL.search(text), f"{template} renders an external URL"
+        for value in _jinja_strings(template.read_text(encoding="utf-8")):
+            assert not _EXTERNAL_URL.search(value), f"{template}: {value!r}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{% set cdn = "https://unpkg.com/htmx.org" %}<script src="{{ cdn }}">',
+        "<link href=\"{{ 'https://fonts.example/x.css' }}\">",
+    ],
+    ids=["set-statement", "expression"],
+)
+def test_the_jinja_string_reader_sees_a_url_in_jinja_syntax(source: str) -> None:
+    """A URL written inside Jinja syntax is one of the strings the check reads."""
+    assert any(_EXTERNAL_URL.search(value) for value in _jinja_strings(source))
 
 
 def test_licence_notices_present() -> None:
@@ -145,7 +251,7 @@ def test_licence_notices_present() -> None:
 
 
 def test_no_pico_colors_anywhere() -> None:
-    """pico.colors.css is neither vendored nor referenced (23.1 coupling contract)."""
+    """pico.colors.css is neither vendored nor referenced; only pico.min.css is used."""
     for root in (STATIC_DIR, TEMPLATE_DIR):
         for path in root.rglob("*"):
             assert "pico.colors" not in path.name, f"{path} is a pico.colors file"
@@ -156,19 +262,43 @@ def test_no_pico_colors_anywhere() -> None:
 
 
 def test_html_tag_has_no_data_theme() -> None:
-    """The <html> tag in base.html carries no data-theme (23.1 coupling contract)."""
+    """The <html> tag carries no data-theme, so dark mode follows the OS preference."""
     html_tags = [attrs for tag, attrs in _tags(BASE_HTML) if tag == "html"]
     assert len(html_tags) == 1
     assert "data-theme" not in html_tags[0]
 
 
 def test_app_css_status_fallback_block_intact() -> None:
-    """app.css keeps the --saneless-status-fallback light/dark block (23.1)."""
-    css = APP_CSS.read_text(encoding="utf-8")
-    assert "--saneless-status-fallback" in css
-    assert "@media only screen and (prefers-color-scheme: dark)" in css
-    assert '[data-theme="dark"]' in css
-    assert "--pico-color-" not in css
+    """
+    app.css gives the fallback amber a light value and a dark-scheme value.
+
+    The light value sits on the top-level ``:root`` and the dark one on ``:root``
+    inside the ``prefers-color-scheme: dark`` query. No rule selects on
+    ``data-theme``, and nothing reads Pico's ``pico.colors`` palette tokens.
+    """
+    rules = _stylesheet_rules(APP_CSS.read_text(encoding="utf-8"))
+    light = [
+        declarations
+        for at_rule, selector, declarations in rules
+        if at_rule is None and selector == ":root"
+    ]
+    dark = [
+        declarations
+        for at_rule, selector, declarations in rules
+        if at_rule == _DARK_SCHEME_MEDIA and selector == ":root"
+    ]
+    assert len(light) == 1, light
+    assert len(dark) == 1, dark
+    assert light[0].get("--saneless-status-fallback")
+    assert dark[0].get("--saneless-status-fallback")
+    assert (
+        dark[0]["--saneless-status-fallback"]
+        != (light[0]["--saneless-status-fallback"])
+    )
+    for at_rule, selector, declarations in rules:
+        assert "data-theme" not in selector, f"{selector} ({at_rule})"
+        assert not any(prop.startswith("--pico-color-") for prop in declarations)
+        assert not any("--pico-color-" in value for value in declarations.values())
 
 
 def test_base_html_has_no_crossorigin() -> None:

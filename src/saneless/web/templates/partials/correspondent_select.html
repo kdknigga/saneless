@@ -1,0 +1,24 @@
+{# The select is its profile-change swap's outerHTML target, so it is rendered
+   here, and it stays the element directly before its help line with no
+   wrapper between them.  It names its own hx-target and hx-swap so it never
+   inherits the scan form's.  The answer replaces the choice with the new
+   profile's default on purpose.  autocomplete is off so a browser's form
+   restore cannot choose other than the server rendered.  The marker comes
+   first and the help line after the select, so the select is the one element
+   left for the main swap.  list_oob is not named oob, which the marker and the
+   help line read. #}
+{% if follows_profile %}{% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
+<select name="correspondent" id="correspondent-select"{% if list_oob %} hx-swap-oob="true"{% endif %}
+        aria-describedby="correspondent-help"
+        autocomplete="off"
+        hx-get="/api/profiles/correspondent"
+        hx-trigger="change from:#profile-select"
+        hx-include="#profile-select"
+        hx-target="this"
+        hx-swap="outerHTML">
+    {% with help_elsewhere = true %}{% include "partials/correspondents.html" %}{% endwith %}
+</select>
+{# Out of band, so the help line says whether this list could be loaded;
+   the page renders it in place instead (help_elsewhere).  oob is scoped to
+   this include so the profile marker above never reads it. #}
+{% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}

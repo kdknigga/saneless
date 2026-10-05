@@ -1,19 +1,30 @@
-"""Tests for the page-record contract and the page spool (HARD-01, M-08)."""
+"""The page-record contract and the spool that writes each page to disk."""
 
 from __future__ import annotations
 
 import base64
 import dataclasses
+import errno
+import logging
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 from PIL import Image, ImageDraw
-from PIL.ImageStat import Stat
 
-from saneless.exceptions import ScanError
+import saneless.spool as spool_module
+from saneless.exceptions import (
+    DiskSpaceError,
+    ScanError,
+    ScanInterrupted,
+    SpoolError,
+)
+from saneless.pages import InkMeasurement, measure_ink
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
+from saneless.vocabulary import ErrorCategory, classify_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,12 +35,12 @@ _IMPOSSIBLE_RESERVE_MB = 1_000_000_000
 
 
 def _white_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
-    """Return a pure-white page: greyscale mean 255.0, stddev 0.0."""
+    """Return a pure-white page: no ink anywhere on it."""
     return Image.new("RGB", size, "white")
 
 
 def _inked_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
-    """Return a page with dark content, so its stddev is far from zero."""
+    """Return a page with dark content, so most of its inset is ink."""
     image = Image.new("RGB", size, "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((10, 10, size[0] - 10, size[1] - 10), fill="black")
@@ -37,15 +48,23 @@ def _inked_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
 
 
 class TestPageRecordContract:
-    """The frozen record of facts a spooled page yields (D-02)."""
+    """The frozen record of facts a spooled page yields."""
 
     def test_fields_are_exactly_the_contract(self) -> None:
-        """PageRecord carries the six agreed fields, in the agreed order."""
+        """PageRecord carries the seven agreed fields, in the agreed order."""
         names = [field.name for field in dataclasses.fields(PageRecord)]
-        assert names == ["sequence", "path", "size", "mode", "mean", "stddev"]
+        assert names == [
+            "sequence",
+            "path",
+            "size",
+            "mode",
+            "dpi",
+            "ink_coverage",
+            "paper_white",
+        ]
 
     def test_carries_no_verdict_field(self) -> None:
-        """No is_blank/is_empty flag: verdicts belong to the pipeline (D-02)."""
+        """No is_blank/is_empty flag: verdicts belong to the pipeline."""
         names = {field.name for field in dataclasses.fields(PageRecord)}
         assert "is_blank" not in names
         assert "is_empty" not in names
@@ -57,8 +76,9 @@ class TestPageRecordContract:
             path=Path("a-0001.png"),
             size=(200, 300),
             mode="RGB",
-            mean=255.0,
-            stddev=0.0,
+            dpi=300,
+            ink_coverage=0.0,
+            paper_white=255,
         )
         # Through setattr with the name in a variable, because a plain
         # ``record.sequence = 2`` is a static error both type checkers report,
@@ -68,20 +88,21 @@ class TestPageRecordContract:
             setattr(record, attribute, 2)
 
     def test_sequence_is_one_based(self) -> None:
-        """The first page's sequence is 1, not 0 (D-02)."""
+        """The first page's sequence is 1, not 0."""
         record = PageRecord(
             sequence=1,
             path=Path("a-0001.png"),
             size=(200, 300),
             mode="RGB",
-            mean=255.0,
-            stddev=0.0,
+            dpi=300,
+            ink_coverage=0.0,
+            paper_white=255,
         )
         assert record.sequence == 1
 
 
 class TestPageSinkContract:
-    """The seam the backend hands each acquired page to (D-01)."""
+    """The seam the backend hands each acquired page to."""
 
     def test_is_abstract(self) -> None:
         """PageSink cannot be instantiated: it declares a contract only."""
@@ -100,30 +121,32 @@ class TestPageSinkContract:
         class _RecordingSink(PageSink):
             """A sink that records nothing to disk, for the contract test."""
 
-            def add(self, image: Image.Image) -> PageRecord:
+            def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
                 """Return a record describing ``image`` without writing it."""
                 return PageRecord(
                     sequence=1,
                     path=Path("a-0001.png"),
                     size=image.size,
                     mode=image.mode,
-                    mean=255.0,
-                    stddev=0.0,
+                    dpi=dpi,
+                    ink_coverage=0.0,
+                    paper_white=255,
                 )
 
         sink = _RecordingSink()
-        record = sink.add(Image.new("RGB", (200, 300), "white"))
+        record = sink.add(Image.new("RGB", (200, 300), "white"), dpi=300)
         assert record.size == (200, 300)
         assert record.mode == "RGB"
+        assert record.dpi == 300
 
 
 class TestSpooledPageSinkNaming:
-    """Sequence assignment and pass-distinguishable file names (D-02)."""
+    """Sequence assignment and pass-distinguishable file names."""
 
     def test_first_page_is_sequence_one(self, tmp_path: Path) -> None:
         """The first add() assigns sequence 1 and writes a-0001.png."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(_white_page())
+        record = sink.add(_white_page(), dpi=300)
         assert record.sequence == 1
         assert record.path == tmp_path / "a-0001.png"
         assert record.path.is_file()
@@ -131,8 +154,8 @@ class TestSpooledPageSinkNaming:
     def test_second_page_increments(self, tmp_path: Path) -> None:
         """The second add() assigns sequence 2 and writes a-0002.png."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        sink.add(_white_page())
-        second = sink.add(_inked_page())
+        sink.add(_white_page(), dpi=300)
+        second = sink.add(_inked_page(), dpi=300)
         assert second.sequence == 2
         assert second.path == tmp_path / "a-0002.png"
         assert second.path.is_file()
@@ -141,8 +164,8 @@ class TestSpooledPageSinkNaming:
         """The records property returns every record so far, in order."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         assert sink.records == ()
-        first = sink.add(_white_page())
-        second = sink.add(_inked_page())
+        first = sink.add(_white_page(), dpi=300)
+        second = sink.add(_inked_page(), dpi=300)
         assert sink.records == (first, second)
         assert isinstance(sink.records, tuple)
 
@@ -152,8 +175,8 @@ class TestSpooledPageSinkNaming:
         """A pass-B sink writes b-0001.png beside pass A's a-0001.png."""
         pass_a = SpooledPageSink(tmp_path, "a", 10)
         pass_b = SpooledPageSink(tmp_path, "b", 10)
-        pass_a.add(_white_page())
-        record = pass_b.add(_inked_page())
+        pass_a.add(_white_page(), dpi=300)
+        record = pass_b.add(_inked_page(), dpi=300)
         assert record.path == tmp_path / "b-0001.png"
         assert sorted(path.name for path in tmp_path.iterdir()) == [
             "a-0001.png",
@@ -168,7 +191,7 @@ class TestSpooledPageSinkWrite:
         """The spooled file reopens as a PNG at the same size and mode."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         image = _inked_page((150, 220))
-        record = sink.add(image)
+        record = sink.add(image, dpi=300)
         with Image.open(record.path) as reopened:
             assert reopened.format == "PNG"
             assert reopened.size == image.size
@@ -178,50 +201,82 @@ class TestSpooledPageSinkWrite:
         """The record's size and mode are the image's own, not the file's."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         image = _inked_page((150, 220))
-        record = sink.add(image)
+        record = sink.add(image, dpi=300)
         assert record.size == (150, 220)
         assert record.mode == "RGB"
 
 
-class TestSpooledPageSinkStatistics:
-    """Greyscale statistics, measured once at spool time (D-02, D-06)."""
+class TestSpooledPageSinkMeasurement:
+    """The ink measurement, made once at spool time by ``pages.measure_ink``."""
 
-    def test_white_page_statistics(self, tmp_path: Path) -> None:
-        """A pure-white page has mean 255.0 and stddev 0.0."""
+    def test_white_page_measures_no_ink(self, tmp_path: Path) -> None:
+        """A pure-white page records ``measure_ink``'s answer: no ink at all."""
+        page = _white_page()
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(_white_page())
-        assert record.mean == 255.0
-        assert record.stddev == 0.0
+        record = sink.add(page, dpi=300)
+        assert (record.ink_coverage, record.paper_white) == tuple(measure_ink(page))
+        assert record.ink_coverage == 0.0
 
-    def test_inked_page_statistics_match_pillow(self, tmp_path: Path) -> None:
-        """mean/stddev equal Stat(image.convert("L")) for an inked page."""
+    def test_inked_page_measurement_matches_measure_ink(self, tmp_path: Path) -> None:
+        """The coverage and paper white equal ``measure_ink`` of the same page."""
         image = _inked_page()
-        expected = Stat(image.convert("L"))
+        expected = measure_ink(image)
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(image)
-        assert record.mean == pytest.approx(expected.mean[0])
-        assert record.stddev == pytest.approx(expected.stddev[0])
-        assert record.stddev > 0.0
+        record = sink.add(image, dpi=300)
+        assert record.ink_coverage == expected.coverage
+        assert record.paper_white == expected.paper_white
+        assert record.ink_coverage > 0.0
+
+    def test_the_record_carries_no_greyscale_statistics(self, tmp_path: Path) -> None:
+        """The record carries no mean or stddev greyscale statistics."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(_inked_page(), dpi=300)
+        assert not hasattr(record, "mean")
+        assert not hasattr(record, "stddev")
+
+    def test_each_page_is_measured_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One ``measure_ink`` call per page, on the page as it was spooled."""
+        measured: list[str] = []
+
+        def counting(image: Image.Image) -> InkMeasurement:
+            measured.append(image.mode)
+            return measure_ink(image)
+
+        monkeypatch.setattr(spool_module, "measure_ink", counting)
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_white_page().convert("RGBA"), dpi=300)
+
+        assert measured == ["RGB", "RGB"]
+
+    def test_a_converted_page_is_measured_as_written(self, tmp_path: Path) -> None:
+        """An RGBA page is measured after its conversion, as the RGB page it became."""
+        image = _inked_page()
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(image.convert("RGBA"), dpi=300)
+        assert (record.ink_coverage, record.paper_white) == tuple(measure_ink(image))
 
 
 class TestSpooledPageSinkThumbnail:
-    """The first page's thumbnail fires at spool time, once (D-05)."""
+    """The first page's thumbnail fires at spool time, once."""
 
     def test_fires_once_on_the_first_page_only(self, tmp_path: Path) -> None:
         """Three pages produce exactly one thumbnail, from page 1."""
         thumbnails: list[str] = []
         sink = SpooledPageSink(tmp_path, "a", 10, thumbnails.append)
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
         assert len(thumbnails) == 1
-        sink.add(_inked_page())
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_inked_page(), dpi=300)
         assert len(thumbnails) == 1
 
     def test_thumbnail_is_non_empty_ascii_base64(self, tmp_path: Path) -> None:
         """The callback receives a decodable base64 ASCII JPEG string."""
         thumbnails: list[str] = []
         sink = SpooledPageSink(tmp_path, "a", 10, thumbnails.append)
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
         encoded = thumbnails[0]
         assert encoded
         assert encoded.isascii()
@@ -230,27 +285,21 @@ class TestSpooledPageSinkThumbnail:
     def test_no_callback_never_raises(self, tmp_path: Path) -> None:
         """A sink built without a callback spools pages normally."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        sink.add(_inked_page())
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_inked_page(), dpi=300)
         assert len(sink.records) == 2
 
     def test_a_raising_thumbnail_callback_still_records_the_page(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        A failed thumbnail cannot unsee a page that is already on disk (WR-01).
+        A failed thumbnail is logged, and the page and the pass carry on.
 
-        The callback is deliberately not wrapped -- a blank thumbnail strip is
-        a silence this project does not want -- but the record has to be
-        appended before it fires.  The web worker's callback writes to the job
-        store, which raises ``sqlite3.Error`` on a locked or closed database,
-        and the page it was describing is a sheet that really was fed.  With
-        the record appended afterwards, ``page_count()`` answered 0 and the
-        partial-scan guard took its "nothing reached the spool" branch, so the
-        workspace deleted the sheet on its way out.
-
-        The assertion on the file, not only on the record, is the part that
-        matters: what is being pinned is that the two agree.
+        The web worker's callback writes to the job store, which raises
+        ``sqlite3.Error`` on a locked or closed database; the page it was
+        describing is a sheet that really was fed.  The thumbnail is something
+        to look at, not part of the scan, so its failure is logged at WARNING
+        with the traceback, and the record and the file on disk still agree.
         """
         thumbnails: list[str] = []
 
@@ -261,27 +310,38 @@ class TestSpooledPageSinkThumbnail:
 
         sink = SpooledPageSink(tmp_path, "a", 10, explode)
 
-        with pytest.raises(OSError, match="the job store was closed"):
-            sink.add(_inked_page())
+        with caplog.at_level(logging.WARNING, logger="saneless.spool"):
+            record = sink.add(_inked_page(), dpi=300)
+            sink.add(_inked_page(), dpi=300)
 
         assert len(thumbnails) == 1
-        assert len(sink.records) == 1
-        assert sink.records[0].sequence == 1
-        assert sink.records[0].path == tmp_path / "a-0001.png"
-        assert sink.records[0].path.stat().st_size > 0
+        assert len(sink.records) == 2
+        assert record == sink.records[0]
+        assert record.sequence == 1
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.stat().st_size > 0
+        warnings = [
+            entry
+            for entry in caplog.records
+            if entry.name == "saneless.spool" and entry.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is not None
+        assert "the job store was closed" in str(warnings[0].exc_info[1])
 
 
 class TestSpooledPageSinkFailures:
-    """No raw OSError escapes, and a shortfall names the page (D-07)."""
+    """No raw OSError escapes, and a shortfall names the page."""
 
-    def test_disk_shortfall_raises_scan_error_naming_the_page(
+    def test_disk_shortfall_raises_disk_space_error_naming_the_page(
         self, tmp_path: Path
     ) -> None:
         """A per-page shortfall names the page, the path and the config key."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
-        with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(_white_page(), dpi=300)
         message = str(excinfo.value)
+        assert message.startswith("Insufficient disk space for page 1: ")
         assert "page 1" in message
         assert str(tmp_path / "a-0001.png") in message
         assert "configure min_free_space_mb to adjust" in message
@@ -289,8 +349,8 @@ class TestSpooledPageSinkFailures:
     def test_disk_shortfall_leaves_no_partial_file(self, tmp_path: Path) -> None:
         """Nothing is written when the page could not have fitted."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
-        with pytest.raises(ScanError):
-            sink.add(_white_page())
+        with pytest.raises(DiskSpaceError):
+            sink.add(_white_page(), dpi=300)
         assert list(tmp_path.iterdir()) == []
         assert sink.records == ()
 
@@ -302,7 +362,7 @@ class TestSpooledPageSinkFailures:
         blocked.write_text("not a directory")
         sink = SpooledPageSink(blocked, "a", 0)
         with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
         message = str(excinfo.value)
         assert "page 1" in message
         assert str(blocked / "a-0001.png") in message
@@ -315,18 +375,10 @@ class TestSpooledPageSinkFailures:
         """
         A spool directory that has gone is a disk fault, not a scanner one.
 
-        ``add``'s docstring promises "no raw OSError escapes this method"
-        (D-07), and ``_write`` honoured it while ``_check_room_for`` did not:
         ``shutil.disk_usage`` on a directory whose mount went away raises
-        ``FileNotFoundError``.  Untranslated it escaped past
-        ``_acquire_pages``' ``except ScanError`` ladder into its generic
-        handler, where it came back as "Scanner error on page N" -- blaming
-        the scanner for a disk fault -- and on the flatbed path it escaped
-        untranslated altogether (WR-11).
-
-        The directory is removed after the sink is built, so the failure is
-        the one production sees: a spool that existed when the scan started
-        and did not when the page arrived.
+        ``FileNotFoundError``; ``add`` turns it into a chained ``ScanError``
+        naming the page.  The directory is removed after the sink is built: a
+        spool that existed when the scan started and not when the page arrived.
         """
         spool = tmp_path / "spool"
         spool.mkdir()
@@ -334,10 +386,513 @@ class TestSpooledPageSinkFailures:
         spool.rmdir()
 
         with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
 
         message = str(excinfo.value)
         assert "Could not measure free space for page 1" in message
         assert str(spool) in message
         assert isinstance(excinfo.value.__cause__, OSError)
         assert sink.records == ()
+
+
+class TestSpoolErrorSeparatesTheDiskFromTheScanner:
+    """
+    A full disk is a ``DiskSpaceError``; any other disk fault is a ``SpoolError``.
+
+    A ``DiskSpaceError`` is not a ``ScanError`` at all, so it files as
+    ``DISK_SPACE`` and exits 10.  A ``SpoolError`` -- a write that failed for
+    another reason, or a spool whose free space cannot be measured -- is still
+    a ``ScanError``, so it keeps the ``SCANNER`` category and its exit code,
+    while a caller that must treat a failing disk differently from a device
+    fault can test for it exactly.  A scanner-delivered fault is neither.
+    """
+
+    @staticmethod
+    def _assert_a_full_disk(error: BaseException, text: str) -> None:
+        """
+        Check that ``error`` is a full disk, filed as disk space.
+
+        Args:
+            error: What the sink raised.
+            text: The part of the message that says which refusal it was.
+
+        """
+        assert isinstance(error, DiskSpaceError)
+        assert not isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert text in str(error)
+
+    @staticmethod
+    def _assert_a_disk_refusal(error: ScanError, text: str) -> None:
+        """
+        Check that ``error`` is a disk refusal that still files as a scanner one.
+
+        Args:
+            error: What the sink raised.
+            text: The part of the message that says which refusal it was.
+
+        """
+        assert isinstance(error, SpoolError)
+        assert isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.SCANNER
+        assert text in str(error)
+
+    def test_a_shortfall_is_a_disk_space_error(self, tmp_path: Path) -> None:
+        """Too little free space for the page is a full disk, not the scanner."""
+        sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_full_disk(excinfo.value, "Insufficient disk space")
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    def test_an_out_of_space_write_is_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        """
+        A write the disk ran out of room for is a full disk, cleaned up.
+
+        The room check passes here -- the disk filled between the check and
+        the write, or a quota ran out -- so it is the write's own errno that
+        says what happened.
+        """
+
+        def full_disk_save(_image: Image.Image, fp: Path, **_params: object) -> None:
+            Path(fp).write_bytes(b"\x89PNG half a page")
+            raise OSError(code, os.strerror(code))
+
+        monkeypatch.setattr(Image.Image, "save", full_disk_save)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(_inked_page(), dpi=300)
+
+        self._assert_a_full_disk(excinfo.value, "Could not write page 1")
+        assert str(tmp_path / "a-0001.png") in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert excinfo.value.__cause__.errno == code
+        assert list(tmp_path.iterdir()) == []
+        assert sink.records == ()
+
+    def test_an_io_error_write_is_not_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that failed for another reason stays a spool write error."""
+
+        def failing_save(_image: Image.Image, fp: Path, **_params: object) -> None:
+            Path(fp).write_bytes(b"\x89PNG half a page")
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(Image.Image, "save", failing_save)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_inked_page(), dpi=300)
+
+        self._assert_a_disk_refusal(excinfo.value, "Could not write page 1")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_unmeasurable_spool_is_not_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Free space that cannot be read says nothing about how much there is."""
+
+        def vanished(path: object) -> NoReturn:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", vanished)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Could not measure free space")
+
+    def test_an_unmeasurable_directory_is_a_spool_error(self, tmp_path: Path) -> None:
+        """Free space that cannot be measured is a disk refusal."""
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        sink = SpooledPageSink(spool, "a", 0)
+        spool.rmdir()
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Could not measure free space")
+
+    def test_a_failed_write_is_a_spool_error(self, tmp_path: Path) -> None:
+        """A page that could not be written is a disk refusal."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory")
+        sink = SpooledPageSink(blocked, "a", 0)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Could not write page")
+
+    def test_an_unsupported_image_mode_is_not_a_spool_error(
+        self, tmp_path: Path
+    ) -> None:
+        """The scanner delivered a page saneless cannot store: a scanner fault."""
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(Image.new("CMYK", (40, 60)), dpi=300)
+        assert not isinstance(excinfo.value, SpoolError)
+        assert classify_error(excinfo.value) is ErrorCategory.SCANNER
+
+
+# The modes a SANE snap produces, spooled exactly as they arrive.
+_KEPT_MODES = ["1", "L", "RGB"]
+
+# Modes the thumbnail or the PNG write mishandle, and what each becomes.
+_CONVERTED_MODES = [
+    ("LA", "L"),
+    ("RGBA", "RGB"),
+    ("RGBX", "RGB"),
+    ("P", "RGB"),
+    ("PA", "RGB"),
+]
+
+# The 16-bit greyscale layouts, scaled down to 8 bits rather than clipped.
+_SIXTEEN_BIT_MODES = ["I;16", "I;16B", "I;16L"]
+
+# Modes with no honest 8-bit page reading: refused, never guessed at.
+_REFUSED_MODES = ["I", "F", "CMYK", "YCbCr", "LAB", "HSV"]
+
+# Mid-grey in 16 bits: 0x8080, which is 128 once scaled by 1/256.  A clip to
+# 8 bits would turn it into 255, which is white.
+_SIXTEEN_BIT_MID_GREY = 32896
+
+
+def _no_free_space(_path: object) -> SimpleNamespace:
+    """
+    Stand in for ``shutil.disk_usage`` on a disk with nothing free.
+
+    Returns:
+        An object with the one attribute the spool reads, ``free``, at zero.
+
+    """
+    return SimpleNamespace(total=0, used=0, free=0)
+
+
+class TestSpooledPageSinkDpi:
+    """Each page carries the resolution the device read back."""
+
+    @pytest.mark.parametrize("dpi", [150, 300, 600])
+    def test_the_record_carries_the_dpi_it_was_given(
+        self, tmp_path: Path, dpi: int
+    ) -> None:
+        """``add(image, dpi=N)`` returns a record whose ``dpi`` is N."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(_inked_page(), dpi=dpi)
+        assert record.dpi == dpi
+
+    @pytest.mark.parametrize("dpi", [150, 300, 600])
+    def test_the_spooled_png_records_its_dpi(self, tmp_path: Path, dpi: int) -> None:
+        """
+        The PNG's pHYs chunk carries the dpi, so a sweep can read it back.
+
+        Rounded: PNG stores pixels per metre as an integer, so 300 reads back
+        as 299.9994.
+        """
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(_inked_page(), dpi=dpi)
+        with Image.open(record.path) as reopened:
+            x_dpi, y_dpi = reopened.info["dpi"]
+        assert round(x_dpi) == dpi
+        assert round(y_dpi) == dpi
+
+
+class TestSpooledPageSinkModes:
+    """Every page mode is kept, converted or refused, never mishandled."""
+
+    @pytest.mark.parametrize("mode", _KEPT_MODES)
+    def test_a_sane_mode_is_stored_unchanged(self, tmp_path: Path, mode: str) -> None:
+        """``1``, ``L`` and ``RGB`` are spooled as they arrive."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(Image.new(mode, (40, 60)), dpi=300)
+        assert record.mode == mode
+        with Image.open(record.path) as reopened:
+            assert reopened.mode == mode
+
+    @pytest.mark.parametrize(("mode", "stored"), _CONVERTED_MODES)
+    def test_a_convertible_mode_is_stored_converted(
+        self, tmp_path: Path, mode: str, stored: str
+    ) -> None:
+        """Alpha, padding and palettes are converted to ``L`` or ``RGB``."""
+        thumbnails: list[str] = []
+        sink = SpooledPageSink(tmp_path, "a", 10, thumbnails.append)
+        record = sink.add(Image.new(mode, (40, 60)), dpi=300)
+        assert record.mode == stored
+        assert record.size == (40, 60)
+        with Image.open(record.path) as reopened:
+            assert reopened.mode == stored
+        # The thumbnail is made from the converted page, so it is made at all.
+        assert len(thumbnails) == 1
+
+    def test_an_rgba_page_keeps_its_colour(self, tmp_path: Path) -> None:
+        """Dropping the alpha band keeps the colour bands as they were."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(Image.new("RGBA", (40, 60), (10, 20, 30, 40)), dpi=300)
+        with Image.open(record.path) as reopened:
+            assert reopened.getpixel((0, 0)) == (10, 20, 30)
+
+    @pytest.mark.parametrize("mode", _SIXTEEN_BIT_MODES)
+    def test_a_sixteen_bit_page_is_scaled_not_clipped(
+        self, tmp_path: Path, mode: str
+    ) -> None:
+        """16-bit mid-grey is stored as 8-bit mid-grey, 128, and not as 255."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(Image.new(mode, (40, 60), _SIXTEEN_BIT_MID_GREY), dpi=300)
+        assert record.mode == "L"
+        with Image.open(record.path) as reopened:
+            assert reopened.mode == "L"
+            assert reopened.getpixel((0, 0)) == 128
+
+    @pytest.mark.parametrize("mode", _REFUSED_MODES)
+    def test_an_unsupported_mode_is_refused_by_name(
+        self, tmp_path: Path, mode: str
+    ) -> None:
+        """The refusal is a ScanError naming the mode, and nothing is written."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(Image.new(mode, (40, 60)), dpi=300)
+        assert repr(mode) in str(excinfo.value)
+        assert "page 1" in str(excinfo.value)
+        assert list(tmp_path.iterdir()) == []
+        assert sink.records == ()
+
+    @pytest.mark.parametrize("mode", _REFUSED_MODES)
+    def test_the_refusal_comes_before_the_room_check(
+        self, tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a full disk a refused mode is still reported as the mode."""
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", _no_free_space)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(Image.new(mode, (40, 60)), dpi=300)
+        assert repr(mode) in str(excinfo.value)
+        assert "Insufficient disk space" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ("mode", "size", "required_mb"),
+        [
+            # Four bands arrive and three are written: 3 MB, not 4.
+            ("RGBA", (1000, 1000), 3),
+            # Two bytes a pixel arrive and one is written: 2 MB, not 4.
+            ("I;16", (2000, 1000), 2),
+        ],
+    )
+    def test_the_room_estimate_is_of_the_normalised_page(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: str,
+        size: tuple[int, int],
+        required_mb: int,
+    ) -> None:
+        """The estimate counts what the page will be, not what it arrived as."""
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", _no_free_space)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(Image.new(mode, size), dpi=300)
+        assert f"{required_mb} MB required" in str(excinfo.value)
+
+    def test_page_megabytes_are_decimal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A page of 1,040,000 bytes needs 2 MB: a megabyte is 10**6 bytes.
+
+        Counted in binary megabytes it would fit in one, and the message
+        would disagree with the ``min_free_space_mb`` it names.
+        """
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", _no_free_space)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(Image.new("L", (1040, 1000)), dpi=300)
+        assert "2 MB required" in str(excinfo.value)
+
+    def test_free_space_is_counted_in_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Exactly 10**6 bytes free is room for a page of exactly 10**6 bytes.
+
+        Counted in binary megabytes the free space rounds down to nothing and
+        the page is refused.
+        """
+        monkeypatch.setattr(
+            "saneless.spool.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=10**6),
+        )
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        record = sink.add(Image.new("L", (1000, 1000)), dpi=300)
+        assert record.path.exists()
+
+
+class TestSpooledPageSinkAtomicWrite:
+    """A page is whole on disk or absent, never truncated."""
+
+    def test_the_png_does_not_exist_while_it_is_being_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The save writes a ``.part`` file; the page's own name appears only after.
+
+        Observed from inside a wrapped ``Image.save``, so the claim is about
+        the moment of writing and not only about what is left afterwards.
+        """
+        original_save = Image.Image.save
+        final = tmp_path / "a-0001.png"
+        targets: list[str] = []
+        final_existed: list[bool] = []
+
+        def watching_save(image: Image.Image, fp: Path, **params: object) -> None:
+            targets.append(str(fp))
+            final_existed.append(final.exists())
+            # Narrowed rather than forwarded blind: ``format`` is the one
+            # parameter ``save`` types, and the spool always names it.
+            image_format = params.pop("format")
+            assert isinstance(image_format, str)
+            original_save(image, fp, image_format, **params)
+
+        monkeypatch.setattr(Image.Image, "save", watching_save)
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(_inked_page(), dpi=300)
+
+        assert targets == [str(tmp_path / "a-0001.png.part")]
+        assert final_existed == [False]
+        assert record.path == final
+        assert final.is_file()
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["a-0001.png"]
+
+    def test_a_failed_write_leaves_neither_the_page_nor_its_part(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that dies half way is cleaned up under both names."""
+
+        def half_a_save(_image: Image.Image, fp: Path, **_params: object) -> None:
+            Path(fp).write_bytes(b"\x89PNG half a page")
+            msg = "No space left on device"
+            raise OSError(msg)
+
+        monkeypatch.setattr(Image.Image, "save", half_a_save)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(_inked_page(), dpi=300)
+
+        assert "No space left on device" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert list(tmp_path.iterdir()) == []
+        assert sink.records == ()
+
+
+class TestSpooledPageSinkInterruption:
+    """A page on disk is always a recorded page, whatever lands mid-way."""
+
+    def test_an_interrupted_write_is_finished_and_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A signal in the middle of the write still leaves the page recorded.
+
+        The sheet has left the feeder, so its image is the only copy: the
+        write is finished before the interruption goes on.
+        """
+        real_write = SpooledPageSink._write
+        calls: list[int] = []
+
+        def interrupted_once(
+            sink: SpooledPageSink,
+            image: Image.Image,
+            sequence: int,
+            png_path: Path,
+            dpi: int,
+        ) -> None:
+            calls.append(sequence)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGTERM"
+                raise ScanInterrupted(msg, signum=15)
+            real_write(sink, image, sequence, png_path, dpi)
+
+        monkeypatch.setattr(SpooledPageSink, "_write", interrupted_once)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        (record,) = sink.records
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.is_file()
+
+    @pytest.mark.parametrize("step", ["normalising", "checking for room", "measuring"])
+    def test_an_interruption_before_the_write_still_spools_the_page(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str
+    ) -> None:
+        """
+        A signal while the page is prepared still leaves it written and recorded.
+
+        The sheet has left the feeder by the time the page reaches the sink,
+        so every step before the write is as much a part of keeping its only
+        copy as the write itself.
+        """
+        calls: list[str] = []
+
+        def interrupt_once() -> None:
+            calls.append(step)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGHUP"
+                raise ScanInterrupted(msg, signum=1)
+
+        real_normalise = spool_module._normalise_mode
+        real_check = SpooledPageSink._check_room_for
+
+        def normalise(image: Image.Image, sequence: int) -> Image.Image:
+            interrupt_once()
+            return real_normalise(image, sequence)
+
+        def check_room_for(
+            sink: SpooledPageSink, image: Image.Image, sequence: int, png_path: Path
+        ) -> None:
+            interrupt_once()
+            real_check(sink, image, sequence, png_path)
+
+        def measure(image: Image.Image) -> InkMeasurement:
+            interrupt_once()
+            return measure_ink(image)
+
+        if step == "normalising":
+            monkeypatch.setattr(spool_module, "_normalise_mode", normalise)
+        elif step == "checking for room":
+            monkeypatch.setattr(SpooledPageSink, "_check_room_for", check_room_for)
+        else:
+            monkeypatch.setattr(spool_module, "measure_ink", measure)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        assert calls == [step, step]
+        (record,) = sink.records
+        assert record.sequence == 1
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.is_file()
+        assert sorted(tmp_path.iterdir()) == [record.path]
+
+    def test_the_page_after_an_interrupted_one_takes_the_next_number(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finishing an interrupted page does not skip or repeat a number."""
+        calls: list[int] = []
+
+        def measure(image: Image.Image) -> InkMeasurement:
+            calls.append(1)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGTERM"
+                raise ScanInterrupted(msg, signum=15)
+            return measure_ink(image)
+
+        monkeypatch.setattr(spool_module, "measure_ink", measure)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        second = sink.add(_inked_page(), dpi=300)
+
+        assert [record.sequence for record in sink.records] == [1, 2]
+        assert second.path == tmp_path / "a-0002.png"

@@ -1,32 +1,51 @@
-{# The whole swap target, wrapper and all.  The swap moved from innerHTML on a
-   multi-select to outerHTML on this div, so the element that carries the id
-   and the class has to be rendered here: an outerHTML swap replaces the
-   target, and a partial that rendered only the rows would put them where the
-   wrapper was and lose both on the first refresh.
+{# This div is the whole outerHTML swap target, so the wrapper with its id and
+   class is rendered here: a partial of rows alone would lose both on the
+   first refresh.
 
-   Two loops, not one.  The first holds the ticks the filter excludes, pinned
-   above the list so a tick can never leave the DOM and therefore can never be
-   dropped from the next submit.  The second is the filtered list; a tag that is
-   both ticked and matched is rendered by that loop alone, so it appears once
-   rather than twice.
+   Every ticked id lands in exactly one row: stale (ticked, missing from a list
+   read just now), unlisted (ticked while the list could not be read, so no
+   "no longer in paperless-ngx" note), pinned (ticked but filtered out, kept so
+   a tick never leaves the DOM and the next submit), then the filtered list.
+   The empty-state lines never render when the list is unavailable: "no tags"
+   and "could not ask" are different facts.
 
-   The filter text itself appears nowhere in this file.  It is a filter, not a
-   label, and nothing the client typed is rendered back (ASVS V5).  The tag
-   names are upstream text and stay autoescaped; nothing here is marked safe.
+   autocomplete is off so a browser's form restore cannot change the ticks the
+   server rendered.  Each box's id comes from its tag id, so htmx can give
+   focus back after a swap the person did not cause.  The filter text is never
+   rendered back, and nothing here is marked safe.
 
-   The label is the tap target, not the box: app.css gives every row the full
-   width and a finger-sized height.
-
-   The wrapper carries no request of its own: the list is server-rendered, and
-   the filter box, the refresh button and the filter form each carry theirs. #}
-<div id="tags-list" class="tag-list">
+   The wrapper's own request, the profile-change refresh, includes only the
+   profile, so it replaces the ticks with that profile's defaults on purpose.
+   The marker comes first so the wrapper stays the response's last element.
+   list_oob is not named oob because the marker include reads oob. #}
+{% if follows_profile %}{% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
+<div id="tags-list" class="tag-list"{% if list_oob %} hx-swap-oob="true"{% endif %}
+     hx-get="/api/profiles/tags"
+     hx-trigger="change from:#profile-select"
+     hx-include="#profile-select"
+     hx-target="this"
+     hx-swap="outerHTML">
+    {%- if tags_loading %}
+    <small>{{ TAGS_LOADING }}</small>
+    {%- else %}
+    {%- if tags_unavailable %}
+    <small class="status-fallback">&#9888; {{ TAGS_UNAVAILABLE }}</small>
+    {%- with retry_resource = "tags", retry_seconds = tags_retry_seconds %}{% include "partials/list_retry.html" %}{% endwith %}
+    {%- endif %}
+    {%- for row in stale %}
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" id="tag-option-{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    {%- endfor %}
+    {%- for row in unlisted %}
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" id="tag-option-{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    {%- endfor %}
     {%- for tag in pinned %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" checked> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" id="tag-option-{{ tag.id }}" autocomplete="off" checked> {{ tag.name }}</label>
     {%- endfor %}
     {%- for tag in tags %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" id="tag-option-{{ tag.id }}" autocomplete="off"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
     {%- endfor %}
-    {%- if not pinned and not tags %}
+    {%- if not tags_unavailable and not stale and not unlisted and not pinned and not tags %}
     {% if any_tags %}<small>No tags match that filter.</small>{% else %}<small>No tags in paperless-ngx yet.</small>{% endif %}
+    {%- endif %}
     {%- endif %}
 </div>

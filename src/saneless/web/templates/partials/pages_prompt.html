@@ -1,0 +1,54 @@
+{# Every sentence comes from the view, in pass_heading and pass_copy; this
+   template writes no words.
+
+   Each button has a fixed id, because the status area is replaced every
+   second and htmx restores focus only by id.  Scan next's id is keyed on the
+   question, not the job row, which can lag it.  The row is a wrapping flex
+   row, not Pico's button group, which never wraps.  hx-confirm sits on the
+   Abort button only: it is inherited, so on a container every button would
+   confirm.  A Finish the question does not offer stays in place, really
+   disabled, with its reason as visible text.  No disclosure widget: the
+   swap every second would close it.  autofocus moves focus only once, because
+   an unchanged poll is answered 204; the full page leaves it off
+   (page_render). #}
+{% set button_ids = {
+  "NEXT": "mp-retry" if pass_prompt.wait == "RETRY" else "mp-next",
+  "FINISH": "mp-finish",
+  "RESCAN": "mp-rescan",
+  "ABORT": "mp-abort",
+  "SKIP_BLANKS": "mp-skip",
+  "KEEP_BLANKS": "mp-keep",
+} %}
+{% set button_classes = {
+  "FINISH": "outline",
+  "RESCAN": "secondary outline",
+  "ABORT": "secondary",
+  "KEEP_BLANKS": "secondary",
+} %}
+<div class="pages-prompt">
+  <p><strong>{{ pass_heading }}</strong></p>
+  {% if pass_copy.alert %}
+  <p class="status-fallback">&#9888; {{ pass_copy.alert }}</p>
+  {% if pass_copy.detail %}<p class="prompt-note">{{ pass_copy.detail }}</p>{% endif %}
+  <p><strong>{{ pass_copy.headline }}</strong>{% if pass_copy.instruction %} {{ pass_copy.instruction }}{% endif %}</p>
+  {% else %}
+  <p><strong>{{ pass_copy.headline }}</strong></p>
+  {% if pass_copy.instruction %}<p>{{ pass_copy.instruction }}</p>{% endif %}
+  {% endif %}
+  <div class="prompt-actions">
+    {% for answer, label in pass_copy.buttons %}
+    <button id="{{ button_ids[answer] }}"{% if answer in ("NEXT", "SKIP_BLANKS") and answer in pass_prompt.offered and not page_render %} autofocus{% endif %}
+            {% if button_classes.get(answer) %}class="{{ button_classes[answer] }}"{% endif %}
+            hx-post="/api/multi-page/answer"
+            hx-vals='{{ {"job_id": job.id, "prompt": pass_prompt.number, "answer": answer} | tojson }}'
+            hx-target="#status-area"
+            hx-swap="outerHTML"
+            {% if answer == "ABORT" and pass_copy.abort_question %}hx-confirm="{{ pass_copy.abort_question }}"{% endif %}
+            {% if answer not in pass_prompt.offered %}disabled{% if pass_copy.finish_blocked %} aria-describedby="finish-blocked-reason"{% endif %}{% endif %}>{{ label }}</button>
+    {% endfor %}
+  </div>
+  {% if pass_copy.finish_blocked %}<small id="finish-blocked-reason" class="prompt-note">{{ pass_copy.finish_blocked }}</small>{% endif %}
+  {% for note in pass_copy.notes %}
+  <small class="prompt-note">{{ note }}</small>
+  {% endfor %}
+</div>

@@ -6,17 +6,108 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 
 | Property | Value |
 |----------|-------|
-| Image | `ghcr.io/kdknigga/saneless:latest` |
+| Image | `ghcr.io/kdknigga/saneless:0.2.0-rc.7` |
 | Base | `python:3.14-slim` |
-| Entrypoint | `saneless serve` |
+| Entrypoint | `saneless` |
+| Default command | `serve` |
+| Platforms | `linux/amd64` |
 | Port | `8080` |
 | User | `1000:1000` (non-root) |
 | Working directory | `/var/lib/saneless` |
+
+The entrypoint is the `saneless` program and `serve` is only its default
+argument. Anything you put after the image name in `docker run` replaces
+`serve`, so ending the line with `doctor` instead runs `saneless doctor` in a
+fresh container.
+
+The image is built for `linux/amd64` only. There is no Arm image, so on a
+Raspberry Pi or another Arm host
+[install saneless on bare metal](../how-to/install-bare-metal.md) instead.
 
 The published port serves a UI with **no login**, bound to `0.0.0.0` -- all network
 interfaces -- so every host that can reach it can start a scan; see
 [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy)
 and the [Web API](web-api.md) notes on the trust model.
+
+### Publishing the port
+
+Docker publishes a port by writing its own iptables rules, and container
+traffic is routed by them before ufw's or firewalld's rules are consulted. A
+port published as `"8080:8080"` is therefore reachable from the network even
+when the host firewall says 8080 is closed. To keep saneless off the LAN,
+publish it on the loopback address only and put a
+[reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy)
+on the host in front of it:
+
+```yaml
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+The examples on this page publish `"8080:8080"`, so that a browser anywhere on
+your LAN reaches the UI with no proxy in between.
+
+## Image tags
+
+Every release publishes the image under more than one tag. Which tags a release
+gets depends on whether it is a final release or a release candidate:
+
+| Tag | Example | Published for | Moves? |
+|-----|---------|---------------|--------|
+| `X.Y.Z` | `0.2.0` | every final release | Never. It always names that release. |
+| `X.Y.Z-rc.N` | `0.2.0-rc.7` | every release candidate | Never. It always names that candidate. |
+| `X.Y` | `0.2` | final releases only | Yes. It moves to each new patch release of that minor version. |
+| `latest` | `latest` | final releases only | Yes. It moves to the newest final release. |
+
+**Release candidates never receive `X.Y` or `latest`.** Pulling either before
+the first final release fails with "manifest unknown", because the tag does not
+exist yet.
+
+Pin `X.Y` to pick up patch releases when you pull, or pin `X.Y.Z` to change
+versions only when you edit the tag yourself. Avoid `latest`: it can move you
+across a minor version, and minor versions may carry breaking changes.
+
+Until a minor version's first final release is published, the examples in these
+docs pin the current release-candidate tag, because that version's `X.Y` tag
+does not exist yet. From its first final release on, they pin `X.Y`.
+
+## Verifying the image
+
+Every image the release pipeline publishes after 0.2.0-rc.6 carries two signed
+attestations, recorded with GitHub and pushed beside the image to the registry:
+a SLSA build-provenance attestation, recording which workflow run in
+`kdknigga/saneless` built it from which commit, and an SPDX SBOM attestation
+listing what the image contains. **0.2.0-rc.6 and every earlier tag carry
+neither**, so verifying one of them fails.
+
+Attestations are bound to the image's digest, not to a tag, so start from the
+digest of the image you actually run. Replace `<image>` with the reference you
+pulled, exactly as your compose file or `docker run` line names it, tag
+included -- a release published after 0.2.0-rc.6:
+
+```bash
+docker image inspect --format '{{index .RepoDigests 0}}' <image>
+```
+
+That prints `ghcr.io/kdknigga/saneless@sha256:<digest>`. Check the provenance
+with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify oci://ghcr.io/kdknigga/saneless@sha256:<digest> -R kdknigga/saneless
+```
+
+and the SBOM by naming its predicate type:
+
+```bash
+gh attestation verify oci://ghcr.io/kdknigga/saneless@sha256:<digest> -R kdknigga/saneless \
+    --predicate-type https://spdx.dev/Document/v2.3
+```
+
+`gh` resolves an `oci://` reference against the registry, so it needs you to be
+logged in there already (`docker login ghcr.io`), and it fetches the
+attestations through GitHub's API, so it needs `gh auth login` as well. A
+successful check proves the image was built by this repository's
+release workflow; it does not replace pinning a tag you have reviewed.
 
 ## User and file ownership
 
@@ -25,10 +116,12 @@ mounted host directory is owned by 1000. On a single-user Linux host your own
 account is 1000, so the `./config` directory you created is already correct and
 nothing further is needed.
 
-If `id -u` reports something else, hand the config directory over once:
+If `id -u` reports something else, hand the config directory over once. Only root
+can give a file to another user, so this needs `sudo`; a plain `chown` fails
+with `Operation not permitted`:
 
 ```bash
-chown -R 1000:1000 ./config
+sudo chown -R 1000:1000 ./config
 ```
 
 This applies to bind mounts only. A named or anonymous volume -- what
@@ -39,14 +132,45 @@ saneless cannot rewrite `saneless.toml` when it saves a generated profile. The
 shipped `docker-compose.yml` also carries a commented `user:` line for running
 the container as your own UID instead.
 
+`config/saneless.toml` holds your paperless-ngx API token, so make it readable
+by the container's user alone. Both steps run as root: the `chown` needs it to
+give the file to UID 1000, and the `chmod` needs it once the file is no longer
+yours:
+
+```bash
+sudo sh -c 'chown 1000:1000 config/saneless.toml && chmod 600 config/saneless.toml'
+```
+
+saneless keeps that mode and owner each time it rewrites the file.
+
+Rootless Podman is the exception. There your own host account maps to root
+inside the container, and the container's UID 1000 is one of your subordinate
+UIDs on the host, so neither a file you own nor one handed to host UID 1000 is
+readable by the container's user once it is `0600`. Make the change from
+inside Podman's user namespace instead, where `1000` means the container's
+user:
+
+```bash
+podman unshare sh -c 'chown 1000:1000 config/saneless.toml && chmod 600 config/saneless.toml'
+```
+
+Afterwards, edit the file through `podman unshare` as well, since your own
+account no longer owns it.
+
 ## Healthcheck
 
 The image includes a built-in healthcheck:
 
 ```dockerfile
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
 ```
+
+The probe is Python's standard library, run by the image's own interpreter; the
+image carries no separate HTTP client. `urlopen` raises on a refused connection
+and on any non-2xx response, so either one exits non-zero and counts as a failed
+check. `--start-period=30s` gives the first SANE initialisation 30 seconds
+before failed checks start to count.
 
 The `/health` endpoint returns `200` when saneless is healthy. It returns `503` when the worker thread is down (`worker thread is down`) or when the worker is degraded because its job store is failing (`job store failing`); see [`GET /health`](web-api.md#get-health). After three failed checks in a row, Docker reports the container as unhealthy.
 
@@ -56,9 +180,9 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 
 | Mount Point | Purpose | Required |
 |-------------|---------|----------|
-| `/etc/saneless` | Configuration directory holding `saneless.toml` (mount read-write; a missing `saneless.toml` means defaults plus environment variables). A `config.toml` left here from an earlier release is **not** read -- the Configuration row on the status page names it and gives the rename to `saneless.toml` | Recommended |
+| `/etc/saneless` | Configuration directory holding `saneless.toml` (mount read-write; a missing `saneless.toml` means defaults plus environment variables). A `config.toml` in this directory is **not** read -- the Configuration row on the status page names it and gives the rename to `saneless.toml` | Recommended |
 | `/var/lib/saneless` | **Durable state:** the job database (`saneless.db`) and preserved scans (`failed/`) | **Yes -- do not treat as disposable** |
-| `/tmp/saneless` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes | No (ephemeral OK) |
+| `/tmp/saneless-1000` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes. The default `tmp_dir` is `$TMPDIR/saneless-<uid>`, and the image runs as uid 1000 | No (ephemeral OK) |
 | `/consume` | Consume directory fallback for file-based ingestion | No (only if using fallback) |
 
 `/consume` is the path the shipped `docker-compose.yml` uses, as a commented
@@ -72,19 +196,26 @@ and what it costs.
 
 Mount the configuration *directory* (`./config:/etc/saneless`), not `saneless.toml` itself. saneless rewrites `saneless.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
 
+On a host with SELinux enforcing (Fedora, RHEL, Rocky), the container cannot read a bind mount until it is relabelled: add `:z` to the mount, as in `./config:/etc/saneless:z`.
+
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
-`/tmp/saneless` is. When a scan cannot be delivered to paperless-ngx at all --
+`/tmp/saneless-1000` is. When a scan cannot be delivered to paperless-ngx at all --
 the upload fails and no consume directory is configured, paperless-ngx rejects
 the upload outright, the consumption task reports a failure, or the task has not
 finished when `paperless_task_timeout` expires -- saneless moves the assembled
-PDF into `/var/lib/saneless/failed/`. That copy is then the only remaining copy
-of the document. Pruning the volume, or leaving it unmounted so that it vanishes
+PDF into `/var/lib/saneless/failed/`. Unless paperless-ngx did file it after
+all -- which a task that outlived `paperless_task_timeout` may still do -- that
+copy is the only one there is. Pruning the volume, or leaving it unmounted so that it vanishes
 when the container is recreated, destroys scans that were never ingested.
 
-The image sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless` and declares it as
-a `VOLUME`, so a plain `docker run -v saneless-data:/var/lib/saneless` is correct
-without setting anything else. `/tmp/saneless` is not mounted by the compose
-files below: it holds nothing worth keeping between runs.
+The image sets `XDG_STATE_HOME=/var/lib`, so `data_dir` defaults to
+`/var/lib/saneless` -- the directory it declares as a `VOLUME` -- and one-shot
+commands such as `docker compose exec saneless saneless jobs` log to
+`/var/lib/saneless/saneless.log`. It is only a default: `[output] data_dir` in
+`saneless.toml`, or `SANELESS_OUTPUT__DATA_DIR`, still overrides it. A plain
+`docker run -v saneless-data:/var/lib/saneless` is therefore correct without
+setting anything else. `/tmp/saneless-1000` is not mounted by the compose files
+below: it holds nothing worth keeping between runs.
 
 ### Preserved scans in `failed/`
 
@@ -93,8 +224,8 @@ or rotates anything in it.** That is deliberate: automatically removing a file
 there would destroy the only copy of a scanned document. Draining the directory
 is an operator task.
 
-- One PDF is written per unrecoverable delivery -- two for an ADF duplex scan
-  whose halves were uploaded separately. Each file corresponds to a job the web
+- One PDF is written per unrecoverable delivery -- two for a manual duplex scan
+  whose fronts and backs were uploaded as separate halves. Each file corresponds to a job the web
   UI shows as **Failed**, whose error message names that exact path.
 - **Partial scans land here too.** A scanner fault part-way through a stack keeps
   the sheets already fed, and a manual duplex job whose second pass or flip
@@ -120,12 +251,20 @@ is an operator task.
   order for a simplex scan but not for a manual duplex one; see
   [what `failed/` holds](../explanation/consume-directory-fallback.md#when-it-activates)
   before assembling a duplex job by hand.
-- Re-ingesting is safe. paperless-ngx checksums documents on consumption and
-  rejects a duplicate, so dropping a preserved PDF back into the consume
-  directory cannot create a second copy of a document it already holds.
+- Check paperless-ngx before re-ingesting. It recognises a duplicate by the
+  file's checksum, but what it does with one depends on its release
+  (checked against paperless-ngx 3.2.1 and 2.20.15): 2.x refuses it, while 3.x
+  stores it as a second document and flags it, unless
+  `PAPERLESS_CONSUMER_DELETE_DUPLICATES` is enabled. On 3.x, dropping a
+  preserved PDF that paperless-ngx already holds back into the consume
+  directory makes a second copy; see
+  [Duplicates](../explanation/consume-directory-fallback.md#duplicates).
 
-Upgrading from a release where the job database lived under `/tmp/saneless`?
-See [Upgrading from a pre-`data_dir` release](../how-to/deploy-docker-compose.md#upgrading-from-a-pre-data_dir-release).
+saneless keeps what it writes under `/var/lib/saneless` to its own user.
+The image's `/var/lib/saneless` is `0700`, and a new volume starts with that
+mode. A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created
+`0600`. `failed/` and each preserved page directory are created `0700`, and
+each preserved PDF and page file is `0600`.
 
 ## Environment Variables
 
@@ -135,12 +274,14 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 |----------|---------------|---------|
 | `SANELESS_SCANNER__HOST` | `192.168.1.50` | Network scanner IP address |
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
-| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
+| `SANELESS_PAPERLESS__TOKEN` | `your-api-token-here` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
 | `SANELESS_OUTPUT__WEB_PORT` | `8080` | **The container's port is fixed at 8080.** `web_port` is a bare-metal setting: setting it here moves the server off the port the image exposes and the healthcheck probes, so the container reports unhealthy while the UI is in fact running somewhere else. Remap on the host instead -- `-p 8888:8080` |
-| `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. **Already set by the image** -- override it only if you mount the volume somewhere else |
+| `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. Not set by the image: it defaults to `/var/lib/saneless` because the image sets `XDG_STATE_HOME=/var/lib`. Set it only if you mount the volume somewhere else |
 | `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
 
-See [Environment Variables](environment-variables.md) for the full list.
+See [Environment Variables](environment-variables.md) for the full list, and
+[Where saneless reads settings](configuration.md#where-saneless-reads-settings)
+for which wins when a variable and `saneless.toml` both set the same thing.
 
 ### Placeholder tokens are detected
 
@@ -155,18 +296,17 @@ exact, never a substring match: `changeme7f3a91` is a real token.
 So do not copy a placeholder into a deployment expecting to fix it later --
 nothing will scan until it is replaced.
 
-**An environment variable overrides `saneless.toml`.** Setting
-`SANELESS_PAPERLESS__TOKEN` in a compose file wins over the token in the
-mounted config file, silently. Keep the secret in `config/saneless.toml` alone,
-and leave the compose `environment:` block free of it -- which is what the
-shipped template now does.
+Keep the token in `config/saneless.toml` and out of the compose
+`environment:` block; see
+[Where saneless reads settings](configuration.md#where-saneless-reads-settings).
 
 ## Minimal docker-compose.yml
 
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
@@ -183,34 +323,93 @@ next time the container is recreated.
 
 ## Scanner Access
 
-The container never reaches a scanner directly, not even one plugged into its own
-host. It reaches every scanner over the SANE network protocol, which is why no
-device mapping and no `--privileged` flag appear anywhere on this page: `saned`
-owns the scanner, and saneless talks to `saned`. Set the scanner host to the
-machine `saned` runs on -- the container's own host, or another one:
+The container reaches scanners over the network only. No device mapping and no
+`--privileged` flag appear anywhere on this page, and none is needed.
+
+The image enables exactly two SANE backends, `net` and `escl`. The stock list
+enables about eighty, and SANE probes every one of them the first time it looks
+for devices, which slows that first scan by seconds even with no scanner
+attached. The consequence is that USB and every other local backend are not
+available inside the container: a scanner plugged into the host is reached
+through `saned` on that host, like any other.
+
+### Through `saned` (primary route)
+
+`saned` owns the scanner, and saneless talks to `saned` over the SANE network
+protocol. This works for any scanner SANE supports, including USB scanners on
+the container's own host. Set the scanner host to the machine `saned` runs on --
+the container's own host, or another one:
 
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
       - ./config:/etc/saneless
+      - saneless-data:/var/lib/saneless
     environment:
       - SANELESS_SCANNER__HOST=192.168.1.50
+
+volumes:
+  saneless-data:
 ```
 
-saneless injects this value into `SANE_NET_HOSTS` before initializing the SANE backend, enabling automatic scanner discovery inside the container.
+saneless injects this value into `SANE_NET_HOSTS`, unless `SANE_NET_HOSTS` is already set to a non-empty value, before initializing the SANE backend, enabling automatic scanner discovery inside the container.
 
 For detailed setup instructions, see [Scanner Host Discovery](../how-to/scanner-host-discovery.md).
+
+### Direct eSCL (driverless network scanners)
+
+Many current network scanners and multifunction printers speak eSCL (Apple
+AirScan), which the image's `escl` backend reaches directly, with no `saned` in
+between. Name the scanner in an `escl.conf` holding one `device` line -- its URL,
+then an optional model name:
+
+```text
+device http://192.168.1.60:80
+```
+
+Use `https://` and the matching port when the scanner serves eSCL over TLS.
+Mount the file read-only over the image's own copy:
+
+```yaml
+services:
+  saneless:
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    stop_grace_period: 90s
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/etc/saneless
+      - saneless-data:/var/lib/saneless
+      - ./escl.conf:/etc/sane.d/escl.conf:ro
+
+volumes:
+  saneless-data:
+```
+
+`saneless devices` lists the scanner under a name beginning `escl:`. With
+`scanner.device` empty saneless uses the first device it finds; set
+`scanner.device` to that name to choose it explicitly when `saned` offers
+others too.
+
+Automatic eSCL discovery over mDNS, with no `device` line, is **untested** in
+the container. The `escl` backend discovers scanners through the host's
+avahi-daemon over the system D-Bus, so it would need the host's avahi-daemon
+running and its D-Bus socket (`/run/dbus/system_bus_socket`) mounted into the
+container. Host networking alone is not enough: the container still has no
+avahi-daemon to ask. Prefer the explicit `device` line.
 
 ## Full Example
 
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
@@ -218,6 +417,7 @@ services:
       - saneless-data:/var/lib/saneless
       # Optional consume-directory fallback; also set
       # paperless.consume_dir = "/consume" in saneless.toml.
+      # Uncomment this mount and the matching volume below together.
       # - paperless-consume:/consume
     environment:
       - TZ=America/Chicago
@@ -228,6 +428,9 @@ services:
 
 volumes:
   saneless-data:
+  # The volume paperless-ngx consumes from. If another compose project
+  # created it, add `external: true` and its real `name:` beneath.
+  # paperless-consume:
 ```
 
 `config/saneless.toml` alongside it carries the connection:
@@ -235,5 +438,5 @@ volumes:
 ```toml
 [paperless]
 url = "http://paperless:8000"
-token = "abc123def456"
+token = "your-api-token-here"
 ```

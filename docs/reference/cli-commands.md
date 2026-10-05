@@ -9,25 +9,34 @@ These options apply to all commands and must appear **before** the subcommand na
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--config PATH` | string | *(search path)* | Path to TOML config file (overrides search path). A path that does not exist or is not a regular file is an error (exit code 2) |
+| `--version` | flag | off | Print `saneless, version <version>` (the installed package version, for example `saneless, version 0.2.0rc6`) and exit 0 without loading any config file |
 | `-v, --verbose` | flag | off | Raise saneless's own loggers to DEBUG. In a one-shot command the detail goes to the log file and is mirrored to stderr; in `saneless serve` it goes to the stream, which is stderr and the only sink there is. Other libraries and the web server keep the configured `log_level` |
 
-`--help` on any command works without a valid config file; settings are loaded only when a command runs. Every command exits with code 2 when the configuration cannot be loaded, and prints a header naming the file then one line per problem; a TOML syntax error names its line and column (see [Validation](configuration.md#validation)). On start, saneless logs at INFO which config file it loaded and which setting names came from environment variables.
+`--help` on any command works without a valid config file; settings are loaded only when a command runs. Every command exits with code 2 when the configuration cannot be loaded, and prints a header naming the file, then one line per problem, then a `Try:` line; a TOML syntax error names its line and column (see [Validation](configuration.md#validation)). On start, saneless logs at INFO which config file it loaded and which setting names came from environment variables.
 
 ## Exit codes
 
-Every command uses the same exit codes. Each failure prints one line to stderr, with no traceback.
+Every command uses the same exit codes. A failure prints a line to stderr saying what failed, then a `Try:` line with the next step, and no traceback unless `-v` asked for one. The `Try:` line is the fix the failing step knows about when it knows one, and otherwise advice for that kind of failure. `saneless serve` logs these failures to its stream without a traceback too. Three kinds of ending print one line and no `Try:` line: a cancel (130), an interruption (129, 143) and an unexpected error (5). A broken pipe (141) prints nothing at all. A script that parses the failure should read the first line; the `Try:` line is advice for a person, and its wording may change.
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Scan error: the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
-| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, or a job database saneless cannot use (unreadable, or an unsupported schema) |
-| 3 | Paperless-ngx error: unreachable after retries, upload rejected, or a malformed Paperless URL |
+| 1 | Scan error: no scanner was found, the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
+| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan is started |
+| 3 | Paperless-ngx error: unreachable after retries, or upload rejected |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF |
 | 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file -- or, under `saneless serve`, in the stream, because a service writes no file |
+| 6 | Saved to the consume folder without its title, tags or correspondent. The document was delivered, so do not scan it again |
+| 7 | Uploaded, with a warning on stderr: a sheet the scanner skipped, or manual-duplex front and back counts that differed. The document was delivered, so do not rescan the whole stack |
+| 8 | Every page looked blank to empty-page detection, so nothing was uploaded. The pages were kept in `failed/`, normally as one PDF; the error line names what was kept |
+| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; the error line names the copy kept in `failed/`, when one could be kept |
+| 10 | The server ran out of disk space; the error line names the folder, and how much space is needed when saneless found the shortfall before writing |
+| 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled by the operator |
+| 141 | Broken pipe: whatever was reading the command's output stopped before it finished, as `head` does once it has the lines it wanted. Nothing failed, and nothing is printed about it |
+| 143 | Interrupted by SIGTERM. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had when it can, and the `Interrupted:` line says what was kept, or where the pages were left. A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's pages already being kept -- does not change it: the command finishes and exits with that outcome's own code. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. A running `serve` stops gracefully on SIGTERM and exits 0, as on Ctrl-C, whether or not it is the container's first process (PID 1). `devices`, `jobs`, `auto-profiles` and `doctor` exit 141 (128 plus SIGPIPE) when the program reading their output closes it early; a shell reports a pipeline's last command's status, so a script sees the 141 only with `set -o pipefail`. `scan` does not: its outcome's code stands even when its output can no longer be written. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -36,31 +45,41 @@ Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` 
 Scan a document and upload to paperless-ngx.
 
 ```
-saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
+saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page]
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted |
+| `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted. At most 118 characters, which paperless-ngx keeps whole even as one half of a split duplex document; a longer title is refused with exit code 2 before the scanner is opened, never shortened |
 | `--profile` | TEXT | `default` | Scan profile name from config |
+| `--multi-page` | flag | off | Ask after each scan whether there is another page, and put every page in one document. Needs an interactive terminal, and is refused for a manual duplex profile. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md) |
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Scan and upload completed successfully |
-| 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, or python-sane not installed) |
-| 3 | Paperless-ngx upload error (unreachable after retries, upload rejected, malformed Paperless URL) |
-| 4 | PDF assembly error (disk full, unwritable output directory) |
+| 1 | Scan error (no scanner found, scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
+| 2 | Configuration or profile error (unknown profile, a `--title` longer than 118 characters, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
+| 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
+| 4 | PDF assembly error: the scanned pages could not be written as a PDF (a full disk is exit 10) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
-| 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
+| 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
+| 7 | Uploaded with a warning (a sheet the scanner skipped, manual-duplex front and back counts that differed, uploaded as two documents, a scan that reached its per-scan sheet cap, a flatbed source the scanner's Auto source scanned through the feeder, or a `--multi-page` document finished because a question timed out or the document reached the page limit); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
+| 8 | Every page looked blank to empty-page detection, or a `--multi-page` question timed out while every page so far had been skipped as blank; nothing was uploaded, and the pages were kept in `failed/`, normally as one PDF (the error line names what was kept) |
+| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; the error line names the copy kept in `failed/`, when one could be kept |
+| 10 | The server ran out of disk space; the error line names the folder, and how much space is needed when saneless found the shortfall before writing |
+| 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned, if any, were kept in `failed/` when they could be, and the `Interrupted:` line says what was kept, or where the pages were left |
+| 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed `a`, Ctrl-D or Ctrl-C at a `--multi-page` question; or Ctrl-C during the scan) |
+| 143 | Interrupted by SIGTERM; pages already scanned, if any, were kept in `failed/` when they could be, and the `Interrupted:` line says what was kept, or where the pages were left |
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
 
-If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
+If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, or `paperless.url` is empty, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
 
-For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides. No, Ctrl-D (end of input, which is also what a terminal that closes produces) or Ctrl-C at the flip prompt cancels the scan, prints one line and exits with code 130. A read error at the flip prompt, such as an I/O error or undecodable input, fails the scan with exit code 1, and the error is logged with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
+For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides. No, Ctrl-D (end of input) or Ctrl-C at the flip prompt cancels the scan, prints one line and exits with code 130. A terminal or SSH session that closes at the prompt sends SIGHUP as well as end of input, and the signal wins: that is an interruption, which keeps the fronts in `failed/` and exits with code 129. A read error at the flip prompt, such as an I/O error or undecodable input, fails the scan with exit code 1, and the error is logged with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
+
+With `--multi-page`, `scan` scans once and then asks, after every scan, what to do next: `[n]ext, [r]e-scan last, [f]inish, [a]bort`, headed by how many pages are kept so far. `n` scans again and adds the pages to the document, `r` throws away the last scan and scans it again, `f` finishes and uploads the document, and `a` asks you to confirm and then cancels (exit 130). A letter that is not offered prints the letters that are, and asks again; `f` is not offered while every page so far was skipped as blank. When the profile has empty-page detection on and a scan produced a page that looks blank, it asks `[s]kip, [k]eep, [r]e-scan` first. When a scan fails with a scanner fault or an empty feeder after at least one page is kept, it asks `[n] scan again, [f]inish, [a]bort` instead of failing. Ctrl-C or Ctrl-D at any of these questions cancels at once, with no confirmation, and keeps nothing (exit 130). Each question waits `operator_wait_timeout_seconds`; a timeout finishes the document with the pages kept and exits 7, or exits 8 if every page so far was skipped as blank. SIGTERM or SIGHUP at a question keeps the pages in `failed/` and exits 143 or 129. `--multi-page` is refused with exit code 2 before the scanner is opened when stdin is not a terminal, and for a manual duplex profile. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md).
 
 ---
 
@@ -75,7 +94,7 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output device list as JSON |
-| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names. With `--json`, each device object gains a `capabilities` object |
+| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names (the entries SANE reports without a name, the option count and the group headings, are left out). With `--json`, each device object gains a `capabilities` object |
 
 **Exit codes:**
 
@@ -85,30 +104,33 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | 1 | Scan error (SANE failed while listing devices, or at least one device's capabilities could not be read; the other devices are still reported) |
 | 2 | Configuration error (invalid config, or python-sane not installed) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
+| 143 | Interrupted by SIGTERM |
 
 Only data goes to stdout. The `Discovering scanners...` and `No scanners found.` status lines, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else. With no scanners, the table mode writes nothing to stdout and `--json` writes `[]`; both exit 0.
 
 **Example output (table):**
 
-```
+```text
 Discovering scanners...
-Name                 Vendor          Model                Type
-------------------------------------------------------------
-net:192.168.1.50:pi  Canon           MF740C Series        scanner
+Name                           Vendor          Model                Type
+------------------------------------------------------------------------
+net:192.168.1.50:hpaio:/usb/h… Hewlett-Packard hp_LaserJet_3030     all-in-one
 ```
 
-The first line is on stderr; the table is on stdout.
+The first line is on stderr; the table is on stdout. The table fits the terminal: the Name column takes the width the other three leave, and a value too long for its column is cut short with `…`. `--json` prints every value whole.
 
 **Example output (JSON):**
 
 ```json
 [
   {
-    "name": "net:192.168.1.50:pixma:MF740C",
-    "vendor": "Canon",
-    "model": "MF740C Series",
-    "type": "scanner"
+    "name": "net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742",
+    "vendor": "Hewlett-Packard",
+    "model": "hp_LaserJet_3030",
+    "type": "all-in-one"
   }
 ]
 ```
@@ -120,15 +142,28 @@ Without `--capabilities` the JSON has exactly these four keys per device, in thi
 ```json
 [
   {
-    "name": "net:192.168.1.50:pixma:MF740C",
-    "vendor": "Canon",
-    "model": "MF740C Series",
-    "type": "scanner",
+    "name": "net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742",
+    "vendor": "Hewlett-Packard",
+    "model": "hp_LaserJet_3030",
+    "type": "all-in-one",
     "capabilities": {
-      "sources": ["Flatbed", "ADF Simplex", "ADF Duplex"],
-      "resolutions": [150, 300, 600],
-      "modes": ["Color", "Gray", "Lineart"],
-      "raw_options": ["source", "mode", "resolution"]
+      "sources": [
+        "Auto",
+        "ADF"
+      ],
+      "resolutions": [
+        75,
+        100,
+        150,
+        200,
+        300,
+        600
+      ],
+      "modes": [
+        "Lineart",
+        "Gray",
+        "Color"
+      ]
     }
   },
   {
@@ -142,7 +177,7 @@ Without `--capabilities` the JSON has exactly these four keys per device, in thi
 ]
 ```
 
-The output is one JSON document. A `capabilities` object has a key only for what the device reported. A device that constrains resolution with a range gets `"resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0}` instead of `resolutions`, and the numbers are the ones the device gave. When a device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"`. Every other device is still reported, the same reason is printed on stderr as `Capabilities for <name>: <reason>`, and the command exits 1 after writing the whole document. The table mode does the same: it prints that stderr line for the failed device, lists the others, and exits 1.
+The output is one JSON document. A `capabilities` object has a key only for what the device reported. A device that reports its SANE options also gets `raw_options`, the option names in the order the device lists them, such as `"mode"`, `"resolution"` and `"source"`. A device that constrains resolution with a range gets `"resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0}` instead of `resolutions`, and the numbers are the ones the device gave. When a device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"`. Every other device is still reported, the same reason is printed on stderr as `Capabilities for <name>: <reason>`, and the command exits 1 after writing the whole document. The table mode does the same: it prints that stderr line for the failed device, lists the others, and exits 1.
 
 ---
 
@@ -157,20 +192,25 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output job history as JSON |
-| `--limit` | int | `20` | Maximum number of jobs to show |
+| `--limit` | int | `20` | Maximum number of jobs to show; at least 1, and a smaller value is a usage error (exit 2) |
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 2 | Configuration error (invalid config, or the job database is unreadable or has an unsupported schema) |
+| 2 | Configuration or usage error (invalid config, `--limit` below 1, or the job database is unreadable, at an older schema `saneless serve` has not upgraded yet, or at an unsupported one) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
+| 143 | Interrupted by SIGTERM |
 
 The table's `Timestamp` column renders each job's start time in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`, and drops seconds. `--json` is a machine contract and is unaffected: its `created_at` stays a UTC ISO-8601 string carrying the `+00:00` offset. See [Use the CLI for Scripting](../how-to/cli-scripting.md#job-history-json).
 
-`jobs` does not need python-sane, and on a fresh install it creates the data directory and prints an empty history.
+Each `--json` entry also carries an `error` field: the full stored text of what stopped the job, file paths on the server and the paperless-ngx URL included, or `null`. The web page shows a failure only as a sentence without paths, and points here for the rest.
+
+`jobs` does not need python-sane. It only reads the history, so it is safe to run while `saneless serve` is using the same database: it never creates the database and never upgrades it. On a fresh install, with no database yet, it prints an empty history. A database at an older schema is refused with exit 2. Only `saneless serve` upgrades a job database, so the message says to start it once with the same config, stop it, and run `saneless jobs` again; this works on an install that otherwise only uses the CLI too.
 
 ---
 
@@ -182,16 +222,16 @@ Check that saneless is ready to scan, printing one line per health check.
 saneless [--config PATH] [-v] doctor
 ```
 
-`doctor` takes no options of its own. It runs the same six checks the web UI's system status list shows, in the same order and with the same wording, so the command and the page cannot disagree about whether the appliance is healthy.
+`doctor` takes no options of its own. It runs the same six checks the web UI's system status list shows, in the same order and with the same wording, so the two normally give the same answer. They can differ on the Profiles row. When the web server generates scan profiles at start-up, it tries to save them to the config file and remembers whether that worked. `doctor` saves nothing, so it cannot know. With a config file saneless cannot write to, such as a read-only `/etc/saneless/saneless.toml`, the page shows an amber Profiles row saying the profiles could not be saved, while `doctor` reports them as configured.
 
 | Check | What it looks at |
 |-------|------------------|
-| Configuration | Whether a `saneless.toml` was loaded, and whether an old `config.toml` is sitting in a searched directory being ignored |
-| Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes |
-| Paperless | Whether the API token has been set to something real, and whether paperless-ngx accepts it. A placeholder token is reported without sending a request |
+| Configuration | Whether a `saneless.toml` was loaded, whether more than one `saneless.toml` was found, and whether an old `config.toml` is sitting in a searched directory being ignored |
+| Scanner | Whether scanner support is installed and starts, and whether a device answers. Scanner support that is installed but will not start is its own red row, and the log says why. Each configured sane-net host is checked first with the start of the SANE network handshake, and a host that is switched off, has no saned running, cannot be found by name, or is turning this machine away is reported as such. Only a host that does not answer is a warning that stops the check before SANE is asked for scanners; otherwise SANE is still asked, so a host with no saned running is red when no usable scanner is visible and amber when one still is. Listing runs in a separate process with a 30-second limit, and three amber rows report a listing that crashed in the scanner library, did not finish in time, or gave no usable answer. When `[scanner] device` is set, that device is looked for by name, and opened once if SANE does not list it. [Scanner Host Discovery](../how-to/scanner-host-discovery.md#what-the-scanner-row-says) lists each Scanner row and what clears it. When `[scanner] device` is empty and more than one device is visible, the row is a warning that gives only the count (device ids hold network addresses and the web page shows this row to everyone on your network): with no device set, every scan goes to whichever device SANE lists first |
+| Paperless | Whether the API token and the paperless-ngx address have been set, and whether paperless-ngx accepts the token. A placeholder token or an empty `paperless.url` is reported without sending a request. A `paperless.url` or `paperless.token` that saneless cannot send is a red row naming both settings, and a TLS trust store that `SSL_CERT_FILE` or `SSL_CERT_DIR` points at but saneless cannot read is a red row naming those two variables. When paperless-ngx answers from another address, `doctor` prints that address on an indented line under the row, with any user name, password or token removed; the web page never shows it, because anyone on your network can load the page |
 | Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
 | Fallback | Whether a fallback folder is configured for when paperless-ngx is down, and whether saneless can write to it |
-| Data folder | Whether the folder holding the job database will take a write |
+| Data folder | Whether `output.data_dir`, which holds the job database, and `output.tmp_dir`, where scans in progress are built, will take a write. A folder that does not exist yet is fine when saneless can create it where it would go; an existing `output.tmp_dir` must also be private (not a symbolic link, owned by saneless's user, and writable by nobody else). A red row names the setting that is wrong, never its path |
 
 **Example output:**
 
@@ -210,7 +250,7 @@ Config files searched, in order:
   not found  /etc/saneless/saneless.toml
 ```
 
-Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line.
+Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line. Where the web UI's next step says to press **Check again**, `doctor` says to run `saneless doctor` again instead, because a terminal has no button; the rest of the sentence is the same on both.
 
 **The config resolution table.** After the rows, `doctor` lists every location its search looked at, with absolute paths, whether the run was healthy or not. This is the section to read when the settings are not the ones you expected: it is the only place that says which of the candidate files won, and it is printed by `doctor` only -- the web page carries the `Configuration` row and no paths at all, because it is visible to everyone on your network.
 
@@ -218,26 +258,36 @@ Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]
 |-------|---------|
 | `used` | The file the settings came from. An explicit path adds ` (given with --config; no search)`, because that path replaces the search rather than joining it |
 | `not used` | The file exists but a higher-priority one won; the line adds ` (an earlier file won)` |
+| `same file` | A file already listed, reached through another candidate -- `./saneless.toml` when saneless runs from inside the XDG directory, or a symlink to a listed file; the line adds ` (already listed)`. It is one file, so it is neither a second file nor an empty path |
 | `not found` | Nothing is there, or what is there is not a regular file |
 | `ignored` | An old `config.toml` beside a candidate, while nothing loaded; the line adds ` (old name; rename it to saneless.toml)` |
 | `leftover` | An old `config.toml` beside a candidate, while a `saneless.toml` did load; the line adds ` (old name; ignored)` |
 
 When the table would have no lines at all -- settings built with no search behind them -- it prints `none recorded` rather than an empty caption, so a truncated run cannot be mistaken for an empty search.
 
+**More than one config file.** saneless reads only the first `saneless.toml` its search finds. When it finds more than one, the Configuration row is `[WARN]`: it names the file in use and every file that is not read, with absolute paths, and its next step says to move anything you still need into the file in use and delete the others. The same row is also printed on stderr as the configuration loads, before any check runs. A warning does not fail the command, so `doctor` still exits 0. In the table, the file in use is `used` and each other one is `not used`.
+
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Every check came out OK or a warning |
-| 2 | At least one check failed (scanner support not installed, no scanner reachable, an unset or rejected API token, no scan profiles, a folder saneless cannot write to, or an old `config.toml` found where a `saneless.toml` was expected), or the configuration could not be loaded |
+| 2 | At least one check failed (scanner support not installed or not starting, no usable scanner found, an unset or rejected API token, paperless-ngx unreachable, failing, or answering from another address, an unreadable TLS trust store, no scan profiles, a folder saneless cannot write to, or an old `config.toml` found where a `saneless.toml` was expected), or the configuration could not be loaded. A scanner host that does not answer is not on this list: it is a warning, and `doctor` exits 0 |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
+| 143 | Interrupted by SIGTERM |
 
-**A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero, so `if saneless doctor; then ...` means "everything that stops scanning or filing is fine".
+**A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero.
+
+**Exit 0 does not prove a scan will work.** A scanner host that does not answer, because it is switched off or not on the network, is a warning, even when it is the only one configured. The check stops there without asking SANE for scanners, so it cannot say that none would be found. A script that needs a scanner before it scans should check for one with `saneless devices --json`, as [Use the CLI for Scripting](../how-to/cli-scripting.md#checking-readiness-before-a-scan) shows.
 
 Unlike `scan`, `devices`, `serve` and `auto-profiles`, `doctor` does **not** refuse to run when python-sane is missing. That machine is exactly the one whose owner needs a diagnosis, so the missing scanner support becomes one failed row among six, and the other five still report.
 
-`doctor` has no `--json` mode: it prints a table for a person to read, and scripts should gate on the exit code.
+It does not refuse over a folder either. The other commands stop at start-up with a line and a `Try:` line when `output.data_dir`, `output.tmp_dir` or `paperless.consume_dir` cannot be used. `doctor` reports the same problem as a red Data folder or Fallback row, and the other rows still print.
+
+`doctor` has no `--json` mode: it prints a table for a person to read, and a script that runs it should read the exit code, not the rows.
 
 The container `HEALTHCHECK` deliberately keeps calling `/health` instead of this command. `doctor` does network I/O — it probes the scanner and talks to paperless-ngx — so wiring it to the healthcheck would mark the container unhealthy during a routine paperless-ngx restart, and restart saneless for a fault that is not saneless's.
 
@@ -264,9 +314,9 @@ Once the addresses are bound, `serve` prints one `Serving on http://<address>:<p
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean shutdown, including Ctrl-C once the web server is running |
-| 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
-| 3 | Malformed Paperless URL |
+| 0 | Clean shutdown, including Ctrl-C or SIGTERM once the web server is running |
+| 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
+| 3 | The TLS trust store named by `SSL_CERT_FILE` or `SSL_CERT_DIR` cannot be read |
 | 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |
 | 130 | Cancelled (Ctrl-C before the web server has started) |
 
@@ -289,14 +339,17 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | Code | Meaning |
 |------|---------|
 | 0 | Profiles generated successfully |
-| 1 | Scan error (SANE failed while listing devices, or could not open or read the scanner's capabilities) |
-| 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
+| 1 | Scan error (no scanner found, SANE failed while listing devices, or could not open or read the scanner's capabilities) |
+| 2 | Configuration or setup error: the config could not be loaded, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be created or rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
+| 143 | Interrupted by SIGTERM |
 
-Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. In the Docker image, whose working directory is `/var/lib/saneless`, that is `/var/lib/saneless/saneless.toml` -- in the durable data volume rather than the mounted `./config` directory, where it outlives the container and keeps loading ahead of any `saneless.toml` you add later -- so create `config/saneless.toml` on the host first (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). A config file created from scratch gets mode `0600`; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it.
+Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#where-saneless-reads-settings). When no config file was loaded, `auto-profiles` creates `/etc/saneless/saneless.toml` if the `/etc/saneless` directory already exists and the command may write to it, and otherwise `$XDG_CONFIG_HOME/saneless/saneless.toml` (by default `~/.config/saneless/saneless.toml`), creating a missing `saneless` directory with mode `0700` and, when the process is permitted to set it, the owner of the directory it is created in. saneless never creates `/etc/saneless` itself, even as root. It never writes `./saneless.toml` either: that file comes first in the search, so a new one would outrank every other config file on the next start, and in the Docker image, whose working directory is the data volume, it would go on shadowing the mounted `./config` directory after every container recreation. In the container that mounted directory is `/etc/saneless`, so the file lands there (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). If the target cannot be written, the command exits 2 naming it. A config file created from scratch gets mode `0600` and, when the process is permitted to set it, its directory's owner; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it. A config file that is a symlink is rewritten at the file it points to; the command refuses a symlink to a file that does not exist and, run as root, a symlink that someone other than root made to a file they do not own.
 
-**`auto-profiles` refuses to write while an old `config.toml` is the only config file found.** It exits 2 with the same rename message the `Configuration` check gives, before it asks the scanner for anything. Writing a fresh `./saneless.toml` in that situation would not lose the old file's paperless-ngx URL and token, but it would bury them: the search would stop at the new file, the row telling you to rename the old one would go green, and the appliance would keep running on defaults. Rename the file first, then run the command again.
+**`auto-profiles` refuses to write while an old `config.toml` is the only config file found.** It exits 2 with the same rename message the `Configuration` check gives, before it asks the scanner for anything. Writing a fresh `saneless.toml` in that situation would not lose the old file's paperless-ngx URL and token, but it would bury them: the search would stop at the new file, the red row telling you to rename the old one would drop to amber, and the appliance would keep running on defaults. Rename the file first, then run the command again.
 
 Without `--force`, a profile that already exists is left alone. With `--force`, the command merges rather than replaces: in a profile marked `auto_generated = true`, the generated keys are refreshed in place, and every other key (`default_tags`, `title`, and so on) and your comments are kept. A profile without `auto_generated = true` is never changed; it is skipped and reported. The output names the absolute path written, then prints one line for each kind of change that happened:
 
@@ -306,10 +359,26 @@ Refreshed: ...
 Skipped (not auto-generated): ...
 Skipped (already exists; use --force to refresh): ...
 Removed (scanner no longer offers it): ...
+Pinned [scanner] device: ...
 ```
+
+**Example output (first run):**
+
+```text
+Profiles in /home/you/saneless.toml:
+Added: 'auto', 'adf', 'default'
+  auto: source=Auto, resolution=300, mode=Color
+  adf: source=ADF, resolution=300, mode=Color
+  default: source=Auto, resolution=300, mode=Color
+Pinned [scanner] device: 'net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742'
+```
+
+This is the HP LaserJet 3030 from [First CLI Scan](../getting-started/first-cli-scan.md), with its config file at `/home/you/saneless.toml`. It reports the sources `Auto` and `ADF`, so the command writes one profile for each and a `default` that copies `auto`.
+
+**`auto-profiles` pins the scanner it used.** When no device is configured (`[scanner] device` is empty in the file and `SANELESS_SCANNER__DEVICE` is not set), the command generates profiles for the first device SANE lists and writes that device's id into `[scanner] device`, so later scans keep going to it rather than to whichever scanner appears first on the network. A device that is already set is never overwritten, with `--force` or without: that key has no `auto_generated` marker, so it is yours. Run [`saneless devices`](#saneless-devices) first if more than one scanner is visible, and set `[scanner] device` yourself when the first one listed is not the one you use. `saneless serve`'s startup generation does not pin a device.
 
 See [Auto-generated profiles](../how-to/configure-scan-profiles.md#auto-generated-profiles) for which keys are generated and how a hand edit is treated.
 
 `saneless serve` also generates profiles once at startup when the config holds only the untouched `default` profile. See [Auto-generated profiles](../how-to/configure-scan-profiles.md#auto-generated-profiles).
 
-A `default` profile is always written, because saneless requires one: your scanner's flatbed backs it when it has one, and otherwise its first reported source does. Regenerating never removes that profile; every other auto-generated profile a new run no longer produces is pruned, while profiles you wrote yourself are left alone.
+A `default` profile is always written, because saneless requires one: it is a copy of your scanner's flatbed profile when it has one, otherwise of its first reported source's, and on a scanner with no choice of source it is a `Standard scan` profile with no `source` key. Regenerating never removes that profile; every other auto-generated profile a new run no longer produces is pruned, while profiles you wrote yourself are left alone. A `default` you wrote yourself is skipped with its own line, `Skipped (not auto-generated): 'default' -- add auto_generated = true to its table to let auto-profiles --force refresh it`, because it cannot be renamed or deleted like any other profile.

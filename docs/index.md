@@ -8,6 +8,7 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 
 **New to saneless? Start here.** Get from installation to your first scan in minutes.
 
+- [Which setup do I have?](getting-started/which-setup.md) -- Find which of the three deployment shapes is yours, and what it needs, before you install.
 - [Quick Start](getting-started/quick-start.md) -- Five-minute path from install to your first document in paperless-ngx.
 - [First CLI Scan](getting-started/first-cli-scan.md) -- Step-by-step CLI tutorial: install, configure, scan, verify.
 - [First Web UI Scan](getting-started/first-web-ui-scan.md) -- Walk through the web interface to scan a document.
@@ -20,8 +21,10 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 - [Deploy with Docker Compose](how-to/deploy-docker-compose.md) -- Run saneless as a container alongside paperless-ngx.
 - [Configure Scan Profiles](how-to/configure-scan-profiles.md) -- Create profiles for different scan types (color, grayscale, high-res).
 - [Set Up ADF Duplex Scanning](how-to/set-up-adf-duplex.md) -- Scan double-sided documents with an automatic document feeder.
+- [Scan a Multi-Page Document](how-to/scan-a-multi-page-document.md) -- Build one PDF from several scans, on the flatbed or by hand-feeding the feeder.
 - [Scanner Host Discovery (Containers)](how-to/scanner-host-discovery.md) -- Connect a containerized saneless instance to a remote scanner.
 - [Use the CLI for Scripting](how-to/cli-scripting.md) -- Automate scans with shell scripts and JSON output.
+- [Troubleshoot a Failed Scan](how-to/troubleshoot-a-failed-scan.md) -- Find out why a scan failed, where its pages went, and what to do next.
 
 ## Reference
 
@@ -38,5 +41,9 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 **Background and design decisions.** Understand why saneless works the way it does.
 
 - [Architecture Overview](explanation/architecture.md) -- How the scanner, pipeline, worker, and web layer fit together.
-- [Empty Page Detection](explanation/empty-page-detection.md) -- How saneless detects and removes blank pages from ADF scans.
+- [Empty Page Detection](explanation/empty-page-detection.md) -- How saneless detects and removes blank pages from every scan.
 - [Consume Directory Fallback](explanation/consume-directory-fallback.md) -- How file-based ingestion works when the paperless-ngx API is unavailable.
+
+## Changelog
+
+[Changelog](changelog.md) -- What each release added, changed and fixed.

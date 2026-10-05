@@ -1,0 +1,5 @@
+{# The only copy of the Correspondent help line.  Every response that
+   re-renders the options carries it again out of band, so it always describes
+   the list the select now holds; a select cannot hold a sentence, so this is
+   where the list says it could not be loaded. #}
+<small id="correspondent-help"{% if oob %} hx-swap-oob="true"{% endif %}{% if correspondents_unavailable %} class="status-fallback"{% endif %}>{% if correspondents_unavailable %}&#9888; {{ CORRESPONDENTS_UNAVAILABLE }}{% with retry_resource = "correspondents", retry_seconds = correspondents_retry_seconds %}{% include "partials/list_retry.html" %}{% endwith %}{% elif correspondents_loading %}{{ CORRESPONDENTS_LOADING }}{% else %}Who sent this document? Optional.{% endif %}</small>

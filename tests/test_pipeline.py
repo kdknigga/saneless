@@ -2,72 +2,145 @@
 
 from __future__ import annotations
 
+import ast
 import base64
+import contextlib
+import dataclasses
 import errno
-import inspect
+import io
 import logging
+import os
 import shutil
+import signal
+import sqlite3
+import stat
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Final, NoReturn, override
 from unittest.mock import MagicMock, patch
 
+import httpx2
 import pikepdf
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
+import saneless.duplex as duplex_module
+import saneless.flip as flip_module
 import saneless.pipeline as pipeline_module
-import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.preservation as preservation_module
+import saneless.scanner.scan_session as scan_session_mod
 from saneless.config import ProfileConfig
+from saneless.duplex import interleave_duplex
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     FeederEmptyError,
+    NoScannerFoundError,
     PaperlessError,
     PaperlessTimeoutError,
+    PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     PdfError,
     ScanCancelledError,
     ScanError,
+    ScanInterrupted,
+    SpoolError,
+    failure_text,
+    is_out_of_space,
 )
-from saneless.paperless import UploadResult
+from saneless.flip import FlipAnswerSlot, FlipCoordinator
+from saneless.pages import BlankFilterResult
+from saneless.paperless import (
+    ApiDelivery,
+    FolderDelivery,
+    PaperlessClient,
+    PaperlessTiming,
+    TaskDuplicate,
+    TaskFiled,
+    UploadResult,
+)
 from saneless.pdf import assemble_pdf
 from saneless.pipeline import (
     _SPOOL_LABEL_A,
     _SPOOL_LABEL_B,
-    FAILED_DIR_WARN_THRESHOLD,
     SCAN_LABEL_BACK,
     SCAN_LABEL_FRONT,
-    FlipAnswerSlot,
-    FlipCoordinator,
+    DeviceMemory,
     PipelineEvent,
     PipelineRequest,
+    RequestHooks,
     ScanResult,
+    Settled,
     _check_disk_space,
-    _interleave_duplex,
     _note_pass_count,
-    _preserving,
-    _warn_if_failed_dir_growing,
+    _open_workspace,
+    _resolve_device,
+    _returns_to_prompt,
+    build_pipeline_request,
     run_pipeline,
 )
-from saneless.scanner.base import DeviceInfo, ScannerBackend
+from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
+from saneless.scan_metadata import ScanMetadata
+from saneless.scanner.base import DeviceInfo, PassCapReached, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
     ErrorCategory,
+    ExitCode,
     FlipOutcome,
     JobState,
+    PassAnswer,
     ScanOutcome,
+    backs_not_scanned_warning,
+    backs_pass_cap_note,
+    backs_pass_cap_warning,
     classify_error,
+    dropped_ids_warning,
+    duplicate_warning,
+    error_advice,
+    exit_code_for,
+    exit_code_for_outcome,
+    pass_cap_note,
+    pass_cap_warning,
+    substituted_source_warning,
+)
+from saneless.workspace import SPOOL_DIR_NAME, find_orphans, sweep_orphans
+from tests.blank_fixtures import (
+    footer_page_number,
+    framed_blank,
+    tinted_blank,
+    typed_line,
 )
 from tests.conftest import (
+    FIXED_JOB_ID,
     AlwaysContinueFlipCoordinator,
     spooling,
     spooling_in_turn,
 )
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
+from tests.golden_support import (
+    CORRESPONDENTS_PATH,
+    TAGS_PATH,
+    DistinctPageScanner,
+    RecordingPaperless,
+    distinct_page,
+    embedded_streams,
+    png_idat,
+)
+from tests.multi_page_support import (
+    DUPLEX_PROFILE,
+    ScriptedPassCoordinator,
+    multi_page_settings,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+    from types import ModuleType
+    from typing import BinaryIO
 
     from saneless.config import Settings
     from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
@@ -82,8 +155,10 @@ class TestRunPipeline:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Full pipeline: scan -> assemble -> upload succeeds."""
-        request = PipelineRequest(profile_name="default", title="Happy Path Doc")
+        """A scan that assembles and uploads ends SUCCESS with no warning."""
+        request = PipelineRequest(
+            profile_name="default", title="Happy Path Doc", job_id=FIXED_JOB_ID
+        )
         result = run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -101,11 +176,13 @@ class TestRunPipeline:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Scanner raises ScanError -> pipeline raises ScanError."""
+        """A ScanError from the scanner leaves the pipeline as that same ScanError."""
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = ScanError("Device not found")
 
-        request = PipelineRequest(profile_name="default", title="Scan Error Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Scan Error Doc", job_id=FIXED_JOB_ID
+        )
         with pytest.raises(ScanError, match="Device not found"):
             run_pipeline(
                 scanner=scanner,
@@ -120,8 +197,8 @@ class TestRunPipeline:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Paperless raises PaperlessError -> pipeline raises PaperlessError."""
-        # data_dir is pointed at tmp_path too: a failing delivery now preserves
+        """A failed upload leaves the pipeline as the PaperlessError it raised."""
+        # data_dir is pointed at tmp_path too: a failing delivery preserves
         # the assembled PDF into <data_dir>/failed/, and a test must not write
         # that into the shared default outside pytest's own temp directory.
         default_settings.output.data_dir = tmp_path / "state"
@@ -129,7 +206,9 @@ class TestRunPipeline:
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
 
-        request = PipelineRequest(profile_name="default", title="Upload Error Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Upload Error Doc", job_id=FIXED_JOB_ID
+        )
         with pytest.raises(PaperlessError, match="Upload failed"):
             run_pipeline(
                 scanner=mock_scanner,
@@ -145,7 +224,9 @@ class TestRunPipeline:
         default_settings: Settings,
     ) -> None:
         """After successful run, tmp_dir has no leftover scan files."""
-        request = PipelineRequest(profile_name="default", title="Cleanup Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Cleanup Doc", job_id=FIXED_JOB_ID
+        )
         run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -166,7 +247,9 @@ class TestRunPipeline:
         scanner.scan_pages.side_effect = ScanError("Boom")
         paperless = MagicMock()
 
-        request = PipelineRequest(profile_name="default", title="Error Cleanup Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Error Cleanup Doc", job_id=FIXED_JOB_ID
+        )
         with pytest.raises(ScanError, match="Boom"):
             run_pipeline(
                 scanner=scanner,
@@ -186,12 +269,14 @@ class TestRunPipeline:
         default_settings: Settings,
     ) -> None:
         """After upload, pipeline calls poll_task with returned UUID."""
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=True, task_uuid="task-uuid-123"
+        mock_paperless.upload_document.return_value = ApiDelivery(
+            task_id="task-uuid-123"
         )
-        mock_paperless.poll_task.return_value = {"status": "SUCCESS"}
+        mock_paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
 
-        request = PipelineRequest(profile_name="default", title="Poll Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Poll Doc", job_id=FIXED_JOB_ID
+        )
         run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -215,6 +300,7 @@ class TestRunPipeline:
         request = PipelineRequest(
             profile_name="default",
             title="Status Doc",
+            job_id=FIXED_JOB_ID,
             status_callback=events.append,
         )
         run_pipeline(
@@ -249,36 +335,6 @@ def _make_empty_image() -> Image.Image:
 _TEST_RESERVE_MB = 1
 
 
-def _distinct_page(index: int) -> Image.Image:
-    """
-    Draw a page no other page of the same job can be mistaken for.
-
-    The index is drawn as a run of marks along the top edge, so two pages
-    differ in their **pixels** -- and therefore in their spooled PNG bytes and
-    in the stream the PDF embeds -- rather than only in a file name.  A test
-    that reads a PDF back to prove page order needs exactly that: content it
-    can tell apart without trusting the thing under test.
-
-    The body rectangle keeps every page far from the blank-page thresholds, so
-    empty-page detection never removes one by accident.
-
-    Args:
-        index: The 0-based page number.  Up to 28 pages fit across the top
-            edge, which is more than any test here scans.
-
-    Returns:
-        A 120x160 RGB page carrying that index.
-
-    """
-    page = Image.new("RGB", (120, 160), "white")
-    draw = ImageDraw.Draw(page)
-    draw.rectangle((10, 30, 110, 150), fill="black")
-    for mark in range(index + 1):
-        left = 2 + mark * 4
-        draw.rectangle((left, 2, left + 2, 8), fill="black")
-    return page
-
-
 def _spool_pass(
     directory: Path, label: str, pages: Sequence[Image.Image]
 ) -> list[PageRecord]:
@@ -301,7 +357,7 @@ def _spool_pass(
 
     """
     sink = SpooledPageSink(directory, label, _TEST_RESERVE_MB)
-    return [sink.add(page) for page in pages]
+    return [sink.add(page, dpi=300) for page in pages]
 
 
 def _duplex_spool(
@@ -327,36 +383,36 @@ def _duplex_spool(
     spool_dir = tmp_path / "spool"
     spool_dir.mkdir()
     front_records = _spool_pass(
-        spool_dir, _SPOOL_LABEL_A, [_distinct_page(index) for index in range(fronts)]
+        spool_dir, _SPOOL_LABEL_A, [distinct_page(index) for index in range(fronts)]
     )
     back_records = _spool_pass(
         spool_dir,
         _SPOOL_LABEL_B,
-        [_distinct_page(fronts + index) for index in range(backs)],
+        [distinct_page(fronts + index) for index in range(backs)],
     )
     return spool_dir, front_records, back_records
 
 
 def _keep_everything(
     pages: Sequence[PageRecord], **_thresholds: float
-) -> list[PageRecord]:
+) -> BlankFilterResult:
     """
-    Stand in for ``filter_empty_pages``, keeping every record it is given.
+    Stand in for ``filter_blank_pages``, keeping every record it is given.
 
-    A ``return_value`` cannot be used for this any more: the records the
-    pipeline goes on to assemble have to be the ones its own sink produced, and
-    a list built in the test would point at files nobody wrote.
+    A ``return_value`` cannot do this: the records the pipeline goes on to
+    assemble have to be the ones its own sink produced, and a list built in the
+    test would point at files nobody wrote.
 
     Args:
         pages: Whatever the pipeline passed.
-        _thresholds: The profile thresholds, ignored here and asserted on
+        _thresholds: The profile threshold, ignored here and asserted on
             through the mock's call args.
 
     Returns:
-        The same records, in the same order.
+        The same records, in the same order, and no removed positions.
 
     """
-    return list(pages)
+    return BlankFilterResult(kept=list(pages), removed_positions=())
 
 
 def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[..., Path]:
@@ -382,7 +438,7 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         output_dir: Path,
         *,
         filename: str,
-        dpi: int,
+        title: str,
     ) -> Path:
         """Open every spooled page, then report the PDF path."""
         for record in records:
@@ -395,57 +451,6 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         return pdf_path
 
     return _assemble
-
-
-def _png_idat(png_bytes: bytes) -> bytes:
-    """
-    Concatenate a PNG's IDAT payloads: its compressed pixel data itself.
-
-    This is what img2pdf embeds when it passes a suitable PNG through -- the
-    zlib stream is copied into a ``/FlateDecode`` image object untouched -- so
-    it is directly comparable with what pikepdf reads back out of the PDF.
-    Comparing these bytes is a much stronger claim than comparing decoded
-    pixels: it says the PDF's page *is* that spooled file, not merely a page
-    that looks like it.
-
-    Args:
-        png_bytes: A whole PNG file, as the spool wrote it.
-
-    Returns:
-        Every IDAT chunk's payload, concatenated in file order.
-
-    """
-    payload = bytearray()
-    # 8-byte signature, then length/type/data/CRC chunks to the end.
-    position = 8
-    while position < len(png_bytes):
-        length = int.from_bytes(png_bytes[position : position + 4], "big")
-        chunk_type = png_bytes[position + 4 : position + 8]
-        if chunk_type == b"IDAT":
-            payload += png_bytes[position + 8 : position + 8 + length]
-        position += 12 + length
-    return bytes(payload)
-
-
-def _embedded_streams(pdf_path: Path) -> list[bytes]:
-    """
-    Read each PDF page's single embedded image stream, in page order.
-
-    Raw, not decoded, so the result can be compared with ``_png_idat``.
-
-    Args:
-        pdf_path: The assembled PDF to read.
-
-    Returns:
-        One raw stream per page, in the order the pages appear in the PDF.
-
-    """
-    streams: list[bytes] = []
-    with pikepdf.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            (image,) = pikepdf.Page(page).get_images().values()
-            streams.append(image.read_raw_bytes())
-    return streams
 
 
 class _AssemblingSomewhereDurable:
@@ -482,7 +487,7 @@ class _AssemblingSomewhereDurable:
         output_dir: Path,
         *,
         filename: str,
-        dpi: int,
+        title: str,
     ) -> Path:
         """
         Copy the spooled pages out, then assemble them for real.
@@ -493,7 +498,7 @@ class _AssemblingSomewhereDurable:
             output_dir: The workspace directory the pipeline asked for, which
                 is exactly what this stand-in exists to override.
             filename: The PDF's file name, used unchanged.
-            dpi: The resolution the device reported, used unchanged.
+            title: The document title, used unchanged.
 
         Returns:
             The assembled PDF's path, outside the workspace.
@@ -502,7 +507,7 @@ class _AssemblingSomewhereDurable:
         self.records = list(records)
         self.page_bytes = [record.path.read_bytes() for record in records]
         self.pdf_path = assemble_pdf(
-            records, self._output_dir, filename=filename, dpi=dpi
+            records, self._output_dir, filename=filename, title=title
         )
         return self.pdf_path
 
@@ -551,12 +556,12 @@ def _spooling_at_each_resolution(
 
 
 class TestInterleave:
-    """Unit tests for _interleave_duplex, over spooled page records."""
+    """Unit tests for interleave_duplex, over spooled page records."""
 
     def test_interleave_basic(self, tmp_path: Path) -> None:
         """Interleave 3 fronts + 3 backs correctly reverses backs."""
         _, fronts, backs = _duplex_spool(tmp_path, 3, 3)
-        result = _interleave_duplex(fronts, backs)
+        result = interleave_duplex(fronts, backs)
         assert len(result) == 6
         # Backs are reversed: the last sheet fed in pass B is page 2.
         # Result: front1, back3, front2, back2, front3, back1
@@ -570,7 +575,7 @@ class TestInterleave:
     def test_interleave_single_page(self, tmp_path: Path) -> None:
         """Single front + single back works."""
         _, fronts, backs = _duplex_spool(tmp_path, 1, 1)
-        result = _interleave_duplex(fronts, backs)
+        result = interleave_duplex(fronts, backs)
         assert len(result) == 2
         assert result[0] is fronts[0]
         assert result[1] is backs[0]
@@ -579,25 +584,20 @@ class TestInterleave:
         """Mismatched front/back counts raise ScanError."""
         _, fronts, backs = _duplex_spool(tmp_path, 3, 2)
         with pytest.raises(ScanError, match="Page count mismatch: 3 fronts, 2 backs"):
-            _interleave_duplex(fronts, backs)
+            interleave_duplex(fronts, backs)
 
 
 class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
     """
-    D-02 and D-04: document order is the record list's order, and nothing else.
+    Document order is the record list's order, and nothing else.
 
-    The invariant both tests attack is one sentence: **nothing ever sorts or
-    globs the spool directory to recover page order.**  Order is carried by the
-    record list, and ``PageRecord.sequence`` is the proof of what the device
-    fed.
-
-    They attack it from opposite ends.  The twelve-page test follows a whole
-    simplex job out the far side, reading the assembled PDF back and matching
-    each of its pages against one specific spooled file.  The interleave test
-    builds a duplex job whose filename order is deliberately *not* its document
-    order, and asserts that difference before asserting the order itself -- so
-    an implementation that ever reached for ``sorted()`` or ``glob()`` would
-    fail it rather than pass it by luck.
+    Nothing ever sorts or globs the spool directory to recover page order:
+    order is carried by the record list, and ``PageRecord.sequence`` is the
+    proof of what the device fed.  The twelve-page test reads a simplex job's
+    assembled PDF back, matching each page to one spooled file.  The
+    interleave test builds a duplex job whose filename order is not its
+    document order, so an implementation that reached for ``sorted()`` or
+    ``glob()`` fails it.
     """
 
     def test_twelve_page_order_survives_into_the_assembled_pdf(
@@ -609,21 +609,15 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         """
         A twelve-page scan is pages 1..12 of the PDF, each carrying its own page.
 
-        The equivalence being asserted, stated so this test cannot quietly
-        weaken into "there are twelve pages": for every position *i*, the raw
-        image stream pikepdf reads out of PDF page *i* is **byte-identical** to
-        the concatenated IDAT payload of the PNG that record *i* names.  That
-        is an equality between a PDF page and one specific spooled file.  The
-        twelve spooled files are asserted to be twelve *distinct* byte strings
-        first, so a PDF of twelve identical pages cannot satisfy it, and the
-        records are asserted to carry ``sequence`` 1..12, so the order being
-        matched is the order the device fed.
-
-        The real ``assemble_pdf`` runs: the stand-in only redirects the output
-        somewhere that outlives the job's workspace.
+        For every position *i*, the raw image stream of PDF page *i* is
+        byte-identical to the concatenated IDAT payload of the PNG record *i*
+        names.  The twelve spooled files are distinct and the records carry
+        ``sequence`` 1..12, so neither twelve identical pages nor a reordering
+        passes.  The real ``assemble_pdf`` runs; the stand-in only redirects
+        the output somewhere that outlives the job's workspace.
         """
         default_settings.output.tmp_dir = tmp_path / "scratch"
-        pages = [_distinct_page(index) for index in range(12)]
+        pages = [distinct_page(index) for index in range(12)]
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(pages)
@@ -634,7 +628,9 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Twelve Pages"),
+                request=PipelineRequest(
+                    profile_name="default", title="Twelve Pages", job_id=FIXED_JOB_ID
+                ),
             )
 
         assert result.outcome is ScanOutcome.SUCCESS
@@ -646,9 +642,9 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         assert len(set(assembly.page_bytes)) == 12
 
         assert assembly.pdf_path is not None
-        streams = _embedded_streams(assembly.pdf_path)
+        streams = embedded_streams(assembly.pdf_path)
         assert len(streams) == 12
-        assert streams == [_png_idat(page) for page in assembly.page_bytes]
+        assert streams == [png_idat(page) for page in assembly.page_bytes]
 
     def test_interleave_records_never_recovers_order_from_the_filesystem(
         self, tmp_path: Path
@@ -657,23 +653,17 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         A duplex job whose filename order is deliberately not its document order.
 
         Pass A spools ``a-0001`` to ``a-0003`` and pass B ``b-0001`` to
-        ``b-0003`` into one directory, so sorting that directory by name yields
-        all three fronts and then all three backs.  The document order is
-        front1, back3, front2, back2, front3, back1: a different order.
-
-        The difference is asserted **first**, on purpose.  Without that
-        assertion this test would still pass against an implementation that
-        rebuilt the page list from a sorted glob, which is exactly the mistake
-        D-02 exists to forbid.
-
-        Nothing on disk moves: the interleave reorders records only, and every
-        record's ``path`` is the same before and after.
+        ``b-0003`` into one directory, so a name sort yields all three fronts
+        and then all three backs, while the document order is front1, back3,
+        front2, back2, front3, back1.  That difference is asserted first, so a
+        page list rebuilt from a sorted glob fails.  Nothing on disk moves: the
+        interleave reorders records only, and every ``path`` is unchanged.
         """
         spool_dir, fronts, backs = _duplex_spool(tmp_path, 3, 3)
         paths_before = [record.path for record in [*fronts, *backs]]
         on_disk = [path.name for path in sorted(spool_dir.iterdir())]
 
-        interleaved = _interleave_duplex(fronts, backs)
+        interleaved = interleave_duplex(fronts, backs)
         document_order = [record.path.name for record in interleaved]
 
         assert on_disk != document_order
@@ -722,6 +712,7 @@ class TestPipelineThumbnail:
         request = PipelineRequest(
             profile_name="default",
             title="Thumb Test",
+            job_id=FIXED_JOB_ID,
             thumbnail_callback=thumb_results.append,
         )
         run_pipeline(
@@ -748,6 +739,7 @@ class TestPipelineThumbnail:
         request = PipelineRequest(
             profile_name="default",
             title="No Thumb Test",
+            job_id=FIXED_JOB_ID,
         )
         result = run_pipeline(
             scanner=mock_scanner,
@@ -783,7 +775,9 @@ class TestPipelineEmptyPageFilter:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Filter Test")
+        request = PipelineRequest(
+            profile_name="default", title="Filter Test", job_id=FIXED_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -805,16 +799,17 @@ class TestPipelineEmptyPageFilter:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Custom thresholds from ProfileConfig are passed to filter_empty_pages."""
-        default_settings.profiles["default"].empty_page_mean_threshold = 200.0
-        default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
+        """The profile's coverage threshold is what reaches filter_blank_pages."""
+        default_settings.profiles["default"].empty_page_coverage_threshold = 0.5
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
-        request = PipelineRequest(profile_name="default", title="Threshold Test")
+        request = PipelineRequest(
+            profile_name="default", title="Threshold Test", job_id=FIXED_JOB_ID
+        )
 
-        with patch("saneless.pipeline.filter_empty_pages", wraps=None) as mock_filter:
+        with patch("saneless.pipeline.filter_blank_pages", wraps=None) as mock_filter:
             # A side_effect, not a return_value: what comes back has to be the
             # records the pipeline's own sink produced, because assembly reads
             # their files.
@@ -827,8 +822,7 @@ class TestPipelineEmptyPageFilter:
             )
             mock_filter.assert_called_once()
             _, kwargs = mock_filter.call_args
-            assert kwargs["mean_threshold"] == 200.0
-            assert kwargs["stddev_threshold"] == 10.0
+            assert kwargs == {"coverage_threshold": 0.5}
 
     def test_all_pages_empty_raises(
         self,
@@ -836,18 +830,22 @@ class TestPipelineEmptyPageFilter:
         default_settings: Settings,
     ) -> None:
         """
-        A non-empty batch that detection empties says "All pages were blank".
+        A non-empty batch that detection empties is its own failure, kept as a PDF.
 
-        EXC-03: the blank message is reserved for detection really removing
-        every page, so it names what happened rather than an empty scan.
+        The blank message is reserved for detection really removing every
+        page, so it names what happened rather than an empty scan.  The run
+        raises ``AllPagesBlankError``, not a scanner fault, and the run guard
+        keeps the unfiltered pages as one PDF in ``failed/``.
         """
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
             [_make_empty_image(), _make_empty_image()]
         )
 
-        request = PipelineRequest(profile_name="default", title="All Empty Test")
-        with pytest.raises(ScanError, match=r"^All pages were blank$"):
+        request = PipelineRequest(
+            profile_name="default", title="All Empty Test", job_id=FIXED_JOB_ID
+        )
+        with pytest.raises(AllPagesBlankError) as excinfo:
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -855,10 +853,242 @@ class TestPipelineEmptyPageFilter:
                 request=request,
             )
 
+        assert not isinstance(excinfo.value, ScanError)
+        text = failure_text(excinfo.value)
+        assert text.startswith(
+            "All 2 page(s) looked blank to empty-page detection, "
+            "so nothing was uploaded."
+        )
+        kept = list(default_settings.output.failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert f"The 2 scanned page(s) were preserved at {kept[0]}" in text
+        with pikepdf.open(kept[0]) as pdf:
+            assert len(pdf.pages) == 2
+        mock_paperless.upload_document.assert_not_called()
+
+
+# The resolution the synthetic pages below are drawn at.  A third of a real
+# scan's, so each page is small enough to spool quickly, and every verdict the
+# pages get at full size still holds at it.
+_SMALL_DPI = 100
+
+
+def _typed() -> Image.Image:
+    """
+    Return one typed line on tinted, noisy paper: content under any sane rule.
+
+    Returns:
+        A small A4 page.
+
+    """
+    return typed_line(dpi=_SMALL_DPI)
+
+
+def _blank() -> Image.Image:
+    """
+    Return tinted, noisy paper with nothing on it.
+
+    A mean/stddev rule would keep this page, because tinted paper is darker
+    than its mean threshold; the ink-coverage rule removes it.
+
+    Returns:
+        A small A4 page.
+
+    """
+    return tinted_blank(dpi=_SMALL_DPI)
+
+
+def _run_through_assembly(
+    scanner: MagicMock, paperless: MagicMock, settings: Settings, title: str
+) -> tuple[ScanResult, int]:
+    """
+    Run the pipeline with the real assembly, counting the pages it assembled.
+
+    Args:
+        scanner: The stubbed scanner, already spooling its pages.
+        paperless: The stubbed paperless-ngx client.
+        settings: The run's settings.
+        title: The document title.
+
+    Returns:
+        The run's result, and how many pages the assembled PDF was given.
+
+    """
+    request = PipelineRequest(
+        profile_name="default",
+        title=title,
+        job_id=FIXED_JOB_ID,
+        flip_coordinator=AlwaysContinueFlipCoordinator(),
+    )
+    with patch("saneless.pipeline.assemble_pdf", wraps=assemble_pdf) as assemble:
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=paperless,
+            settings=settings,
+            request=request,
+        )
+    return result, sum(len(call.args[0]) for call in assemble.call_args_list)
+
+
+class TestBlankPagesByInkCoverage:
+    """
+    The pipeline judges pages by ink coverage and names the ones it removed.
+
+    The removed pages are named by their 1-based place in the scanned
+    document -- the interleaved document, for manual duplex -- because that
+    is the number the operator rescans by.  The names are information, not a
+    warning: a run that dropped blank backs is a plain success.
+    """
+
+    def test_simplex_names_the_removed_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Pages 2 and 4 of four are blank: both removed, both named, no warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_typed(), _blank(), _typed(), _blank()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Positions"
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.removed_positions == (2, 4)
+        assert result.pages_scanned == 4
+        assert result.pages_removed == 2
+        assert result.pages_uploaded == 2
+        assert result.warning is None
+        assert assembled == 2
+        mock_paperless.upload_document.assert_called_once()
+
+    def test_manual_duplex_names_the_interleaved_position(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """
+        A blank back is named by its page in the interleaved document.
+
+        Pass B runs over the flipped stack, so its first page is the back of
+        the last sheet.  With two sheets that is page 4 of the document,
+        whatever number the spool gave it.
+        """
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_typed(), _typed()], [_blank(), _typed()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Duplex Positions"
+        )
+
+        assert result.removed_positions == (4,)
+        assert result.pages_removed == 1
+        assert result.warning is None
+        assert assembled == 3
+
+    def test_detection_off_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """With detection off nothing is removed, so nothing is named."""
+        default_settings.profiles["default"].enable_empty_page_detection = False
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_typed(), _blank()])
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Detection Off"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+        assert assembled == 2
+
+    def test_nothing_removed_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """A run with no blank page reports an empty set of positions."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_typed(), _typed()])
+
+        result, _ = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Nothing Removed"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+
+    def test_the_default_profile_keeps_a_page_number_page(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """
+        A page carrying only a footer page number is uploaded, not dropped.
+
+        On bright paper a mean/stddev rule removes this page, losing a real
+        page of the document.
+        """
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_typed(), footer_page_number(tint=255, dpi=_SMALL_DPI)]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Page Number"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_uploaded == 2
+        assert assembled == 2
+
+    def test_every_page_blank_by_coverage_fails_and_keeps_the_pdf(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Tinted and framed blanks are all removed: nothing uploaded, PDF kept."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_blank(), framed_blank(3, dpi=_SMALL_DPI)]
+        )
+
+        request = PipelineRequest(
+            profile_name="default", title="All Tinted Blank", job_id=FIXED_JOB_ID
+        )
+        with pytest.raises(AllPagesBlankError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        kept = list(default_settings.output.failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        with pikepdf.open(kept[0]) as pdf:
+            assert len(pdf.pages) == 2
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_a_duplex_mismatch_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """The mismatch route skips detection, so it names nothing, blank or not."""
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_typed(), _typed(), _typed()], [_blank(), _typed()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Mismatch"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+        assert assembled == 5
+
 
 class TestFlipAnswerSlot:
     """
-    The one claim-once answer both flip coordinators compose (IN-02).
+    The one claim-once answer both flip coordinators compose.
 
     Every wait here is bounded, and none sleeps: a wait on an answered slot
     returns because its event is already set, and a wait on an unanswered one
@@ -870,7 +1100,7 @@ class TestFlipAnswerSlot:
         assert FlipAnswerSlot().answer is None
 
     def test_the_first_offer_claims_and_a_later_one_is_dropped(self) -> None:
-        """D-16: the first offer is the answer, and a later offer changes nothing."""
+        """The first offer is the answer, and a later offer changes nothing."""
         slot = FlipAnswerSlot()
         assert slot.offer(FlipOutcome.CONTINUED) is True
         assert slot.answer is FlipOutcome.CONTINUED
@@ -938,6 +1168,7 @@ class TestFlipAnswerSlot:
             threading.Thread(
                 target=_offer,
                 args=(FlipOutcome.CONTINUED if i % 2 else FlipOutcome.ABORTED,),
+                daemon=True,
             )
             for i in range(contenders)
         ]
@@ -945,6 +1176,7 @@ class TestFlipAnswerSlot:
             thread.start()
         for thread in threads:
             thread.join(timeout=5)
+            assert not thread.is_alive()
 
         assert len(results) == contenders
         winners = [outcome for outcome, claimed in results if claimed]
@@ -953,7 +1185,7 @@ class TestFlipAnswerSlot:
 
     def test_the_slot_is_public_api(self) -> None:
         """``FlipAnswerSlot`` is exported next to the coordinator contract."""
-        assert "FlipAnswerSlot" in pipeline_module.__all__
+        assert "FlipAnswerSlot" in flip_module.__all__
 
 
 class _FixedFlipCoordinator(FlipCoordinator):
@@ -1040,31 +1272,37 @@ class TestFlipCoordinatorContract:
 
         ``abort_cause`` is concrete on the ABC, so an ``ABORTED`` answer from a
         coordinator that never overrides it is always an operator's abort -- a
-        cancel -- and existing coordinators need no change (D-02).
+        cancel -- and existing coordinators need no change.
         """
         coordinator = _FixedFlipCoordinator(FlipOutcome.ABORTED)
 
         assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
 
-    def test_abort_cause_adds_no_fourth_flip_outcome(self) -> None:
-        """The cause travels beside the outcome, never as a new member (D-09)."""
+    def test_abort_cause_adds_no_flip_outcome_of_its_own(self) -> None:
+        """
+        The cause travels beside the outcome, never as a new member.
+
+        The fourth member is a server stop, which is a different ending, not a
+        broken prompt.
+        """
         assert set(FlipOutcome) == {
             FlipOutcome.CONTINUED,
             FlipOutcome.ABORTED,
             FlipOutcome.TIMED_OUT,
+            FlipOutcome.INTERRUPTED,
         }
 
 
 class TestZeroPages:
     """
-    An empty batch is reported truthfully at the pipeline boundary (EXC-03, N-06).
+    An empty batch is reported truthfully at the pipeline boundary.
 
-    Before this check an empty batch was misreported as all-blank with
-    detection on, and leaked img2pdf's bare ``ValueError`` with it off or on an
-    empty duplex half. The SANE backend never returns an empty batch --
-    an empty feeder raises ``FeederEmptyError`` (Phase 24 D-03) -- so these
-    tests drive the pipeline's contract check with a stubbed backend.
+    It is reported as neither all-blank nor img2pdf's bare ``ValueError``,
+    with detection on or off and on either duplex half.  The SANE backend
+    never returns an empty batch -- an empty feeder raises
+    ``FeederEmptyError`` -- so these tests drive the pipeline's contract
+    check with a stubbed backend.
     """
 
     @pytest.mark.parametrize("detection", [True, False])
@@ -1079,14 +1317,16 @@ class TestZeroPages:
         An empty simplex batch raises "No pages were scanned", detection on or off.
 
         Assembly and upload are never reached, so img2pdf never sees an empty
-        list (N-06).
+        list.
         """
         default_settings.profiles["default"].enable_empty_page_detection = detection
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([])
 
-        request = PipelineRequest(profile_name="default", title="Zero Pages")
+        request = PipelineRequest(
+            profile_name="default", title="Zero Pages", job_id=FIXED_JOB_ID
+        )
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
             pytest.raises(ScanError, match=r"^No pages were scanned$"),
@@ -1106,7 +1346,7 @@ class TestZeroPages:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """An empty manual-duplex pass A raises before the flip prompt (EXC-03)."""
+        """An empty manual-duplex pass A raises before the flip prompt."""
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1117,6 +1357,7 @@ class TestZeroPages:
         request = PipelineRequest(
             profile_name="default",
             title="Empty Pass A",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=coordinator,
         )
         with pytest.raises(ScanError, match=r"^No pages were scanned$"):
@@ -1138,18 +1379,14 @@ class TestZeroPages:
         tmp_path: Path,
     ) -> None:
         """
-        An empty manual-duplex pass B raises before the count comparison (EXC-03).
+        An empty manual-duplex pass B raises before the count comparison.
 
         Without the check the counts differ and the mismatch recovery would try
         to assemble the empty back half.  The message names the pass and what
-        pass A scanned: "No pages were scanned" would be false once the fronts
-        were fed (IN-01).
-
-        Since plan 29-09 the fronts are preserved rather than discarded, so the
-        message carries a preservation clause after the sentence pinned here
-        and no half is *delivered* -- which is what "before any half is
-        assembled" was always guarding.  The preserved half itself is covered
-        by ``TestPassBAndFlipFailuresKeepTheFronts``.
+        pass A scanned, since "No pages were scanned" is false once the fronts
+        were fed.  The fronts are preserved, so a preservation clause follows
+        the sentence pinned here, and no half is delivered; the preserved half
+        is covered by ``TestPassBAndFlipFailuresKeepTheFronts``.
         """
         _duplex_settings(default_settings, tmp_path)
 
@@ -1162,13 +1399,7 @@ class TestZeroPages:
             job_id="job-empty-b",
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.CONTINUED),
         )
-        with pytest.raises(
-            ScanError,
-            match=(
-                r"^No back pages were scanned in pass B "
-                r"\(pass A scanned 1 front page\(s\)\)\."
-            ),
-        ):
+        with pytest.raises(ScanError) as excinfo:
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -1176,6 +1407,11 @@ class TestZeroPages:
                 request=request,
             )
 
+        assert failure_text(excinfo.value).startswith(
+            "No back pages were scanned in pass B "
+            "(pass A scanned 1 front page(s)). The 1 page(s) scanned before "
+            "the error were preserved at "
+        )
         assert scanner.scan_pages.call_count == 2
         mock_paperless.upload_document.assert_not_called()
 
@@ -1184,14 +1420,21 @@ class TestZeroPages:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Detection removing every page of a non-empty batch is "blank" (EXC-03)."""
+        """
+        Detection removing every page of a non-empty batch is "blank".
+
+        The run's own assembly never starts; the only PDF built is the
+        preservation's, of the unfiltered pages.
+        """
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_empty_image()])
 
-        request = PipelineRequest(profile_name="default", title="All Blank")
+        request = PipelineRequest(
+            profile_name="default", title="All Blank", job_id=FIXED_JOB_ID
+        )
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
-            pytest.raises(ScanError, match=r"^All pages were blank$"),
+            pytest.raises(AllPagesBlankError) as excinfo,
         ):
             run_pipeline(
                 scanner=scanner,
@@ -1201,6 +1444,9 @@ class TestZeroPages:
             )
 
         mock_assemble.assert_not_called()
+        assert failure_text(excinfo.value).startswith(
+            "All 1 page(s) looked blank to empty-page detection"
+        )
 
     def test_an_empty_feeder_keeps_its_own_message(
         self,
@@ -1208,7 +1454,7 @@ class TestZeroPages:
         default_settings: Settings,
     ) -> None:
         """
-        ``FeederEmptyError`` propagates unchanged (Phase 24 D-03).
+        ``FeederEmptyError`` propagates unchanged.
 
         The zero-page check runs on a returned batch, so it can never replace
         the backend's more specific feeder message.
@@ -1216,7 +1462,9 @@ class TestZeroPages:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = FeederEmptyError("No paper detected in feeder")
 
-        request = PipelineRequest(profile_name="default", title="Feeder Empty")
+        request = PipelineRequest(
+            profile_name="default", title="Feeder Empty", job_id=FIXED_JOB_ID
+        )
         with pytest.raises(FeederEmptyError, match=r"^No paper detected in feeder$"):
             run_pipeline(
                 scanner=scanner,
@@ -1250,6 +1498,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Test",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1285,6 +1534,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Mismatch Test",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1322,13 +1572,12 @@ class TestManualDuplex:
 
         The mismatch path uploads twice. If either upload fell back, the run did
         not reach paperless-ngx and must not claim SUCCESS -- that is precisely
-        the lie ScanOutcome.FALLBACK exists to prevent (CTR-02).
+        the lie ScanOutcome.FALLBACK exists to prevent.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=False,
-            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        mock_paperless.upload_document.return_value = FolderDelivery(
+            path=tmp_path / "consume" / "doc.pdf"
         )
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -1344,6 +1593,7 @@ class TestManualDuplex:
             request=PipelineRequest(
                 profile_name="default",
                 title="Mismatch Fallback",
+                job_id=FIXED_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -1359,15 +1609,12 @@ class TestManualDuplex:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """A partially-delivered mismatch is still FALLBACK, not SUCCESS (CTR-02)."""
+        """A partially-delivered mismatch is still FALLBACK, not SUCCESS."""
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.side_effect = [
-            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-            UploadResult(
-                delivered_to_api=False,
-                consume_dir_path=tmp_path / "consume" / "backs.pdf",
-            ),
+            ApiDelivery(task_id="fronts-task"),
+            FolderDelivery(path=tmp_path / "consume" / "backs.pdf"),
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -1383,6 +1630,7 @@ class TestManualDuplex:
             request=PipelineRequest(
                 profile_name="default",
                 title="Half Delivered",
+                job_id=FIXED_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -1408,6 +1656,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Normal Duplex",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1446,6 +1695,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Filter Test",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1483,6 +1733,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Thumb Test",
+            job_id=FIXED_JOB_ID,
             thumbnail_callback=thumb_results.append,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -1503,12 +1754,12 @@ class TestManualDuplex:
         default_settings: Settings,
     ) -> None:
         """
-        The flip wait is one bounded call to the coordinator (DPLX-04, DPLX-05).
+        The flip wait is one bounded call to the coordinator.
 
         ``AWAITING_FLIP`` is announced before the wait and ``SCANNING_REVERSE``
         only after it, and the timeout handed over is the configured one.
         """
-        default_settings.output.flip_timeout_seconds = 42
+        default_settings.output.operator_wait_timeout_seconds = 42
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1522,6 +1773,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Coordinator Wait Test",
+            job_id=FIXED_JOB_ID,
             status_callback=events.append,
             flip_coordinator=coordinator,
         )
@@ -1544,12 +1796,12 @@ class TestManualDuplex:
         default_settings: Settings,
     ) -> None:
         """
-        An operator's ABORTED cancels the run before pass B (EXC-04, N-08).
+        An operator's ABORTED cancels the run before pass B.
 
         Web Abort, n, Ctrl-D and Ctrl-C all reach the pipeline as ``ABORTED``
         with no ``abort_cause``: someone chose to stop, so the run raises
         ``ScanCancelledError`` -- never a ``ScanError`` -- and the worker and
-        the CLI record a cancel rather than a scanner failure (D-01, D-02).
+        the CLI record a cancel rather than a scanner failure.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -1560,6 +1812,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Abort Test",
+            job_id=FIXED_JOB_ID,
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
         )
 
@@ -1587,13 +1840,14 @@ class TestManualDuplex:
         """
         An ``ABORTED`` with an ``abort_cause`` fails the run, chained to the cause.
 
-        A broken terminal prompt is not anyone's choice to stop (D-02, WR-08),
-        so it raises ``ScanError`` -- exit 1 at the CLI, ERROR on the web --
-        naming what broke, with the original exception as ``__cause__``.
+        A broken terminal prompt is not anyone's choice to stop, so it raises
+        ``ScanError`` -- exit 1 at the CLI, ERROR on the web -- naming what
+        broke, with the original exception as ``__cause__``.
 
-        Because nobody chose to stop, plan 29-09 also keeps pass A's fronts,
-        so the message continues past the sentence pinned here.  ``__cause__``
-        is still the OSError the prompt raised, not the re-raise in between.
+        Because nobody chose to stop, pass A's fronts are kept, so the failure
+        text continues past the sentence pinned here.  The run guard re-raises
+        the very ``ScanError`` this path built, so its ``__cause__`` is the
+        OSError the prompt raised, with no link in between.
         """
         _duplex_settings(default_settings, tmp_path)
 
@@ -1608,9 +1862,7 @@ class TestManualDuplex:
             flip_coordinator=_BrokenPromptFlipCoordinator(cause),
         )
 
-        with pytest.raises(
-            ScanError, match=r"^Flip prompt failed: \[Errno 5\] Input/output error\."
-        ) as excinfo:
+        with pytest.raises(ScanError) as excinfo:
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -1619,13 +1871,13 @@ class TestManualDuplex:
             )
 
         assert not isinstance(excinfo.value, ScanCancelledError)
-        # One link longer than it used to be, and nothing is lost: the escaping
-        # exception chains the ScanError this path built, which still chains
-        # the OSError the prompt raised.  The extra link is the preservation
-        # re-raise, which keeps the type and appends where the fronts went.
-        preserved_from = excinfo.value.__cause__
-        assert isinstance(preserved_from, ScanError)
-        assert preserved_from.__cause__ is cause
+        assert failure_text(excinfo.value).startswith(
+            "Flip prompt failed: [Errno 5] Input/output error. The 1 page(s) "
+            "scanned before the error were preserved at "
+        )
+        # The guard adds a note and re-raises the same object, so the chain is
+        # the one this path built: straight to the OSError the prompt raised.
+        assert excinfo.value.__cause__ is cause
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
 
@@ -1635,9 +1887,9 @@ class TestManualDuplex:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """TIMED_OUT fails the run naming the flip wait and its timeout (DPLX-05)."""
+        """TIMED_OUT fails the run naming the flip wait and its timeout."""
         _duplex_settings(default_settings, tmp_path)
-        default_settings.output.flip_timeout_seconds = 17
+        default_settings.output.operator_wait_timeout_seconds = 17
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
@@ -1657,14 +1909,170 @@ class TestManualDuplex:
                 request=request,
             )
 
-        assert "17" in str(excinfo.value)
+        assert "17" in failure_text(excinfo.value)
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
+
+    def test_a_flip_timeout_next_step_names_the_wait_setting(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The error run_pipeline raises says to answer in time, or allow longer.
+
+        The scanner did nothing wrong, so the scanner category's advice does
+        not fit; the raise site knows the wait setting, and its next step
+        survives the run guard, which re-raises the same object.
+        """
+        _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Timeout Next Step",
+                    job_id="job-flip-timeout-next-step",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.TIMED_OUT),
+                ),
+            )
+
+        next_step = excinfo.value.next_step
+        assert next_step is not None
+        assert "operator_wait_timeout_seconds" in next_step
+        assert "flip prompt" in next_step
+        assert "scanner" not in next_step
+
+    def test_a_broken_flip_prompt_next_step_is_about_the_terminal(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A prompt that could not be read points at the terminal, not the scanner."""
+        _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+        cause = OSError(5, "Input/output error")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Broken Prompt Next Step",
+                    job_id="job-broken-prompt-next-step",
+                    flip_coordinator=_BrokenPromptFlipCoordinator(cause),
+                ),
+            )
+
+        next_step = excinfo.value.next_step
+        assert next_step is not None
+        assert "terminal" in next_step
+        assert "scanner" not in next_step
+        assert str(cause) not in next_step
+
+    def test_a_server_stop_at_the_flip_keeps_the_fronts(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        INTERRUPTED is an interruption: the run raises ScanInterrupted and keeps.
+
+        A server stop is nobody's decision to throw the scan away, so unlike
+        an Abort it keeps pass A's fronts.  ``signum`` is ``None`` because no
+        signal was involved, and the failure text names the kept PDF.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Stopped At The Flip",
+            job_id="job-server-stop",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.INTERRUPTED),
+        )
+
+        with pytest.raises(ScanInterrupted) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert excinfo.value.signum is None
+        preserved = sorted(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+        text = failure_text(excinfo.value)
+        assert "preserved at " in text
+        assert preserved[0].name in text
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_the_preserving_event_is_set_only_while_pages_are_kept(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A stopping server can tell that a failed run's pages are still moving.
+
+        ``PipelineRequest.preserving`` is set before the guard starts keeping
+        the pages and cleared once it is done, so ``ScanWorker.stop`` knows
+        when waiting a little longer saves the fronts.
+        """
+        _duplex_settings(default_settings, tmp_path)
+        preserving = threading.Event()
+        seen_during_move: list[bool] = []
+        real_move = preservation_module.move_private
+
+        def observing_move(source: Path, destination: Path) -> None:
+            seen_during_move.append(preserving.is_set())
+            real_move(source, destination)
+
+        monkeypatch.setattr(preservation_module, "move_private", observing_move)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+        request = PipelineRequest(
+            profile_name="default",
+            title="Watched While Kept",
+            job_id="job-preserving",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.INTERRUPTED),
+            preserving=preserving,
+        )
+
+        assert not preserving.is_set()
+        with pytest.raises(ScanInterrupted):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert seen_during_move == [True]
+        assert not preserving.is_set()
 
 
 class TestManualDuplexPassCounts:
     """
-    ``pass_count_callback`` carries each pass's page count out mid-run (A-4).
+    ``pass_count_callback`` carries each pass's page count out mid-run.
 
     ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
     payload, so ``SCANNING_REVERSE`` cannot tell an observer how many fronts
@@ -1696,14 +2104,17 @@ class TestManualDuplexPassCounts:
         return PipelineRequest(
             profile_name="default",
             title="Pass Count Test",
+            job_id=FIXED_JOB_ID,
             status_callback=status_callback,
             pass_count_callback=pass_count_callback,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
     def test_pass_count_callback_defaults_to_none(self) -> None:
-        """A request built without one behaves exactly as it did before."""
-        request = PipelineRequest(profile_name="default", title="No Counts")
+        """A request built without a pass-count observer has none."""
+        request = PipelineRequest(
+            profile_name="default", title="No Counts", job_id=FIXED_JOB_ID
+        )
 
         assert request.pass_count_callback is None
 
@@ -1840,9 +2251,218 @@ def _two_pass_scanner() -> MagicMock:
     return scanner
 
 
+def _scanner_listing(*names: str) -> MagicMock:
+    """
+    Build a scanner mock whose ``get_devices`` lists ``names`` in order.
+
+    Args:
+        *names: The SANE ids to report, first one first.
+
+    Returns:
+        A mock backend.
+
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.get_devices.return_value = [
+        DeviceInfo(name=name, vendor="V", model="M", device_type="t") for name in names
+    ]
+    return scanner
+
+
+def _pipeline_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    Pick the pipeline logger's records out of everything captured.
+
+    Args:
+        caplog: pytest's log capture.
+
+    Returns:
+        The records ``saneless.pipeline`` emitted.
+
+    """
+    return [record for record in caplog.records if record.name == "saneless.pipeline"]
+
+
+class TestResolveDeviceChange:
+    """
+    A worker remembers the device it auto-detected, and says when it changes.
+
+    With ``scanner.device`` empty every scan goes to the first listed device,
+    so a scanner that appears on the LAN between two jobs silently takes the
+    second one.  The change is logged at WARNING, and nothing refuses to scan.
+    """
+
+    def test_device_change_between_jobs_logs_one_warning(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A different first device than last time is one WARNING naming both."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(
+                _scanner_listing("dev:b", "dev:a"), default_settings, memory
+            )
+
+        assert chosen == "dev:b"
+        assert memory.last_id == "dev:b"
+        warnings = [
+            record.getMessage()
+            for record in _pipeline_records(caplog)
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "'dev:a'" in warnings[0]
+        assert "'dev:b'" in warnings[0]
+
+    def test_device_change_first_detection_logs_info_only(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The first detection has nothing to differ from: one INFO."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory()
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(
+                _scanner_listing("dev:a"), default_settings, memory
+            )
+
+        assert chosen == "dev:a"
+        assert memory.last_id == "dev:a"
+        levels = [record.levelno for record in _pipeline_records(caplog)]
+        assert levels == [logging.INFO]
+
+    def test_device_change_same_device_logs_info_only(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The same device again is no change."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            _resolve_device(_scanner_listing("dev:a"), default_settings, memory)
+
+        levels = [record.levelno for record in _pipeline_records(caplog)]
+        assert levels == [logging.INFO]
+
+    def test_device_change_without_memory_is_todays_behaviour(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The CLI passes no memory: one INFO naming the device with repr."""
+        default_settings.scanner.device = ""
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(_scanner_listing("dev:b"), default_settings)
+
+        assert chosen == "dev:b"
+        messages = [
+            (record.levelno, record.getMessage())
+            for record in _pipeline_records(caplog)
+        ]
+        assert messages == [(logging.INFO, "Auto-detected scanner: 'dev:b'")]
+
+    def test_device_change_is_not_checked_for_a_pinned_device(
+        self, default_settings: Settings
+    ) -> None:
+        """A configured device is used as is; discovery never runs."""
+        memory = DeviceMemory(last_id="dev:a")
+        scanner = _scanner_listing("dev:b")
+
+        chosen = _resolve_device(scanner, default_settings, memory)
+
+        assert chosen == default_settings.scanner.device
+        scanner.get_devices.assert_not_called()
+        assert memory.last_id == "dev:a"
+
+    def test_device_change_memory_travels_on_the_request(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``run_pipeline`` hands ``request.device_memory`` to the resolution."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+        scanner = _two_pass_scanner()
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Memory",
+                    job_id=FIXED_JOB_ID,
+                    device_memory=memory,
+                ),
+            )
+
+        assert memory.last_id == "test:auto:001"
+        assert any(
+            "'dev:a'" in record.getMessage()
+            and "'test:auto:001'" in record.getMessage()
+            for record in _pipeline_records(caplog)
+            if record.levelno == logging.WARNING
+        )
+
+
+class TestNoScannerFound:
+    """
+    Finding no scanner is a scanner condition, never a configuration one.
+
+    An empty ``scanner.device`` is a valid setting that asks for discovery;
+    discovery finding nothing means the scanner is off, unplugged or out of
+    reach.  So the failure is a ``ScanError``, classified SCANNER, exit 1,
+    with the advice to check the scanner rather than the file.
+    """
+
+    def test_no_scanner_found_raises_no_scanner_found_error(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """No device set and none discovered is ``NoScannerFoundError``."""
+        default_settings.scanner.device = ""
+        scanner = _scanner_listing()
+
+        with pytest.raises(NoScannerFoundError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Nothing", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        assert failure_text(excinfo.value).startswith("No scanner found: ")
+        scanner.scan_pages.assert_not_called()
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_no_scanner_found_is_classified_as_a_scanner_error(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """The category is SCANNER, the exit code 1, the advice the scanner's."""
+        default_settings.scanner.device = ""
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_scanner_listing(),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Nothing", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        category = classify_error(excinfo.value)
+        assert category is ErrorCategory.SCANNER
+        assert exit_code_for(category) is ExitCode.SCAN
+        assert "switched on and connected" in error_advice(category).next_step
+
+
 class TestDuplexStrategy:
     """
-    ``profile.duplex`` alone chooses the scanning strategy (DPLX-01, DPLX-03).
+    ``profile.duplex`` alone chooses the scanning strategy.
 
     ``source`` is a pure SANE value: a source that merely reads like manual
     duplex must not start the two-pass flow, and a manual-duplex profile must
@@ -1872,10 +2492,12 @@ class TestDuplexStrategy:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No Coordinator"),
+                request=PipelineRequest(
+                    profile_name="default", title="No Coordinator", job_id=FIXED_JOB_ID
+                ),
             )
 
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "'default'" in message
         assert "flip coordinator" in message
         scanner.get_devices.assert_not_called()
@@ -1897,7 +2519,9 @@ class TestDuplexStrategy:
             scanner=scanner,
             paperless=mock_paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Looks Duplex"),
+            request=PipelineRequest(
+                profile_name="default", title="Looks Duplex", job_id=FIXED_JOB_ID
+            ),
         )
 
         assert scanner.scan_pages.call_count == 1
@@ -1921,6 +2545,7 @@ class TestDuplexStrategy:
             request=PipelineRequest(
                 profile_name="default",
                 title="Plain Feeder Duplex",
+                job_id=FIXED_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -1929,25 +2554,149 @@ class TestDuplexStrategy:
         assert result.pages_scanned == 2
 
 
+# A sheet the real backend refuses: 10x10 RGB is 300 raw bytes, far under its
+# 10 KB integrity floor, so the pass counts it as rejected and spools nothing.
+_UNREADABLE = "unreadable"
+
+
+def _rgb(colour: str) -> tuple[int, int, int]:
+    """
+    Name the RGB value a ``_make_content_image`` page carries at its centre.
+
+    Args:
+        colour: The colour name the page was drawn with.
+
+    Returns:
+        That colour as an RGB triple.
+
+    """
+    red, green, blue = ImageColor.getrgb(colour)[:3]
+    return (red, green, blue)
+
+
+def _sheet(colour: str) -> Image.Image:
+    """
+    Build one fed sheet: a content page, or one the backend cannot read.
+
+    Args:
+        colour: The page's colour, or ``_UNREADABLE``.
+
+    Returns:
+        The image to load into the fake feeder.
+
+    """
+    if colour == _UNREADABLE:
+        return Image.new("RGB", (10, 10), "white")
+    return _make_content_image(colour)
+
+
+def _page_colours(pdf: bytes) -> list[tuple[int, int, int]]:
+    """
+    Read the colour at the centre of each page of a PDF, in page order.
+
+    Decoded from the embedded image itself, so the answer is what the page
+    shows rather than anything about how it was named or spooled.
+
+    Args:
+        pdf: The whole PDF.
+
+    Returns:
+        One RGB triple per page.
+
+    """
+    colours: list[tuple[int, int, int]] = []
+    with pikepdf.open(io.BytesIO(pdf)) as document:
+        for page in document.pages:
+            (image,) = pikepdf.Page(page).get_images().values()
+            assert isinstance(image, pikepdf.Stream)
+            decoded = pikepdf.PdfImage(image).as_pil_image().convert("RGB")
+            pixel = decoded.getpixel((decoded.width // 2, decoded.height // 2))
+            assert isinstance(pixel, tuple)
+            red, green, blue = pixel
+            colours.append((red, green, blue))
+    return colours
+
+
+def _manual_duplex_over_the_fake(
+    fronts: Sequence[str],
+    backs: Sequence[str],
+    paperless: MagicMock,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ScanResult, list[tuple[str, bytes]]]:
+    """
+    Run a manual duplex job through the real backend, assembly and all.
+
+    Args:
+        fronts: The colour of each sheet pass A is fed, in feed order.
+        backs: The colour of each sheet pass B is fed, in feed order.
+        paperless: The paperless mock, whose uploads are captured.
+        settings: Application settings; the default profile becomes a
+            manual-duplex feeder profile.
+        monkeypatch: Swaps the backend's ``sane`` module for the shared fake.
+
+    Returns:
+        The run's result and, per upload, its title and the PDF's bytes --
+        read during the upload, because the workspace is gone afterwards.
+
+    """
+    profile = settings.profiles["default"]
+    profile.source = "ADF"
+    profile.duplex = "manual"
+    profile.mode = "Color"
+
+    dev = FakeSaneDev()
+    dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+    dev.load_feeder([_sheet(colour) for colour in fronts])
+    monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
+
+    def _reload_the_stack(event: PipelineEvent) -> None:
+        """Put the flipped stack back when the pipeline asks for it."""
+        if event is PipelineEvent.AWAITING_FLIP:
+            dev.load_feeder([_sheet(colour) for colour in backs])
+
+    uploads: list[tuple[str, bytes]] = []
+
+    def _capture(
+        pdf_path: Path,
+        title: str,
+        tags: list[int] | None = None,
+        correspondent: int | None = None,
+    ) -> UploadResult:
+        """Keep the PDF as uploaded, and accept it."""
+        del tags, correspondent
+        uploads.append((title, pdf_path.read_bytes()))
+        return ApiDelivery(task_id=f"task-{len(uploads)}")
+
+    paperless.upload_document.side_effect = _capture
+
+    result = run_pipeline(
+        scanner=SaneBackend(),
+        paperless=paperless,
+        settings=settings,
+        request=PipelineRequest(
+            profile_name="default",
+            title="Duplex over the shared fake",
+            job_id=FIXED_JOB_ID,
+            status_callback=_reload_the_stack,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+        ),
+    )
+    return result, uploads
+
+
 class TestManualDuplexOverTheSharedFake:
     """
-    A manual duplex run driven through a real SaneBackend (SCNR-07, M-32).
+    A manual duplex run driven through a real SaneBackend.
 
-    Every other pipeline test here hands ``run_pipeline`` a
-    ``MagicMock(spec=ScannerBackend)``, which can only ever return what the test
-    already told it to return.  A SANE-level defect on a duplex path -- a source
-    never assigned to the device, a feeder never rewound, a second pass handing
-    back the first pass's sheets -- cannot surface through a mock like that,
-    which is M-32's actual complaint.  This test drives the pipeline through the
-    real backend over the one shared fake, so such a defect can.
-
-    The two passes share one device handle.  ``scan_pages`` opens and closes the
-    device per pass and drains the feeder to its end, so the stack has to be
-    reloaded between them -- which is precisely the physical act manual duplex
-    asks the operator to perform.  The pipeline announces that moment with
-    ``AWAITING_FLIP`` *before* it asks the flip coordinator, so the status
-    callback is the honest place to do the reload: no second device, no thread,
-    and the reload happens exactly when the operator's would.
+    A ``MagicMock(spec=ScannerBackend)`` returns only what the test told it
+    to, so a SANE-level duplex defect -- a source never assigned, a feeder
+    never rewound, a second pass handing back the first pass's sheets --
+    cannot surface through it.  These tests drive the real backend over the
+    one shared fake.  ``scan_pages`` drains the feeder each pass, so the
+    status callback reloads the stack on ``AWAITING_FLIP``, which the
+    pipeline announces before it asks the flip coordinator: exactly when the
+    operator would reload it, with no second device and no thread.
     """
 
     def test_both_passes_run_through_the_backend_and_interleave(
@@ -1964,13 +2713,13 @@ class TestManualDuplexOverTheSharedFake:
         ``"Automatic Document Feeder"``, with no plain ``"ADF"`` and no
         manual-duplex pseudo-source, while the profile says ``source = "ADF"``
         as the how-to teaches. Only resolving the feeder from the device's own
-        list can make this pass (C-01, D-02).
+        list can make this pass.
         """
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
         profile.duplex = "manual"
-        # The fake carries the real device's list constraints, which reject an
-        # unlisted value -- so the mode is the device's own spelling.
+        # The device's own spelling.  Like libsane, the fake would also take a
+        # case-differing unique prefix such as "color" and store "Color".
         profile.mode = "Color"
 
         dev = FakeSaneDev()
@@ -1978,7 +2727,7 @@ class TestManualDuplexOverTheSharedFake:
         fronts = [_make_content_image(c) for c in ["red", "green", "blue"]]
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
         dev.load_feeder(fronts)
-        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         def _reload_the_stack(event: PipelineEvent) -> None:
             """Put the flipped stack back when the pipeline asks for it."""
@@ -1988,6 +2737,7 @@ class TestManualDuplexOverTheSharedFake:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex over the shared fake",
+            job_id=FIXED_JOB_ID,
             status_callback=_reload_the_stack,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -2013,6 +2763,82 @@ class TestManualDuplexOverTheSharedFake:
         assert dev.calls.count("snap") == 6
         assert dev.source == "Automatic Document Feeder"
 
+    def test_two_skip_manual_duplex_is_delivered_as_two_pdfs(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Each pass loses a different sheet: the halves are never interleaved.
+
+        Four sheets. Pass A cannot read sheet 2's front; pass B, fed the flipped
+        stack last sheet first, cannot read sheet 4's back. Both passes then
+        read three pages, so the counts agree -- and interleaving them would
+        pair sheet 3's front with sheet 2's back and sheet 4's front with
+        sheet 3's back, delivered as one successful document. Nothing in the
+        run can prove which back belongs to which front, so both halves go to
+        paperless-ngx separately with the reason stated.
+
+        The real backend rejects each 10x10 sheet under its byte floor, and
+        the real assembly builds both PDFs.
+        """
+        fronts = ["red", _UNREADABLE, "blue", "green"]
+        # Fed as the flipped stack comes out of the feeder: sheet 4's back
+        # first, sheet 1's back last.
+        backs = [_UNREADABLE, "yellow", "magenta", "cyan"]
+
+        result, uploads = _manual_duplex_over_the_fake(
+            fronts, backs, mock_paperless, default_settings, monkeypatch
+        )
+
+        assert [title for title, _ in uploads] == [
+            "Duplex over the shared fake (fronts)",
+            "Duplex over the shared fake (backs)",
+        ]
+        (_, fronts_pdf), (_, backs_pdf) = uploads
+        assert _page_colours(fronts_pdf) == [_rgb("red"), _rgb("blue"), _rgb("green")]
+        # Sheet order: the reverse of the order pass B produced them.
+        assert _page_colours(backs_pdf) == [
+            _rgb("cyan"),
+            _rgb("magenta"),
+            _rgb("yellow"),
+        ]
+        assert result.warning is not None
+        assert "could not read 2 sheet" in result.warning
+        assert "paired" in result.warning
+        # Said once, in the mismatch sentence, not again in the generic one.
+        assert "were skipped" not in result.warning
+        assert "Page count mismatch" not in result.warning
+
+    def test_one_rejected_sheet_with_equal_counts_still_splits(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        One sheet lost on pass A alone is enough to stop the interleave.
+
+        Pass A reads two of three fronts; pass B reads two backs. The counts
+        agree, but a sheet went missing on one pass, so position does not
+        prove which back belongs to which front.
+        """
+        fronts = ["red", _UNREADABLE, "blue"]
+        backs = ["yellow", "cyan"]
+
+        result, uploads = _manual_duplex_over_the_fake(
+            fronts, backs, mock_paperless, default_settings, monkeypatch
+        )
+
+        assert [title for title, _ in uploads] == [
+            "Duplex over the shared fake (fronts)",
+            "Duplex over the shared fake (backs)",
+        ]
+        assert result.warning is not None
+        assert "could not read 1 sheet," in result.warning
+        assert "paired" in result.warning
+
     def test_a_device_with_no_feeder_refuses_before_pass_a(
         self,
         mock_paperless: MagicMock,
@@ -2022,10 +2848,10 @@ class TestManualDuplexOverTheSharedFake:
         """
         A flatbed-plus-Auto device fails loudly instead of snapshotting twice.
 
-        This is C-01's silent path: ``Auto`` on offer, ``auto_source_mode`` at
-        its ``"flatbed"`` default, and manual duplex used to take one platen
-        snapshot per pass and report a green Complete. Now no page is taken,
-        the operator is never asked to flip, and nothing is uploaded.
+        With ``Auto`` on offer and ``auto_source_mode`` at its ``"flatbed"``
+        default, manual duplex would otherwise take one platen snapshot per
+        pass and report a green Complete.  No page is taken, the operator is
+        never asked to flip, and nothing is uploaded.
         """
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
@@ -2034,12 +2860,13 @@ class TestManualDuplexOverTheSharedFake:
 
         dev = FakeSaneDev()
         dev.report_sources(["Flatbed", "Auto"])
-        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         events: list[PipelineEvent] = []
         request = PipelineRequest(
             profile_name="default",
             title="No feeder",
+            job_id=FIXED_JOB_ID,
             status_callback=events.append,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -2052,14 +2879,14 @@ class TestManualDuplexOverTheSharedFake:
                 request=request,
             )
 
-        assert "'Auto'" in str(excinfo.value)
+        assert "'Auto'" in failure_text(excinfo.value)
         assert dev.calls == []
         assert PipelineEvent.AWAITING_FLIP not in events
         mock_paperless.upload_document.assert_not_called()
 
 
 class TestExifStripped:
-    """No EXIF reaches the PDF, now that the page reaches it as a file."""
+    """No EXIF reaches the PDF from a spooled page."""
 
     def test_exif_stripped_before_pdf(
         self,
@@ -2068,15 +2895,13 @@ class TestExifStripped:
         tmp_path: Path,
     ) -> None:
         """
-        A page arriving with EXIF is spooled without it (Pitfall #5).
+        A page arriving with EXIF is spooled without it.
 
-        The pipeline no longer strips EXIF page by page, and restoring that
-        loop would have nothing to act on: what reaches ``assemble_pdf`` is a
-        record naming a PNG, and Pillow's PNG encoder emits an EXIF chunk only
-        for one handed to it through ``encoderinfo``, which the spool never
-        does.  The property the deleted loop protected is therefore still true,
-        and this asserts it where it is now decided -- on the spooled file the
-        PDF embeds, read while that file still exists.
+        What reaches ``assemble_pdf`` is a record naming a PNG, and Pillow's
+        PNG encoder emits an EXIF chunk only for one handed to it through
+        ``encoderinfo``, which the spool never does.  This asserts it where it
+        is decided -- on the spooled file the PDF embeds, read while that file
+        still exists.
         """
         img = _make_content_image()
         img.info["exif"] = b"fake-exif-data"
@@ -2085,7 +2910,9 @@ class TestExifStripped:
         scanner.scan_pages.side_effect = spooling([img])
 
         spooled: list[Image.Image] = []
-        request = PipelineRequest(profile_name="default", title="EXIF Test")
+        request = PipelineRequest(
+            profile_name="default", title="EXIF Test", job_id=FIXED_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.side_effect = _reading_the_pages(
@@ -2124,7 +2951,9 @@ class TestEmptyPageDetectionToggle:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Toggle Test")
+        request = PipelineRequest(
+            profile_name="default", title="Toggle Test", job_id=FIXED_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -2143,7 +2972,7 @@ class TestEmptyPageDetectionToggle:
 
 
 class TestFlatbedStillWorks:
-    """Flatbed regression tests."""
+    """A flatbed scan still produces a PDF and its thumbnail."""
 
     def test_flatbed_single_page_with_thumbnail(
         self,
@@ -2158,6 +2987,7 @@ class TestFlatbedStillWorks:
         request = PipelineRequest(
             profile_name="default",
             title="Flatbed Test",
+            job_id=FIXED_JOB_ID,
             thumbnail_callback=thumb_results.append,
         )
 
@@ -2179,14 +3009,52 @@ class TestDiskSpaceCheck:
         """No exception when free space exceeds minimum."""
         _check_disk_space(tmp_path, 1)
 
-    def test_disk_space_check_fails_when_insufficient(self, tmp_path: Path) -> None:
-        """Raises ScanError when free space below threshold."""
-        with pytest.raises(ScanError, match="Insufficient disk space"):
+    def test_disk_space_check_fails_as_disk_space_when_insufficient(
+        self, tmp_path: Path
+    ) -> None:
+        """Too little free space is a full disk: DISK_SPACE, never the scanner."""
+        with pytest.raises(DiskSpaceError) as exc_info:
             _check_disk_space(tmp_path, 999_999_999)
 
-    @pytest.mark.parametrize(
-        "failing_call", ["mkdir", "disk_usage", "TemporaryDirectory"]
-    )
+        error = exc_info.value
+        assert not isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert str(error).startswith("Insufficient disk space: ")
+        assert str(tmp_path) in str(error)
+        assert "999999999 MB required" in str(error)
+
+    def test_free_space_check_counts_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A megabyte is 10**6 bytes, as ``min_free_space_mb`` and the docs say.
+
+        Exactly 500 * 10**6 bytes free meets a 500 MB reserve.  Counted in
+        binary megabytes it is only 476, which would refuse the scan.
+        """
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6),
+        )
+
+        assert _check_disk_space(tmp_path, 500) is None
+
+    def test_free_space_check_one_byte_short_reports_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One byte under 500 * 10**6 is refused, reported as 499 MB free."""
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6 - 1),
+        )
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            _check_disk_space(tmp_path, 500)
+
+        assert "499 MB free" in str(exc_info.value)
+        assert "500 MB required" in str(exc_info.value)
+
+    @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
     def test_workspace_filesystem_failure_is_a_config_error(
         self,
         failing_call: str,
@@ -2196,17 +3064,81 @@ class TestDiskSpaceCheck:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-07: a tmp_dir that cannot be used is a setup error, not a bug.
+        A tmp_dir that cannot be used is a setup error, not a bug.
 
-        Each of the three start-up calls can raise a raw OSError -- a full
-        disk, or tmp_dir removed since start-up.  Untranslated, it classified
-        UNKNOWN and the CLI called it a saneless bug (exit 5), while
-        ``validate_settings_dirs`` reports the same condition as a ConfigError
-        at start-up.  Nothing is scanned.
+        Each of the three start-up steps can raise a raw OSError -- a
+        permission refused, or tmp_dir removed since start-up.  It is reported
+        as a ConfigError, as ``validate_settings_dirs`` reports the same
+        condition at start-up, never as an UNKNOWN saneless bug.  Nothing is
+        scanned.  A full disk is the one OSError that is not a setup error;
+        the test after this one covers it.
         """
         tmp_dir = tmp_path / "work"
         default_settings.output.tmp_dir = tmp_dir
-        failure = OSError(errno.ENOSPC, "No space left on device")
+        failure = OSError(errno.EACCES, "Permission denied")
+        if failing_call == "mkdir":
+            (tmp_path / "blocker").write_text("")
+            tmp_dir = tmp_path / "blocker" / "work"
+            default_settings.output.tmp_dir = tmp_dir
+        elif failing_call == "disk_usage":
+
+            def failing_disk_usage(*_args: object) -> object:
+                raise failure
+
+            monkeypatch.setattr(
+                "saneless.pipeline.shutil.disk_usage", failing_disk_usage
+            )
+        else:
+            # The job workspace is created on entry, in a staging directory
+            # made by mkdtemp: that is the call a full disk fails.
+            def failing_mkdtemp(*_args: object, **_kwargs: object) -> str:
+                raise failure
+
+            monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", failing_mkdtemp)
+        scanner = MagicMock(spec=ScannerBackend)
+
+        with pytest.raises(ConfigError) as exc_info:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No room", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        message = failure_text(exc_info.value)
+        if failing_call == "mkdir":
+            # Creating tmp_dir is the private-directory helper's job, and its
+            # message names the setting.
+            assert message.startswith(
+                f"output.tmp_dir {tmp_dir} could not be created: "
+            )
+        else:
+            assert message.startswith(
+                f"Could not prepare the working directory {tmp_dir}: "
+            )
+        assert isinstance(exc_info.value.__cause__, OSError)
+        scanner.scan_pages.assert_not_called()
+
+    @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
+    def test_a_workspace_failure_next_step_names_tmp_dir(
+        self,
+        failing_call: str,
+        tmp_path: Path,
+        default_settings: Settings,
+        mock_paperless: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Each way the workspace cannot be prepared points at ``output.tmp_dir``.
+
+        The message names the directory and why it failed; the next step names
+        the setting, and never the path or the OS error.
+        """
+        tmp_dir = tmp_path / "work"
+        default_settings.output.tmp_dir = tmp_dir
+        failure = OSError(errno.EACCES, "Permission denied")
         if failing_call == "mkdir":
             (tmp_path / "blocker").write_text("")
             tmp_dir = tmp_path / "blocker" / "work"
@@ -2221,31 +3153,207 @@ class TestDiskSpaceCheck:
             )
         else:
 
-            def failing_temporary_directory(
-                *_args: object, **_kwargs: object
-            ) -> object:
+            def failing_mkdtemp(*_args: object, **_kwargs: object) -> str:
                 raise failure
 
-            monkeypatch.setattr(
-                "saneless.pipeline.tempfile.TemporaryDirectory",
-                failing_temporary_directory,
-            )
-        scanner = MagicMock(spec=ScannerBackend)
+            monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", failing_mkdtemp)
 
         with pytest.raises(ConfigError) as exc_info:
             run_pipeline(
-                scanner=scanner,
+                scanner=MagicMock(spec=ScannerBackend),
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No room"),
+                request=PipelineRequest(
+                    profile_name="default", title="No dir", job_id=FIXED_JOB_ID
+                ),
             )
 
-        message = str(exc_info.value)
-        assert message.startswith(
+        next_step = exc_info.value.next_step
+        assert next_step is not None
+        assert "output.tmp_dir" in next_step
+        assert str(tmp_dir) not in next_step
+        assert "Permission denied" not in next_step
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    @pytest.mark.parametrize("failing_call", ["mkdir", "JobWorkspace"])
+    def test_workspace_out_of_space_is_a_disk_space_error(
+        self,
+        failing_call: str,
+        code: int,
+        tmp_path: Path,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A full disk while preparing tmp_dir is disk space, not configuration.
+
+        Both the creation of a missing tmp_dir and the job workspace inside
+        it write to the disk, and either can find it full or the quota used
+        up.  That is not something the settings got wrong, so it must not be
+        reported as one.  Nothing is scanned.
+        """
+        tmp_dir = tmp_path / "work"
+        default_settings.output.tmp_dir = tmp_dir
+        failure = OSError(code, os.strerror(code))
+
+        def failing(*_args: object, **_kwargs: object) -> NoReturn:
+            raise failure
+
+        if failing_call == "mkdir":
+            monkeypatch.setattr("saneless.private_dirs.make_private_dir", failing)
+        else:
+            monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", failing)
+        scanner = MagicMock(spec=ScannerBackend)
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No room", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        error = exc_info.value
+        assert failure_text(error).startswith(
             f"Could not prepare the working directory {tmp_dir}: "
         )
-        assert isinstance(exc_info.value.__cause__, OSError)
+        assert os.strerror(code) in failure_text(error)
+        assert is_out_of_space(error)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(error)) is ExitCode.DISK_SPACE
         scanner.scan_pages.assert_not_called()
+
+    def test_open_workspace_creates_a_missing_tmp_dir_private(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing ``tmp_dir`` is created 0700 even under umask 002."""
+        tmp_dir = tmp_path / "scratch"
+        request = PipelineRequest(
+            profile_name="default", title="t", job_id=FIXED_JOB_ID
+        )
+        old = os.umask(0o002)
+        try:
+            with _open_workspace(tmp_dir, 0, request) as workspace:
+                assert workspace.path.parent == tmp_dir
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(tmp_dir.stat().st_mode) == 0o700
+
+    @pytest.mark.parametrize("shape", ["world-writable", "symlink"])
+    def test_open_workspace_refuses_an_unsafe_tmp_dir(
+        self, tmp_path: Path, shape: str
+    ) -> None:
+        """
+        ``tmp_dir`` is re-checked before every scan, not only at startup.
+
+        A temp-directory sweep can remove it while the server runs, and
+        another local user can then create the name. The refusal is the
+        private-directory check's own, not the "could not prepare" wrapper
+        for a raw ``OSError``.
+        """
+        tmp_dir = tmp_path / "scratch"
+        if shape == "symlink":
+            real = tmp_path / "elsewhere"
+            real.mkdir(mode=0o700)
+            tmp_dir.symlink_to(real)
+        else:
+            tmp_dir.mkdir()
+            tmp_dir.chmod(0o777)
+        request = PipelineRequest(
+            profile_name="default", title="t", job_id=FIXED_JOB_ID
+        )
+        with (
+            pytest.raises(ConfigError) as exc_info,
+            _open_workspace(tmp_dir, 0, request),
+        ):
+            pytest.fail("the workspace should have been refused")
+        message = failure_text(exc_info.value)
+        assert "output.tmp_dir" in message
+        assert "chmod 700" in message
+        assert not message.startswith("Could not prepare the working directory")
+        if shape == "symlink":
+            assert list((tmp_path / "elsewhere").iterdir()) == []
+
+
+class TestFullDiskIsNotTheScanner:
+    """A full disk anywhere in acquisition is reported as disk space."""
+
+    def test_a_full_disk_is_never_returned_to_the_prompt_disk_space(self) -> None:
+        """
+        A multi-page run does not offer to try a pass again on a full disk.
+
+        The same pass would fail the same way at once.  A jam is the contrast:
+        the operator can clear it, so it is worth asking about.
+        """
+        assert not _returns_to_prompt(DiskSpaceError("Insufficient disk space"))
+        assert not _returns_to_prompt(SpoolError("Could not write page 1"))
+        assert _returns_to_prompt(ScanError("Paper jam"))
+
+    def test_a_spool_that_fills_on_page_2_is_disk_space_through_the_backend(
+        self,
+        default_settings: Settings,
+        mock_paperless: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A spool that runs out of room mid-feed reaches the caller as disk space.
+
+        Driven through the real ``SaneBackend`` over the shared fake, because
+        the question is whether the backend's acquisition ladder, which turns
+        every non-saneless failure into "Scanner error on page N", can claim
+        the sink's refusal.  The spool reports plenty of room for page 1 and
+        none for page 2; everything else measures the real disk.  The run
+        guard keeps page 1.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        profile = default_settings.profiles["default"]
+        profile.source = "Automatic Document Feeder"
+        profile.mode = "Color"
+
+        dev = FakeSaneDev()
+        dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+        dev.load_feeder([_make_content_image(c) for c in ["red", "green", "blue"]])
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
+
+        real_disk_usage = shutil.disk_usage
+        spool_measurements: list[Path] = []
+        roomy_pages = 1
+
+        def filling_spool(path: str | os.PathLike[str]) -> object:
+            """Report no room in the spool from its second page on."""
+            if Path(path).name == SPOOL_DIR_NAME:
+                spool_measurements.append(Path(path))
+                if len(spool_measurements) > roomy_pages:
+                    return SimpleNamespace(total=0, used=0, free=0)
+            return real_disk_usage(path)
+
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", filling_spool)
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            run_pipeline(
+                scanner=SaneBackend(),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Full disk", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        error = exc_info.value
+        message = failure_text(error)
+        assert "Scanner error" not in message
+        assert message.startswith("Insufficient disk space for page 2: ")
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(error)) is ExitCode.DISK_SPACE
+        assert len(spool_measurements) == roomy_pages + 1
+        mock_paperless.upload_document.assert_not_called()
+        (kept,) = failed_dir.glob("*.pdf")
+        assert kept.stat().st_size > 0
 
 
 class TestPipelineEventEnum:
@@ -2263,6 +3371,7 @@ class TestPipelineEventEnum:
         request = PipelineRequest(
             profile_name="default",
             title="Enum Check",
+            job_id=FIXED_JOB_ID,
             status_callback=events.append,
         )
         run_pipeline(
@@ -2278,30 +3387,36 @@ class TestPipelineEventEnum:
 
     @pytest.mark.parametrize("event", list(PipelineEvent))
     def test_job_state_projection_is_total(self, event: PipelineEvent) -> None:
-        """Every PipelineEvent projects to a JobState, with no None escape (DPLX-06)."""
+        """Every PipelineEvent projects to a JobState, with no None escape."""
         assert isinstance(event.job_state, JobState)
 
     def test_job_state_projection_mapping(self) -> None:
-        """Each state-changing event names the state the worker persists (CTR-01)."""
+        """Each state-changing event names the state the worker persists."""
         assert PipelineEvent.SCANNING.job_state is JobState.SCANNING
         assert PipelineEvent.AWAITING_FLIP.job_state is JobState.AWAITING_FLIP
         assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
         assert PipelineEvent.ASSEMBLING.job_state is JobState.ASSEMBLING
         assert PipelineEvent.UPLOADING.job_state is JobState.UPLOADING
         assert PipelineEvent.DONE.job_state is JobState.DONE
+        assert PipelineEvent.AWAITING_NEXT_PASS.job_state is JobState.AWAITING_NEXT_PASS
+        assert (
+            PipelineEvent.AWAITING_BLANK_DECISION.job_state
+            is JobState.AWAITING_BLANK_DECISION
+        )
+        assert PipelineEvent.AWAITING_RETRY.job_state is JobState.AWAITING_RETRY
 
     def test_scanning_reverse_projects_to_its_own_job_state(self) -> None:
         """
-        Pass B persists SCANNING_REVERSE, so the job leaves AWAITING_FLIP (DPLX-06).
+        Pass B persists SCANNING_REVERSE, so the job leaves AWAITING_FLIP.
 
-        While this projected to None the job stayed AWAITING_FLIP for the whole
-        of pass B, leaving the flip prompt and its dead Abort on screen as pages fed.
+        Otherwise the job would stay AWAITING_FLIP for the whole of pass B,
+        leaving the flip prompt and its dead Abort on screen as pages fed.
         """
         assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
 
 
 class TestScanResultContract:
-    """run_pipeline's typed ScanResult return (CTR-03)."""
+    """run_pipeline returns a typed ScanResult."""
 
     def test_success_outcome_and_page_counts(
         self,
@@ -2318,7 +3433,9 @@ class TestScanResultContract:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Counts Test")
+        request = PipelineRequest(
+            profile_name="default", title="Counts Test", job_id=FIXED_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -2351,7 +3468,9 @@ class TestScanResultContract:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="No Filter Test")
+        request = PipelineRequest(
+            profile_name="default", title="No Filter Test", job_id=FIXED_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -2368,7 +3487,7 @@ class TestScanResultContract:
         assert result.pages_removed == 0
         assert result.pages_uploaded == 3
 
-    def test_fallback_outcome_when_not_delivered_to_api(
+    def test_fallback_outcome_when_delivered_to_the_folder(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
@@ -2376,12 +3495,13 @@ class TestScanResultContract:
         tmp_path: Path,
     ) -> None:
         """An upload that only reached the consume dir reports FALLBACK."""
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=False,
-            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        mock_paperless.upload_document.return_value = FolderDelivery(
+            path=tmp_path / "consume" / "doc.pdf"
         )
 
-        request = PipelineRequest(profile_name="default", title="Fallback Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Fallback Doc", job_id=FIXED_JOB_ID
+        )
         result = run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -2390,7 +3510,7 @@ class TestScanResultContract:
         )
 
         assert result.outcome is ScanOutcome.FALLBACK
-        # OUTC-02: the FALLBACK state says the document took the other route;
+        # The FALLBACK state says the document took the other route;
         # the warning says what that route did not do.  A state on its own
         # leaves the user to guess why their title and tags never appeared.
         assert result.warning is not None
@@ -2432,13 +3552,11 @@ def _one_page_scanner() -> MagicMock:
     return scanner
 
 
-def _delivering_to_api(task_uuid: str = "task-uuid-1") -> MagicMock:
+def _delivering_to_api(task_id: str = "task-uuid-1") -> MagicMock:
     """Return a paperless client whose upload reaches the API and polls clean."""
     paperless = MagicMock()
-    paperless.upload_document.return_value = UploadResult(
-        delivered_to_api=True, task_uuid=task_uuid
-    )
-    paperless.poll_task.return_value = None
+    paperless.upload_document.return_value = ApiDelivery(task_id=task_id)
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 
@@ -2477,9 +3595,8 @@ class TestPreservation:
         """
         A Paperless FAILURE after a successful upload still preserves the PDF.
 
-        This is the case the whole phase is named after: a guard wrapped around
-        only the upload would let this raise unwind the temporary directory and
-        delete the finished scan.
+        A guard wrapped around only the upload would let this raise unwind
+        the temporary directory and delete the finished scan.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = _delivering_to_api()
@@ -2503,7 +3620,7 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """D-10: a timeout is ambiguous, so the local copy is kept too."""
+        """A timeout is ambiguous, so the local copy is kept too."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = _delivering_to_api()
         paperless.poll_task.side_effect = PaperlessTimeoutError(
@@ -2522,7 +3639,7 @@ class TestPreservation:
 
         assert len(list(failed_dir.glob("*.pdf"))) == 1
         # The subclass survives the re-raise, so a caller that narrows to a
-        # timeout deliberately (D-11) still can.
+        # timeout deliberately still can.
         assert type(excinfo.value) is PaperlessTimeoutError
 
     def test_preserved_destination_is_named_in_the_raised_message(
@@ -2530,7 +3647,7 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """OUTC-04: the user must be told where the scan went."""
+        """The user is told where the scan went."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -2546,16 +3663,20 @@ class TestPreservation:
             )
 
         preserved = next(iter(failed_dir.glob("*.pdf")))
-        message = str(excinfo.value)
-        assert str(preserved) in message
-        assert "Upload failed" in message
+        message = failure_text(excinfo.value)
+        assert message == f"Upload failed. The scan was preserved at {preserved}"
 
     def test_preserving_chains_the_original_exception(
         self,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """The original type and traceback survive on __cause__."""
+        """
+        The original exception itself escapes, with its traceback.
+
+        The run guard attaches a note and re-raises the very object the
+        client raised, so there is no copy and no chain.
+        """
         _isolate_dirs(default_settings, tmp_path)
         original = PaperlessError("Upload failed")
         paperless = MagicMock()
@@ -2571,7 +3692,9 @@ class TestPreservation:
                 ),
             )
 
-        assert excinfo.value.__cause__ is original
+        assert excinfo.value is original
+        assert excinfo.value.__cause__ is None
+        assert "preserved at" in failure_text(excinfo.value)
 
     def test_preserved_paperless_failure_still_classifies_as_upload(
         self,
@@ -2595,24 +3718,24 @@ class TestPreservation:
 
         assert classify_error(excinfo.value) is ErrorCategory.UPLOAD
 
-    def test_preserving_maps_a_foreign_exception_to_a_paperless_error(
+    def test_preserving_keeps_a_foreign_exception_as_itself(
         self,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
         """
-        A non-saneless exception in the delivery window is a delivery failure.
+        A non-saneless exception in the delivery window keeps its own type.
 
-        The guard spans nothing but the upload and the poll, so from the job's
-        point of view an arbitrary exception there is a delivery failure -- and
-        rebuilding an arbitrary third-party exception from a single string is
-        not safe, so the re-raise uses PaperlessError instead.
+        The run guard keeps the PDF, attaches a note and re-raises the same
+        ``RuntimeError``, which ``classify_error`` files as UNKNOWN, so a bug
+        in our own code is never filed as an upload failure.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = RuntimeError("something odd")
         paperless = MagicMock()
-        paperless.upload_document.side_effect = RuntimeError("something odd")
+        paperless.upload_document.side_effect = original
 
-        with pytest.raises(PaperlessError) as excinfo:
+        with pytest.raises(RuntimeError) as excinfo:
             run_pipeline(
                 scanner=_one_page_scanner(),
                 paperless=paperless,
@@ -2622,9 +3745,14 @@ class TestPreservation:
                 ),
             )
 
-        assert len(list(failed_dir.glob("*.pdf"))) == 1
-        assert isinstance(excinfo.value.__cause__, RuntimeError)
-        assert "something odd" in str(excinfo.value)
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert excinfo.value is original
+        assert not isinstance(excinfo.value, PaperlessError)
+        assert classify_error(excinfo.value) is ErrorCategory.UNKNOWN
+        assert failure_text(excinfo.value) == (
+            f"something odd. The scan was preserved at {preserved[0]}"
+        )
 
     def test_preservation_creates_a_missing_failed_dir(
         self,
@@ -2679,11 +3807,11 @@ class TestPreservation:
                 ),
             )
 
-        message = str(excinfo.value)
-        assert "Upload failed" in message
-        assert str(failed_dir) in message
-        assert "NOT" in message
-        assert excinfo.value.__cause__ is original
+        message = failure_text(excinfo.value)
+        assert message.startswith(
+            f"Upload failed. The scan could NOT be preserved to {failed_dir}: "
+        )
+        assert excinfo.value is original
 
     def test_nothing_is_preserved_when_delivery_succeeds(
         self,
@@ -2745,10 +3873,9 @@ class TestPreservation:
         """
         Only the PDF is preserved: the spooled pages die with the workspace.
 
-        The spool lives inside the job's ``TemporaryDirectory``, and the
-        preservation guard moves the assembled PDF and nothing else, so
-        ``failed/`` holds exactly one kind of file.  Plan 29-09 is what adds a
-        page directory beside it; until then this is the whole contract.
+        The spool lives inside the job's workspace, and a delivery failure
+        keeps the assembled PDF and nothing else, so ``failed/`` holds exactly
+        one kind of file.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
@@ -2771,7 +3898,7 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """The TemporaryDirectory still unwinds; only the PDF escaped it."""
+        """The job workspace still unwinds; only the PDF escaped it."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -2793,13 +3920,13 @@ class TestPreservation:
 
 def _spooling_then_failing(
     pages: Sequence[Image.Image],
-    failure: Exception,
+    failure: BaseException,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
     Build a ``scan_pages`` stand-in that spools some pages and then fails.
 
-    This is the mid-batch failure HARD-02 is about: a jam on sheet N+1 of a
-    stack whose first N sheets already went through the feeder.  The pages go
+    A mid-batch failure: a jam on sheet N+1 of a stack whose first N
+    sheets already went through the feeder.  The pages go
     into the pipeline's own sink, so the records the preservation path finds --
     and the files behind them -- are the ones production would have.
 
@@ -2817,7 +3944,7 @@ def _spooling_then_failing(
     ) -> ScanBatch:
         """Spool every page the device managed, then raise as it would."""
         for page in pages:
-            sink.add(page)
+            sink.add(page, dpi=settings.resolution)
         raise failure
 
     return _spool_then_fail
@@ -2837,21 +3964,21 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     """
     scanner = MagicMock(spec=ScannerBackend)
     scanner.scan_pages.side_effect = _spooling_then_failing(
-        [_distinct_page(index) for index in range(pages)], failure
+        [distinct_page(index) for index in range(pages)], failure
     )
     return scanner
 
 
 class TestPartialScanPreservation:
     """
-    HARD-02 / D-09: a mid-batch failure keeps the pages already fed.
+    A mid-batch failure keeps the pages already fed.
 
-    A jam on page 40 of a 50-sheet stack used to discard the 39 sheets the
-    operator had already put through the feeder.  The spool holds them, so the
+    A jam on page 40 of a 50-sheet stack does not discard the 39 sheets the
+    operator already put through the feeder.  The spool holds them, so the
     guard assembles them unfiltered into a ``(partial)`` PDF under ``failed/``
     and names the count and the path in the exception it re-raises -- without
     changing that exception's type, which is what keeps the job's error
-    category and the CLI's exit code correct (Phase 28 D-07).
+    category and the CLI's exit code correct.
     """
 
     def test_partial_scan_preserved_when_the_scanner_fails_mid_batch(
@@ -2890,7 +4017,7 @@ class TestPartialScanPreservation:
         assert "partial" in preserved[0].name
         with pikepdf.open(preserved[0]) as pdf:
             assert len(pdf.pages) == 3
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "Document feeder jammed" in message
         assert "3 page(s)" in message
         assert str(preserved[0]) in message
@@ -2905,7 +4032,7 @@ class TestPartialScanPreservation:
 
         ``type(...) is``, not ``isinstance``: a silent widening to
         ``SanelessError`` would satisfy an isinstance check while changing the
-        exit code the CLI chooses (Phase 28's table).
+        exit code the CLI chooses.
         """
         _isolate_dirs(default_settings, tmp_path)
         original = ScanError("Scanner error on page 3: Paper jam")
@@ -2921,7 +4048,7 @@ class TestPartialScanPreservation:
             )
 
         assert type(excinfo.value) is ScanError
-        assert excinfo.value.__cause__ is original
+        assert excinfo.value is original
         assert classify_error(excinfo.value) is ErrorCategory.SCANNER
 
     def test_partial_scan_is_not_blank_filtered(
@@ -2932,9 +4059,9 @@ class TestPartialScanPreservation:
         """
         An anomaly is delivered whole for review, following the mismatch path.
 
-        Every spooled sheet here is blank enough that ``_drop_empty_pages``
-        would have removed it -- and removing them all would raise "All pages
-        were blank" and destroy the very evidence the operator needs.
+        Every spooled sheet here is blank enough that ``_drop_blank_pages``
+        would have removed it -- and removing them all would fail the run as
+        all-blank rather than deliver the evidence the operator needs.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         assert default_settings.profiles["default"].enable_empty_page_detection
@@ -2965,7 +4092,7 @@ class TestPartialScanPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """N-02's rejected alternative: no incomplete document reaches paperless."""
+        """No incomplete document reaches paperless."""
         _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
 
@@ -2989,7 +4116,7 @@ class TestPartialScanPreservation:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-10: the operator chose to stop, so nothing is kept.
+        The operator chose to stop, so nothing is kept.
 
         ``ScanCancelledError`` is an ordinary ``Exception``, so a guard that
         caught only broadly would file a cancelled scan into a directory
@@ -3076,7 +4203,7 @@ class TestPartialScanPreservation:
         Being told only "the feeder jammed" while the pages were destroyed is a lie.
 
         ``failed_dir`` is made a regular file, so the guard's own mkdir raises
-        and the move can never run -- the shape ``_preserving`` already uses.
+        and the move can never run -- the shape the delivery test uses too.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         failed_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -3093,17 +4220,19 @@ class TestPartialScanPreservation:
                 ),
             )
 
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "Document feeder jammed" in message
         assert str(failed_dir) in message
         assert "NOT" in message
-        assert excinfo.value.__cause__ is original
+        assert excinfo.value is original
 
 
 def _failing_in_pass_b(
     fronts: int,
     backs: int,
-    failure: Exception,
+    failure: BaseException,
+    *,
+    unreadable_fronts: int = 0,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
     Build a manual-duplex ``side_effect`` whose second pass fails part-way.
@@ -3116,6 +4245,7 @@ def _failing_in_pass_b(
         fronts: How many sheets pass A feeds.
         backs: How many sheets pass B gets through before the fault.
         failure: What the device raises on the next sheet of pass B.
+        unreadable_fronts: How many sheets pass A reports it could not read.
 
     Returns:
         A callable with ``scan_pages``' own shape, for ``MagicMock.side_effect``.
@@ -3131,10 +4261,12 @@ def _failing_in_pass_b(
         index = calls
         calls += 1
         if index == 0:
-            pages = [_distinct_page(number) for number in range(fronts)]
-            return spooling(pages)(device_id, settings, sink)
+            pages = [distinct_page(number) for number in range(fronts)]
+            return spooling(pages, rejected=unreadable_fronts)(
+                device_id, settings, sink
+            )
         for number in range(backs):
-            sink.add(_distinct_page(fronts + number))
+            sink.add(distinct_page(fronts + number), dpi=settings.resolution)
         raise failure
 
     return _spool_next
@@ -3182,12 +4314,10 @@ def _preserved_page_counts(failed_dir: Path) -> dict[str, int]:
 
 class TestPassBAndFlipFailuresKeepTheFronts:
     """
-    D-10: every way pass A's fronts can be lost now keeps them.
+    Every failure after pass A that nobody chose keeps pass A's fronts.
 
-    The gap this closes was written into ``_scan_manual_duplex`` itself -- "The
-    fronts are still lost here; keeping them needs Phase 29's spooling" -- and
-    the halves are named exactly as the duplex-mismatch recovery already names
-    them, so an operator finds the same two artefacts either way.
+    The halves are named exactly as the duplex-mismatch recovery names them,
+    so an operator finds the same two artefacts either way.
     """
 
     def test_pass_b_preserves_fronts_when_the_scanner_fails(
@@ -3217,9 +4347,46 @@ class TestPassBAndFlipFailuresKeepTheFronts:
 
         assert _preserved_page_counts(failed_dir) == {"fronts": 3, "backs": 1}
         assert type(excinfo.value) is ScanError
-        assert excinfo.value.__cause__ is original
-        assert "4 page(s)" in str(excinfo.value)
+        assert excinfo.value is original
+        assert "4 page(s)" in failure_text(excinfo.value)
         paperless.upload_document.assert_not_called()
+
+    def test_a_sheet_pass_a_could_not_read_voids_the_page_pairing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Pass A skipped a sheet, so the kept halves cannot be paired by number.
+
+        Four fronts for five sheets: counting back from the fourth front would
+        pair the first back with the wrong front, so the error says to pair
+        them by content instead of naming a page.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 3 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(
+            4, 2, original, unreadable_fronts=1
+        )
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Skipped Front",
+                    job_id="job-passb-skip",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 4, "backs": 2}
+        message = failure_text(excinfo.value)
+        assert "cannot be paired" in message
+        assert "goes with" not in message
 
     def test_pass_b_preserves_fronts_when_it_is_empty(
         self,
@@ -3229,13 +4396,13 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         """
         A pass B that fed nothing still keeps the fronts.
 
-        The existing message is unchanged; the preservation text is appended to
-        it, exactly as ``_preserving`` appends to a delivery failure's.
+        The empty-pass-B message comes first; the preservation sentence follows
+        it as a note, exactly as it follows a delivery failure's.
         """
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling_in_turn(
-            [_distinct_page(index) for index in range(2)], []
+            [distinct_page(index) for index in range(2)], []
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3252,7 +4419,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
             )
 
         assert _preserved_page_counts(failed_dir) == {"fronts": 2}
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert message.startswith(
             "No back pages were scanned in pass B (pass A scanned 2 front page(s))"
         )
@@ -3263,12 +4430,12 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Nobody chose to stop, so the fronts are kept (D-10, Phase 28 D-02)."""
+        """A flip wait that times out keeps the fronts: nobody chose to stop."""
         failed_dir = _duplex_settings(default_settings, tmp_path)
-        default_settings.output.flip_timeout_seconds = 17
+        default_settings.output.operator_wait_timeout_seconds = 17
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3285,7 +4452,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
             )
 
         assert _preserved_page_counts(failed_dir) == {"fronts": 3}
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "flip wait timed out" in message
         assert "3 page(s)" in message
         assert type(excinfo.value) is ScanError
@@ -3301,7 +4468,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         cause = OSError(5, "Input/output error")
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(2)]
+            [distinct_page(index) for index in range(2)]
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3318,7 +4485,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
             )
 
         assert _preserved_page_counts(failed_dir) == {"fronts": 2}
-        assert "Flip prompt failed" in str(excinfo.value)
+        assert "Flip prompt failed" in failure_text(excinfo.value)
         assert not isinstance(excinfo.value, ScanCancelledError)
 
     def test_a_flip_abort_preserves_nothing(
@@ -3336,7 +4503,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
 
         with pytest.raises(
@@ -3368,7 +4535,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         tmp_path: Path,
     ) -> None:
         """
-        D-10 applies to each manual-duplex pass, not only to pass B.
+        A failure in pass A keeps the fronts fed so far, as one in pass B does.
 
         Nobody is asked to flip, so only one half exists and it is named as
         the fronts it is.
@@ -3376,7 +4543,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = _spooling_then_failing(
-            [_distinct_page(index) for index in range(2)],
+            [distinct_page(index) for index in range(2)],
             ScanError("Scanner error on page 3: Paper jam"),
         )
 
@@ -3444,14 +4611,12 @@ def _preserve_one_scan(settings: Settings, job_id: str) -> PaperlessError:
 
 class TestFailedDirWarningFiresOncePerGuard:
     """
-    One guard preserving two PDFs warns once, not once per file (WR-09).
+    One guard preserving two PDFs warns once, not once per file.
 
-    The duplex-mismatch recovery passes both halves under a single
-    ``_preserving`` guard, because they are one document between them (D-08).
-    Running the threshold check inside the per-file loop therefore emitted the
-    same "N preserved scans have accumulated" WARNING twice, with different
-    counts -- log noise on the one path already flagged as an anomaly, and a
-    contradiction of the helper's own "one WARNING" docstring.
+    A failed duplex-mismatch delivery keeps both halves in one preservation,
+    because they are one document between them.  A threshold check per moved
+    file would log the "N preserved scans have accumulated" WARNING twice,
+    with different counts, on the one path already flagged as an anomaly.
     """
 
     def _two_scans(self, tmp_path: Path) -> list[Path]:
@@ -3464,19 +4629,26 @@ class TestFailedDirWarningFiresOncePerGuard:
     def _preserve_both(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Path:
         """Fail one delivery holding two PDFs, and return the failed dir."""
         failed_dir = tmp_path / "failed"
-        # One short of the threshold, so the per-file call crossed it on the
-        # first move and again on the second -- two warnings for one failure.
+        # One short of the threshold, so a check per moved file would cross it
+        # on the first move and again on the second -- two warnings for one
+        # failure.
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
         pdfs = self._two_scans(tmp_path)
-        failure = PaperlessError("Upload failed")
+        artefacts = preservation_module.RunArtefacts(
+            job_id="job-two-halves",
+            title="Two halves",
+            workspace=tmp_path,
+            spool_dir=tmp_path / "spool",
+            failed_dir=failed_dir,
+            reserve_mb=0,
+            stage=preservation_module.RunStage.DELIVERING,
+            pdfs=pdfs,
+        )
 
-        with (
-            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
-            pytest.raises(PaperlessError),
-            _preserving(pdfs, failed_dir),
-        ):
-            raise failure
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            report = preservation_module.preserve_most_finished(artefacts)
 
+        assert report.kind is preservation_module.KeptKind.ASSEMBLED
         return failed_dir
 
     def test_two_preserved_scans_emit_one_warning(
@@ -3508,7 +4680,7 @@ class TestFailedDirWarningFiresOncePerGuard:
 
 
 class TestFailedDirWarning:
-    """Warn -- never prune -- when preserved scans accumulate (T-23-29)."""
+    """Accumulating preserved scans are warned about and never pruned."""
 
     def test_failed_dir_warns_when_the_threshold_is_reached(
         self,
@@ -3520,7 +4692,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-1")
 
         warnings = [
@@ -3541,7 +4713,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-2")
 
         message = next(
@@ -3550,7 +4722,8 @@ class TestFailedDirWarning:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        assert "MiB" in message
+        assert " MB)" in message
+        assert "MiB" not in message
         assert str(failed_dir) in message
 
     def test_failed_dir_warning_is_silent_below_the_threshold(
@@ -3562,14 +4735,14 @@ class TestFailedDirWarning:
         """One preserved scan is not a problem and must not be announced."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-3")
 
         assert len(list(failed_dir.glob("*.pdf"))) == 1
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_warning_deletes_nothing(
@@ -3587,7 +4760,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         existing = _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-4")
 
         survivors = {path.name for path in failed_dir.glob("*.pdf")}
@@ -3605,7 +4778,7 @@ class TestFailedDirWarning:
 
         The growth check runs inside the preservation guard's own exception
         handler, so a raise there would swap the delivery failure -- the
-        message OUTC-04 requires the job to carry -- for a bookkeeping error.
+        message the job must carry -- for a bookkeeping error.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         real_glob = Path.glob
@@ -3620,8 +4793,8 @@ class TestFailedDirWarning:
 
         escaped = _preserve_one_scan(default_settings, "job-growth-5")
 
-        assert "Upload failed" in str(escaped)
-        assert "preserved at" in str(escaped)
+        assert "Upload failed" in failure_text(escaped)
+        assert "preserved at" in failure_text(escaped)
         # iterdir, not glob: the patch is still in force.
         assert len([path for path in failed_dir.iterdir() if path.is_file()]) == 1
 
@@ -3634,7 +4807,9 @@ def _fail_assembly(message: str = "img2pdf refused the page") -> MagicMock:
         message: The failure text the error carries.
 
     Returns:
-        A MagicMock ready for ``patch("saneless.pipeline.assemble_pdf", ...)``.
+        A MagicMock ready for ``patch("saneless.pipeline.assemble_pdf", ...)``
+        (the main assembly) or ``patch("saneless.preservation.assemble_pdf",
+        ...)`` (the assembly of a preserved partial scan).
 
     """
     assembling = MagicMock()
@@ -3660,14 +4835,12 @@ def _preserved_page_dirs(failed_dir: Path) -> list[Path]:
 
 class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
     """
-    WR-03: D-10's page-file fallback now covers the *partial* assembly too.
+    The page-file fallback covers the assembly of a partial scan.
 
-    It was wired only around ``run_pipeline``'s main ``assemble_pdf``. The
-    realistic trigger is the same fault twice over: D-07's per-page check
+    The realistic trigger is one fault twice over: the per-page space check
     refuses a sheet because the disk is full, the partial-scan guard fires,
-    ``assemble_pdf`` then also cannot write, and every page the guard exists to
-    keep went out with the workspace at exactly the moment the operator most
-    needed them.
+    and ``assemble_pdf`` cannot write either.  Without the fallback every page
+    the guard exists to keep would go out with the workspace.
     """
 
     def test_an_unassemblable_partial_still_keeps_the_page_files(
@@ -3681,7 +4854,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         scanner = _jamming_scanner(3, original)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            patch("saneless.preservation.assemble_pdf", _fail_assembly()),
             pytest.raises(ScanError) as excinfo,
         ):
             run_pipeline(
@@ -3703,7 +4876,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
             "a-0003.png",
         ]
         assert all(entry.stat().st_size > 0 for entry in kept[0].iterdir())
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         # Both failures, then what was salvaged in spite of them.
         assert "Document feeder jammed" in message
         assert "img2pdf refused the page" in message
@@ -3711,7 +4884,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         # The type is what carries the exit code and the error category, and a
         # scan that could not be assembled is still a scan failure.
         assert type(excinfo.value) is ScanError
-        assert excinfo.value.__cause__ is original
+        assert excinfo.value is original
 
     def test_the_fallback_keeps_both_passes_of_a_duplex_job(
         self,
@@ -3730,7 +4903,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         scanner.scan_pages.side_effect = _failing_in_pass_b(2, 1, original)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            patch("saneless.preservation.assemble_pdf", _fail_assembly()),
             pytest.raises(ScanError),
         ):
             run_pipeline(
@@ -3759,7 +4932,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         tmp_path: Path,
     ) -> None:
         """
-        D-10 is unchanged: the operator chose to stop, so nothing is filed.
+        A cancel files nothing, fallback or not: the operator chose to stop.
 
         The fallback lives inside the broad handler, below the cancel
         re-raise, and this is the assertion that keeps it there.
@@ -3785,14 +4958,13 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
 
 class TestPreservationNamesWhatItDidKeep:
     """
-    WR-02: a preservation that got half-way must not report a total loss.
+    A preservation that got half-way names what it kept, not a total loss.
 
-    Every guard here moves artefacts one at a time, so a failure part-way
-    through leaves some of them sitting in ``failed/`` while the message says
-    the scan "could NOT be preserved".  That is the inversion of the failure
-    ``_preserving``'s own docstring names -- told nothing was saved when some
-    of it was -- and it is the more expensive half: an operator who believes
-    it rescans and never looks in a directory saneless never prunes.
+    The preservation moves artefacts one at a time, so a failure part-way
+    through leaves some of them sitting in ``failed/``.  An operator told the
+    scan "could NOT be preserved" rescans and never looks in a directory
+    saneless never prunes.  The report names what did land, and "could NOT"
+    is kept for the case where nothing did.
     """
 
     def test_a_half_preserved_partial_scan_names_the_half_it_kept(
@@ -3811,18 +4983,19 @@ class TestPreservationNamesWhatItDidKeep:
             records: Sequence[PageRecord],
             output_dir: Path,
             filename: str,
-            dpi: int,
+            *,
+            title: str,
         ) -> Path:
             """Assemble the fronts for real, then refuse the backs."""
             nonlocal calls
             calls += 1
             if calls == 1:
-                return assemble_pdf(records, output_dir, filename, dpi)
+                return assemble_pdf(records, output_dir, filename, title=title)
             msg = "qpdf refused the backs"
             raise PdfError(msg)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fronts_then_refuse),
+            patch("saneless.preservation.assemble_pdf", _fronts_then_refuse),
             pytest.raises(ScanError) as excinfo,
         ):
             run_pipeline(
@@ -3840,13 +5013,17 @@ class TestPreservationNamesWhatItDidKeep:
         kept = list(failed_dir.glob("*.pdf"))
         assert len(kept) == 1
         assert "fronts" in kept[0].name
-        message = str(excinfo.value)
-        # Both failures are still reported, which is the existing contract.
+        message = failure_text(excinfo.value)
+        # Both failures are reported.
         assert "Paper jam" in message
         assert "qpdf refused the backs" in message
-        # And the new part: the file that is really sitting there is named.
-        assert "could NOT be fully preserved" in message
-        assert f"Only {kept[0]} was kept" in message
+        # The file that is really sitting there is named, and nothing claims
+        # a total loss.  The page files of both passes are kept as well.
+        assert (
+            f"3 of the 4 page(s) scanned before the error were preserved at {kept[0]}"
+        ) in message
+        assert "4 spooled page file(s) were preserved at" in message
+        assert "could NOT" not in message
 
     def test_a_half_moved_page_directory_names_the_pages_it_kept(
         self,
@@ -3858,20 +5035,20 @@ class TestPreservationNamesWhatItDidKeep:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
-        real_move = shutil.move
+        real_move = preservation_module.move_private
         moved: list[Path] = []
 
-        def _two_then_fail(src: Path, dst: Path) -> object:
+        def _two_then_fail(src: Path, dst: Path) -> None:
             """Move the first two pages for real, then fail on the third."""
             if len(moved) == 2:
                 msg = "the volume went away"
                 raise OSError(msg)
             moved.append(Path(dst))
-            return real_move(src, dst)
+            real_move(src, dst)
 
-        monkeypatch.setattr(pipeline_module.shutil, "move", _two_then_fail)
+        monkeypatch.setattr(preservation_module, "move_private", _two_then_fail)
 
         with (
             patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -3894,11 +5071,13 @@ class TestPreservationNamesWhatItDidKeep:
             "a-0001.png",
             "a-0002.png",
         ]
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "img2pdf refused the page" in message
         assert "the volume went away" in message
-        assert "could NOT be fully preserved" in message
-        assert f"Only {moved[0]}, {moved[1]} was kept" in message
+        assert (
+            f"2 of the 3 spooled page file(s) were preserved at {moved[0]}, {moved[1]}"
+        ) in message
+        assert "could NOT" not in message
 
     def test_a_preservation_that_kept_nothing_still_says_exactly_that(
         self,
@@ -3906,10 +5085,10 @@ class TestPreservationNamesWhatItDidKeep:
         tmp_path: Path,
     ) -> None:
         """
-        The total-loss sentence is unchanged, because it was true.
+        A preservation that kept nothing says the scan could NOT be preserved.
 
-        Only the half-way case was misreporting; widening the new wording over
-        both would make every preservation failure read as a partial one.
+        Using the half-way wording here as well would make every preservation
+        failure read as a partial one.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         failed_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -3929,20 +5108,142 @@ class TestPreservationNamesWhatItDidKeep:
                 ),
             )
 
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert f"The scan could NOT be preserved to {failed_dir}" in message
         assert "fully preserved" not in message
         assert "was kept" not in message
 
+    def test_pages_that_could_not_be_kept_stay_for_the_next_sweep(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A failed/ that cannot be written must not cost the only copy.
+
+        Nothing reached failed/, so the workspace is the last copy of the
+        pages: it is left in place, unlocked, and the next sweep recovers it
+        once failed/ can be written again.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+        original = ScanError("Scanner error on page 3: Paper jam")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(2, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Left For Later",
+                    job_id="job-left-1",
+                ),
+            )
+
+        tmp_dir = default_settings.output.tmp_dir
+        (workspace,) = tmp_dir.glob("job-*")
+        spool = workspace / SPOOL_DIR_NAME
+        assert len(list(spool.glob("*.png"))) == 2
+        message = failure_text(excinfo.value)
+        assert f"The scan could NOT be preserved to {failed_dir}" in message
+        assert f"left in {spool}" in message
+
+        # The lock is gone with the run, so the sweep can take it once
+        # failed/ is a directory again.
+        failed_dir.unlink()
+        (recovered,) = sweep_orphans(tmp_dir, failed_dir, 0)
+        assert recovered.pages == 2
+        assert list(tmp_dir.glob("job-*")) == []
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
+
+    def test_a_pdf_that_could_not_be_kept_is_not_left_to_pile_up(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A PDF built for failed/ but refused there does not stay in the workspace.
+
+        Its pages are still in the spool, which is what is kept for the next
+        sweep.  Left behind, the PDF would be joined by another whole copy of
+        the document on every sweep that failed the same way.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+
+        def refused(source: Path, destination: Path) -> None:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        monkeypatch.setattr("saneless.preservation.move_private", refused)
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=_jamming_scanner(2, ScanError("Paper jam")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Pile Up",
+                    job_id="job-pile-1",
+                ),
+            )
+
+        tmp_dir = default_settings.output.tmp_dir
+        (workspace,) = tmp_dir.glob("job-*")
+        assert len(list((workspace / SPOOL_DIR_NAME).glob("*.png"))) == 2
+        assert list(workspace.rglob("*.pdf")) == []
+
+        sweep_orphans(tmp_dir, failed_dir, 0)
+
+        assert list(tmp_dir.glob("job-*")) == [workspace]
+        assert len(list((workspace / SPOOL_DIR_NAME).glob("*.png"))) == 2
+        assert list(workspace.rglob("*.pdf")) == []
+
+    def test_pages_left_in_an_unlocked_workspace_say_no_sweep_will_come(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without a lock no sweep recovers the pages, so the note says so."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+
+        def no_locks(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+        monkeypatch.setattr("saneless.workspace.fcntl.flock", no_locks)
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(1, ScanError("Paper jam")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Left Unlocked",
+                    job_id="job-left-2",
+                ),
+            )
+
+        (workspace,) = default_settings.output.tmp_dir.glob("unlocked-*")
+        message = failure_text(excinfo.value)
+        assert f"left in {workspace / SPOOL_DIR_NAME}" in message
+        assert "no sweep recovers" in message
+        assert "next time" not in message
+
 
 class TestAssemblyFailureKeepsThePageFiles:
     """
-    D-10: no PDF could be built, so the pages themselves are what is kept.
+    When no PDF can be built, the page files themselves are kept.
 
-    Phase 28 deferred this case. The spool holds real files, so an assembly
-    failure moves them into ``failed/<job-keyed-name>/`` -- a second *kind* of
-    artefact in a directory that until now held only PDFs, which is why the
-    growth check has to learn about it too.
+    An assembly failure moves the spooled files into
+    ``failed/<job-keyed-name>/``, a second kind of artefact beside the
+    preserved PDFs, which the growth check counts too.
     """
 
     def test_a_pdf_error_moves_the_page_files_into_a_job_keyed_directory(
@@ -3954,7 +5255,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
         paperless = MagicMock()
 
@@ -3977,7 +5278,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         assert len(pages) == 3
         assert {page.suffix for page in pages} == {".png"}
         assert all(page.stat().st_size > 0 for page in pages)
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "img2pdf refused the page" in message
         assert "3 spooled page file(s)" in message
         assert str(kept[0]) in message
@@ -3996,7 +5297,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         """
         _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+        scanner.scan_pages.side_effect = spooling([distinct_page(0)])
         original = PdfError("img2pdf refused the page")
 
         with (
@@ -4013,7 +5314,7 @@ class TestAssemblyFailureKeepsThePageFiles:
             )
 
         assert type(excinfo.value) is PdfError
-        assert excinfo.value.__cause__ is original
+        assert excinfo.value is original
         assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
 
     def test_two_assembly_failures_make_two_directories(
@@ -4037,7 +5338,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         for job_id in ("pdf-one", "pdf-two"):
             scanner = MagicMock(spec=ScannerBackend)
             scanner.scan_pages.side_effect = spooling(
-                [_distinct_page(index) for index in range(2)]
+                [distinct_page(index) for index in range(2)]
             )
             with (
                 patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -4067,7 +5368,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         """The workspace still unwinds; only the page files escaped it."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+        scanner.scan_pages.side_effect = spooling([distinct_page(0)])
 
         with (
             patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -4085,6 +5386,125 @@ class TestAssemblyFailureKeepsThePageFiles:
         scratch = tmp_path / "scratch"
         assert [item for item in scratch.iterdir() if item.is_dir()] == []
         assert len(_preserved_page_dirs(failed_dir)) == 1
+
+    def test_assembly_refuses_up_front_without_twice_the_spool_free(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Too little room for the singles and the output: no PDF is attempted.
+
+        Assembly writes a single-page PDF per page and then the merged
+        document beside the spool, so it needs about twice the spooled bytes on
+        top of the reserve. Refusing before it starts keeps the disk from
+        filling half way through, and the pages go to failed/ as for any other
+        assembly failure.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(3)]
+        )
+        # Below the reserve alone, so below twice the spool plus the reserve.
+        monkeypatch.setattr(
+            preservation_module, "_free_bytes", lambda _directory: 1_000_000
+        )
+        assembling = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", assembling),
+            pytest.raises(DiskSpaceError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Room", job_id="job-room-1"
+                ),
+            )
+
+        assembling.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert sorted(entry.name for entry in kept[0].iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+        ]
+        message = failure_text(excinfo.value)
+        assert "MB needed" in message
+        assert "1 MB free" in message
+        assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in message
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(excinfo.value)) is ExitCode.DISK_SPACE
+
+    def test_mismatch_halves_are_refused_up_front_without_the_room(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both halves together must fit the rule before either is assembled."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        monkeypatch.setattr(preservation_module, "_free_bytes", lambda _directory: 0)
+        assembling = MagicMock()
+        paperless = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", assembling),
+            pytest.raises(DiskSpaceError, match="MB needed"),
+        ):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Room For Halves",
+                    job_id="job-room-2",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assembling.assert_not_called()
+        paperless.upload_document.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert len(list(kept[0].iterdir())) == 5
+
+    def test_a_partial_refused_by_the_rule_keeps_the_page_files(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A jammed scan with no room for its partial PDF keeps the pages."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        monkeypatch.setattr(preservation_module, "_free_bytes", lambda _directory: 0)
+        assembling = MagicMock()
+
+        with (
+            patch("saneless.preservation.assemble_pdf", assembling),
+            pytest.raises(ScanError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=_jamming_scanner(2, ScanError("Feeder jammed")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Room Jam", job_id="job-room-3"
+                ),
+            )
+
+        assembling.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        message = failure_text(excinfo.value)
+        assert "MB needed" in message
+        assert f"The 2 spooled page file(s) were preserved at {kept[0]}" in message
 
 
 def _preserved_pages_dir(failed_dir: Path, name: str, page_bytes: int) -> Path:
@@ -4112,11 +5532,11 @@ def _preserved_pages_dir(failed_dir: Path, name: str, page_bytes: int) -> Path:
 
 class TestFailedDirCountsPreservedPageDirectories:
     """
-    D-10: ``failed/`` holds two kinds of artefact now, and both are counted.
+    The growth check counts both kinds of artefact in ``failed/``.
 
-    A growth check that only globbed ``*.pdf`` would under-report a directory
-    filling up with preserved page directories -- silently, which is the one
-    thing T-29-36's warning exists to prevent.
+    A check that only globbed ``*.pdf`` would silently under-report a
+    directory filling up with preserved page directories, which is the one
+    thing the warning exists to prevent.
     """
 
     def test_failed_dir_counts_directories_towards_the_threshold(
@@ -4129,8 +5549,8 @@ class TestFailedDirCountsPreservedPageDirectories:
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
         _preserved_pages_dir(failed_dir, "20260101-000000-jobx-doc", 110 * 1024)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
-            _warn_if_failed_dir_growing(failed_dir)
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            warn_if_failed_dir_growing(failed_dir)
 
         message = next(
             record.getMessage()
@@ -4138,10 +5558,11 @@ class TestFailedDirCountsPreservedPageDirectories:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs.  A size sum
-        # that skipped the directories, or walked only their top level, would
-        # report 0.0 or 0.1 here.
-        assert "0.2 MiB" in message
+        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs: 235,008
+        # bytes.  A size sum that skipped the directories, or walked only
+        # their top level, would report 0.0 or 0.1 here.
+        assert "0.2 MB" in message
+        assert "MiB" not in message
 
     def test_failed_dir_stays_silent_below_the_threshold_with_directories(
         self,
@@ -4153,13 +5574,13 @@ class TestFailedDirCountsPreservedPageDirectories:
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 2)
         _preserved_pages_dir(failed_dir, "20260101-000000-joby-doc", 1024)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
-            _warn_if_failed_dir_growing(failed_dir)
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            warn_if_failed_dir_growing(failed_dir)
 
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_counts_directories_never_raises_on_a_vanished_walk(
@@ -4170,9 +5591,9 @@ class TestFailedDirCountsPreservedPageDirectories:
         """
         A directory removed underneath the walk ends the check silently.
 
-        The walk lives inside the existing ``try``, so it returns through the
-        same ``except OSError`` that has always kept a bookkeeping failure from
-        displacing the delivery failure already in flight.
+        The walk runs inside the check's ``try``, so it returns through the
+        ``except OSError`` that keeps a bookkeeping failure from displacing the
+        delivery failure already in flight.
         """
         failed_dir = tmp_path / "failed"
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD)
@@ -4188,7 +5609,7 @@ class TestFailedDirCountsPreservedPageDirectories:
         monkeypatch.setattr(Path, "rglob", exploding_rglob)
 
         # The assertion is that this returns at all.
-        _warn_if_failed_dir_growing(failed_dir)
+        warn_if_failed_dir_growing(failed_dir)
 
     def test_failed_dir_counts_directories_never_raises_on_an_unreadable_dir(
         self,
@@ -4208,7 +5629,7 @@ class TestFailedDirCountsPreservedPageDirectories:
 
         monkeypatch.setattr(Path, "iterdir", exploding_iterdir)
 
-        _warn_if_failed_dir_growing(failed_dir)
+        warn_if_failed_dir_growing(failed_dir)
 
 
 def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
@@ -4236,22 +5657,22 @@ def _both_halves_delivered() -> MagicMock:
     """Return a paperless client that accepts both partial uploads."""
     paperless = MagicMock()
     paperless.upload_document.side_effect = [
-        UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-        UploadResult(delivered_to_api=True, task_uuid="backs-task"),
+        ApiDelivery(task_id="fronts-task"),
+        ApiDelivery(task_id="backs-task"),
     ]
-    paperless.poll_task.return_value = None
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 
 class TestDuplexMismatchDelivery:
-    """D-08: the duplex-mismatch path gets the same honesty as the simplex one."""
+    """The duplex-mismatch path confirms, preserves and reports like the simplex one."""
 
     def test_duplex_mismatch_polls_both_halves(
         self,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Leaving either task unpolled is C-03 surviving in a corner."""
+        """Both halves' tasks are polled, so neither is reported filed unconfirmed."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -4345,7 +5766,7 @@ class TestDuplexMismatchDelivery:
         default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.poll_task.side_effect = [
-            None,
+            TaskFiled(task={"status": "SUCCESS"}),
             PaperlessError("Paperless reported FAILURE"),
         ]
 
@@ -4365,24 +5786,64 @@ class TestDuplexMismatchDelivery:
         assert paperless.poll_task.call_count == 2
         assert len(list(failed_dir.glob("*.pdf"))) == 2
 
+    def test_a_half_paperless_already_took_is_kept_with_a_caution(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The fronts reached paperless-ngx, the backs did not: only one is new.
+
+        Both are kept, because the pair is one document, but the kept fronts
+        say they were already accepted, so they are not uploaded a second
+        time by someone following the usual advice.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            ApiDelivery(task_id="fronts-task"),
+            PaperlessError("Upload rejected"),
+        ]
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Half Taken",
+                    job_id="job-dx-9",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        (fronts,) = failed_dir.glob("*-fronts.pdf")
+        (backs,) = failed_dir.glob("*-backs.pdf")
+        message = failure_text(excinfo.value)
+        assert (
+            f"{fronts.name} had already been accepted by paperless-ngx as task "
+            f"fronts-task, which had not confirmed it was consumed, so check "
+            f"paperless-ngx before uploading it again"
+        ) in message
+        assert f"{backs.name} had already" not in message
+
     def test_duplex_mismatch_assembly_failure_keeps_every_spooled_page(
         self,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
         """
-        A PdfError on the fronts half keeps both passes' page files (CR-01).
+        A PdfError on the fronts half keeps both passes' page files.
 
-        This arm returns early from ``run_pipeline``, so neither guard that
-        function opens is in scope: the partial-scan guard has closed and the
-        page-file guard sits on the branch this path never reaches.  Until the
-        assembly here got a guard of its own, a full disk or a page file
-        Pillow could no longer read unwound the workspace and deleted every
-        sheet of *both* passes -- on the one path whose whole reason to exist
-        is handing an anomaly to a person.
-
-        The assertion is on the file names and not merely on a count, because
-        keeping only the half that assembled would satisfy a count.
+        This arm returns early from ``run_pipeline``, outside the guards that
+        function opens, so its assembly needs a guard of its own: without it
+        a full disk or an unreadable page file would delete every sheet of
+        both passes, on the one path that exists to hand an anomaly to a
+        person.  The assertion is on the file names, because keeping only the
+        half that assembled would satisfy a count.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
@@ -4416,7 +5877,7 @@ class TestDuplexMismatchDelivery:
             "b-0002.png",
         ]
         assert all((kept[0] / name).stat().st_size > 0 for name in pages)
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "img2pdf refused the page" in message
         assert "5 spooled page file(s)" in message
         assert str(kept[0]) in message
@@ -4429,7 +5890,7 @@ class TestDuplexMismatchDelivery:
         tmp_path: Path,
     ) -> None:
         """
-        The guard spans both assembly calls, not just the first (CR-01).
+        The guard spans both assembly calls, not just the first.
 
         A guard wrapped around the fronts alone would leave the backs
         unprotected and still pass the sibling test above, so the failure is
@@ -4464,8 +5925,8 @@ class TestDuplexMismatchDelivery:
         kept = _preserved_page_dirs(failed_dir)
         assert len(kept) == 1
         assert len(sorted(kept[0].iterdir())) == 5
-        assert "qpdf refused the merge" in str(excinfo.value)
-        assert "5 spooled page file(s)" in str(excinfo.value)
+        assert "qpdf refused the merge" in failure_text(excinfo.value)
+        assert "5 spooled page file(s)" in failure_text(excinfo.value)
         paperless.upload_document.assert_not_called()
 
     def test_duplex_mismatch_upload_failure_does_not_also_keep_the_pages(
@@ -4474,10 +5935,10 @@ class TestDuplexMismatchDelivery:
         tmp_path: Path,
     ) -> None:
         """
-        The two guards do not overlap: an upload failure keeps the PDFs only.
+        The stages do not overlap: an upload failure keeps the PDFs only.
 
-        D-08 puts one ``_preserving`` over both halves of the upload, and the
-        page-file guard stops at the assembly deliberately.  Nesting them would
+        Both halves are kept when either upload fails, and the page files
+        are kept only when the assembly is what failed.  Keeping both would
         file the same two passes twice -- once as the partial PDFs and again as
         the page files they were built from -- and leave the operator two
         copies of one anomaly to reconcile.
@@ -4561,7 +6022,7 @@ class TestDuplexMismatchDelivery:
                 ),
             )
 
-        message = str(excinfo.value)
+        message = failure_text(excinfo.value)
         assert "Upload failed" in message
         assert str(failed_dir) in message
 
@@ -4570,7 +6031,7 @@ class TestDuplexMismatchDelivery:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """OUTC-03: the worker needs an outcome, a warning and three counts."""
+        """A mismatch result carries the outcome, a warning and all three counts."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -4605,13 +6066,10 @@ class TestDuplexMismatchDelivery:
         default_settings.profiles["default"].duplex = "manual"
         paperless = MagicMock()
         paperless.upload_document.side_effect = [
-            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-            UploadResult(
-                delivered_to_api=False,
-                consume_dir_path=tmp_path / "consume" / "backs.pdf",
-            ),
+            ApiDelivery(task_id="fronts-task"),
+            FolderDelivery(path=tmp_path / "consume" / "backs.pdf"),
         ]
-        paperless.poll_task.return_value = None
+        paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
 
         result = run_pipeline(
             scanner=_mismatched_duplex_scanner(),
@@ -4629,15 +6087,297 @@ class TestDuplexMismatchDelivery:
         assert paperless.poll_task.call_count == 1
 
 
+def _mismatch_request(title: str) -> PipelineRequest:
+    """Return the request for a manual duplex run that ends in a mismatch."""
+    return PipelineRequest(
+        profile_name="default",
+        title=title,
+        job_id="job-dx-half",
+        flip_coordinator=AlwaysContinueFlipCoordinator(),
+    )
+
+
+def _manual_duplex(settings: Settings, tmp_path: Path) -> Path:
+    """Set the default profile to manual duplex and return the failed dir."""
+    failed_dir = _isolate_dirs(settings, tmp_path)
+    settings.profiles["default"].source = "ADF"
+    settings.profiles["default"].duplex = "manual"
+    return failed_dir
+
+
+def _kept_pdfs(failed_dir: Path) -> list[str]:
+    """Return the names of the PDFs kept in failed/, sorted."""
+    return sorted(path.name for path in failed_dir.glob("*.pdf"))
+
+
+class TestDuplicateIsAWarnedDelivery:
+    """paperless-ngx already holding the file is a delivered scan, not a failure."""
+
+    def test_duplicate_single_document_is_done_with_a_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The scan succeeds, names the document, exits 7 and keeps nothing."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskDuplicate(document_id=42, in_trash=False)
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Twice", job_id=FIXED_JOB_ID
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert result.warning == duplicate_warning(42, in_trash=False)
+        assert "#42" in result.warning
+        assert (
+            exit_code_for_outcome(result.outcome, result.warning)
+            is ExitCode.UPLOADED_WITH_WARNING
+        )
+        assert _kept_pdfs(failed_dir) == []
+
+    def test_duplicate_in_the_trash_says_so(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The trash note reaches the job's warning."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskDuplicate(
+            document_id=None, in_trash=True
+        )
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Trashed", job_id=FIXED_JOB_ID
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == duplicate_warning(None, in_trash=True)
+
+    def test_filed_task_carries_no_duplicate_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A filed task stays a plain success."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Once", job_id=FIXED_JOB_ID
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+
+    def test_duplicate_backs_half_joins_the_mismatch_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A duplicate half is still delivered; both sentences are kept."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = [
+            TaskFiled(task={"status": "SUCCESS"}),
+            TaskDuplicate(document_id=42, in_trash=False),
+        ]
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(fronts=3, backs=2),
+            paperless=paperless,
+            settings=default_settings,
+            request=_mismatch_request("Half Twice"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert "Page count mismatch: 3 fronts, 2 backs" in result.warning
+        assert (
+            duplicate_warning(42, in_trash=False, half=preservation_module.BACKS_SUFFIX)
+            in result.warning
+        )
+        assert _kept_pdfs(failed_dir) == []
+
+    def test_duplicate_on_both_halves_names_each(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Each half's duplicate sentence names that half."""
+        _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = [
+            TaskDuplicate(document_id=7, in_trash=False),
+            TaskDuplicate(document_id=8, in_trash=True),
+        ]
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=_mismatch_request("Both Twice"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        fronts = duplicate_warning(
+            7, in_trash=False, half=preservation_module.FRONTS_SUFFIX
+        )
+        backs = duplicate_warning(
+            8, in_trash=True, half=preservation_module.BACKS_SUFFIX
+        )
+        assert fronts in result.warning
+        assert backs in result.warning
+        assert result.warning.index(fronts) < result.warning.index(backs)
+
+
+class TestPerHalfDelivery:
+    """Once one half of a mismatch is in paperless-ngx, a failure is unconfirmed."""
+
+    def test_per_half_backs_upload_refused_after_the_fronts_were_accepted(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The headline names the delivered half, and a rescan is not invited."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        refused = PaperlessError("refused 400")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            ApiDelivery(task_id="fronts-task"),
+            refused,
+        ]
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Half Refused"),
+            )
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            "The (fronts) half reached paperless-ngx; the (backs) half failed: "
+            "refused 400"
+        )
+        assert excinfo.value.__cause__ is refused
+        assert classify_error(excinfo.value) is ErrorCategory.UNCONFIRMED_FILING
+        assert exit_code_for(classify_error(excinfo.value)) is ExitCode.UNCONFIRMED
+        (fronts,) = failed_dir.glob("*-fronts.pdf")
+        (backs,) = failed_dir.glob("*-backs.pdf")
+        text = failure_text(excinfo.value)
+        assert f"{fronts.name} had already been accepted by paperless-ngx" in text
+        assert f"{backs.name} had already" not in text
+        paperless.poll_task.assert_not_called()
+
+    def test_per_half_fronts_upload_failure_propagates_unchanged(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Nothing reached paperless-ngx, so the error is the upload's own."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        refused = PaperlessError("fronts refused 400")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = refused
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Nothing Sent"),
+            )
+
+        assert excinfo.value is refused
+        assert type(excinfo.value) is PaperlessError
+        assert paperless.upload_document.call_count == 1
+        assert len(_kept_pdfs(failed_dir)) == 2
+
+    def test_per_half_fronts_poll_failure_names_the_backs_as_delivered(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Both were accepted; the fronts task is the half that failed."""
+        _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        failure = PaperlessUnconfirmedError("Paperless task fronts-task ended FAILURE")
+        paperless.poll_task.side_effect = failure
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Fronts Poll"),
+            )
+
+        assert str(excinfo.value).startswith(
+            "The (backs) half reached paperless-ngx; the (fronts) half failed: "
+            "Paperless task fronts-task ended FAILURE"
+        )
+        assert excinfo.value.__cause__ is failure
+
+    def test_per_half_backs_poll_failure_names_the_fronts_as_delivered(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The fronts were filed; the backs task never confirmed."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        timeout = PaperlessTimeoutError("Paperless task backs-task did not finish")
+        paperless.poll_task.side_effect = [TaskFiled(task={}), timeout]
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Backs Poll"),
+            )
+
+        assert str(excinfo.value).startswith(
+            "The (fronts) half reached paperless-ngx; the (backs) half failed: "
+            "Paperless task backs-task did not finish"
+        )
+        assert excinfo.value.__cause__ is timeout
+        assert classify_error(excinfo.value) is ErrorCategory.UNCONFIRMED_FILING
+        assert len(_kept_pdfs(failed_dir)) == 2
+
+    def test_per_half_interruption_passes_through_unchanged(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A stop during the backs upload is still a stop, not a failed half."""
+        _manual_duplex(default_settings, tmp_path)
+        stop = ScanInterrupted("server stopping")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            ApiDelivery(task_id="fronts-task"),
+            stop,
+        ]
+
+        with pytest.raises(ScanInterrupted) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Stopped"),
+            )
+
+        assert excinfo.value is stop
+
+
 class TestTheDpiTheDeviceActuallyChose:
     """
     The PDF declares the resolution the scanner used, not the one asked for.
 
-    Phase 23 made the profile's requested resolution authoritative for
-    ``img2pdf.get_fixed_dpi_layout_fun``. SANE substitutes silently -- measured,
-    5000 comes back as 1200 -- so a device that substitutes produced both a
-    mis-cropped page and a MediaBox disagreeing with its own content, which
-    re-opened part of OUTC-06 (T-24-22).
+    SANE substitutes a resolution silently (a request for 5000 can come back
+    as 1200), so laying pages out at the requested value would give a
+    mis-cropped page and a MediaBox that disagrees with its own content.
     """
 
     def test_the_pdf_is_assembled_at_the_resolution_the_device_chose(
@@ -4662,10 +6402,61 @@ class TestTheDpiTheDeviceActuallyChose:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Clamped"),
+                request=PipelineRequest(
+                    profile_name="default", title="Clamped", job_id=FIXED_JOB_ID
+                ),
             )
 
-        assert mock_assemble.call_args.kwargs["dpi"] == 300
+        records = mock_assemble.call_args.args[0]
+        assert [record.dpi for record in records] == [300]
+
+    def test_preserved_partial_uses_the_read_back_dpi(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A partial kept after a jam is laid out at the device's dpi.
+
+        The profile asks for 300 and the device reads back 150; two A4 rasters
+        at 150 dpi go through, then the third sheet jams.  The scan never
+        returned a batch, so the only place the 150 can come from is the pages
+        themselves.  Laid out at the requested 300, the kept PDF would be half
+        size.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].resolution = 300
+
+        def spool_two_then_jam(
+            device_id: str, settings: ScanSettings, sink: PageSink
+        ) -> ScanBatch:
+            """Spool two A4 pages read back at 150 dpi, then jam."""
+            for _ in range(2):
+                sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+            msg = "Scanner error on page 3: Document feeder jammed"
+            raise ScanError(msg)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spool_two_then_jam
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Read Back", job_id="job-dpi-rb"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        with pikepdf.open(preserved[0]) as pdf:
+            box = pikepdf.Rectangle(pdf.pages[0].mediabox)
+            assert len(pdf.pages) == 2
+        assert (box.llx, box.lly, box.urx, box.ury) == pytest.approx(
+            (0.0, 0.0, 595.2, 841.92)
+        )
 
     def test_the_duplex_mismatch_recovery_also_uses_the_actual_dpi(
         self,
@@ -4705,8 +6496,59 @@ class TestTheDpiTheDeviceActuallyChose:
                 ),
             )
 
-        dpis = [call.kwargs["dpi"] for call in mock_assemble.call_args_list]
-        assert dpis == [150, 150]
+        dpis = [
+            [record.dpi for record in call.args[0]]
+            for call in mock_assemble.call_args_list
+        ]
+        assert dpis == [[150, 150, 150], [150, 150]]
+
+    def test_a_long_title_still_gives_the_two_halves_two_names(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Past the file name's cap on the title, the halves are still told apart.
+
+        Both halves are named in the same second, and the consume folder
+        fallback lands each on its own name, so one name for both would let
+        the backs replace the fronts.
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+        )
+        fronts_pdf = tmp_path / "fronts.pdf"
+        backs_pdf = tmp_path / "backs.pdf"
+        fronts_pdf.write_bytes(b"%PDF-fake")
+        backs_pdf.write_bytes(b"%PDF-fake")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.side_effect = [fronts_pdf, backs_pdf]
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=_both_halves_delivered(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title=(
+                        "An Unusually Long Title For A Two Sided Stack Of Tax "
+                        "Paperwork 2026"
+                    ),
+                    job_id="job-long-1",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        names = [call.kwargs["filename"] for call in mock_assemble.call_args_list]
+        assert len(names) == 2
+        assert names[0].endswith("-fronts.pdf"), names[0]
+        assert names[1].endswith("-backs.pdf"), names[1]
 
     def test_two_passes_disagreeing_on_resolution_say_so(
         self,
@@ -4719,8 +6561,10 @@ class TestTheDpiTheDeviceActuallyChose:
         Manual duplex must not silently pick one of two different resolutions.
 
         The two passes use identical settings on one device, so a disagreement
-        means the device changed its mind mid-job. Pass A's value is used and
-        the difference is logged rather than swallowed.
+        means the device changed its mind mid-job. The difference is logged
+        rather than swallowed, and nothing has to be picked for the PDF: every
+        page is laid out at the dpi its own pass read back, so the fronts are
+        300 and the backs 150, interleaved.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -4733,7 +6577,7 @@ class TestTheDpiTheDeviceActuallyChose:
 
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
-            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+            caplog.at_level(logging.WARNING, logger="saneless.duplex"),
         ):
             mock_assemble.return_value = tmp_path / "output.pdf"
             (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
@@ -4745,6 +6589,7 @@ class TestTheDpiTheDeviceActuallyChose:
                 request=PipelineRequest(
                     profile_name="default",
                     title="Two Dpis",
+                    job_id=FIXED_JOB_ID,
                     flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
@@ -4755,18 +6600,18 @@ class TestTheDpiTheDeviceActuallyChose:
             if record.levelno == logging.WARNING
         ]
         assert [m for m in messages if "300" in m and "150" in m]
-        assert mock_assemble.call_args.kwargs["dpi"] == 300
+        records = mock_assemble.call_args.args[0]
+        assert [record.dpi for record in records] == [300, 150, 300, 150]
 
 
 class TestRejectedPagesAreNotBlankPages:
     """
-    D-07: a sheet the scanner could not read is counted, and counted apart.
+    A sheet the scanner could not read is counted, and counted apart.
 
-    ``pages_scanned`` is ``len(records)``, which already excludes a skipped
-    sheet, so a ten-sheet stack with one unreadable page reported nine and
-    nobody learned a page was lost (T-24-23). The count must not be folded into
-    the blank-page total, which Phase 30 renders as pages removed for being
-    blank (T-24-24).
+    ``pages_scanned`` is ``len(records)``, which excludes a skipped sheet, so
+    without its own count a ten-sheet stack with one unreadable page would
+    report nine and nobody would learn a page was lost.  The count stays out
+    of the blank-page total, which is shown as pages removed for being blank.
     """
 
     def test_rejected_pages_are_reported_without_touching_the_blank_count(
@@ -4789,12 +6634,16 @@ class TestRejectedPagesAreNotBlankPages:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Two Rejected"),
+                request=PipelineRequest(
+                    profile_name="default", title="Two Rejected", job_id=FIXED_JOB_ID
+                ),
             )
 
         assert result.pages_removed == 0
-        assert result.warning is not None
-        assert "2" in result.warning
+        assert result.warning == (
+            "2 page(s) could not be read by the scanner and were skipped. "
+            "They were not removed for being blank; rescan those sheets."
+        )
 
     def test_a_clean_scan_reports_zero_for_both_counts(
         self,
@@ -4816,28 +6665,525 @@ class TestRejectedPagesAreNotBlankPages:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="All Clean"),
+                request=PipelineRequest(
+                    profile_name="default", title="All Clean", job_id=FIXED_JOB_ID
+                ),
             )
 
         assert result.pages_removed == 0
         assert result.warning is None
 
 
+class TestBatchFactWarnings:
+    """
+    What the backend measured about a pass finishes the job warned.
+
+    A flatbed request the scanner's Auto source took through the feeder, and a
+    pass that stopped at its per-pass cap, both upload the pages kept and end
+    as a warned DONE, each worded once beside any unreadable-sheet warning.
+    """
+
+    def _run(
+        self,
+        scanner: MagicMock,
+        paperless: MagicMock,
+        settings: Settings,
+        tmp_path: Path,
+    ) -> ScanResult:
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+            return run_pipeline(
+                scanner=scanner,
+                paperless=paperless,
+                settings=settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Facts", job_id=FIXED_JOB_ID
+                ),
+            )
+
+    def test_a_substitution_through_the_feeder_is_a_warned_done(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The requested source and the feeder routing are in the warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(2)], substituted_source="Flatbed"
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert substituted_source_warning("Flatbed") in result.warning
+        mock_paperless.upload_document.assert_called_once()
+
+    def test_no_substitution_fact_is_a_plain_done(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A substitution kept on the glass reaches the pipeline as no fact."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(2)]
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+
+    def test_a_named_feeder_cap_uploads_the_pages_kept_and_warns(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The kept pages go up, and the warning names the sheet not kept."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 3
+        mock_paperless.upload_document.assert_called_once()
+        assert result.warning == pass_cap_warning(3, 500, 501, auto_source=False)
+
+    def test_a_cap_counts_the_pages_uploaded_after_blank_removal(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        "Finished at N pages" agrees with pages_uploaded once blanks are out.
+
+        A multi-page document's cap sentence counts the pages it holds, so a
+        single pass counts the same thing: the pages uploaded, not the pages
+        scanned.
+        """
+        assert default_settings.profiles["default"].enable_empty_page_detection
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image(), _make_empty_image(), _make_content_image()],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.pages_scanned == 3
+        assert result.pages_uploaded == 2
+        assert result.warning == pass_cap_warning(2, 500, 501, auto_source=False)
+
+    @pytest.mark.parametrize(
+        "blank",
+        [
+            pytest.param(False, id="delivery-fails"),
+            pytest.param(True, id="all-blank"),
+        ],
+    )
+    def test_a_failure_after_a_capped_pass_still_names_the_sheet_not_kept(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        *,
+        blank: bool,
+    ) -> None:
+        """
+        The failure line carries the cap sentence, not only the log.
+
+        The pages are kept in ``failed/``, and the operator resuming from them
+        needs to know which sheet was fed and not kept. Parametrised over a
+        delivery that fails and a pass whose every page is blank, which fails
+        before anything is assembled.
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        expected: type[Exception] = AllPagesBlankError
+        if not blank:
+            expected = PaperlessError
+            mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        make = _make_empty_image if blank else _make_content_image
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [make() for _ in range(3)],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        with pytest.raises(expected) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Capped", job_id=FIXED_JOB_ID
+                ),
+            )
+
+        text = failure_text(excinfo.value)
+        assert text.endswith(pass_cap_note(500, 501, auto_source=False))
+        assert "preserved" in text
+
+    def test_an_auto_source_cap_carries_the_auto_sentence(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The lower Auto cap is worded with its own advice."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            cap_reached=PassCapReached(50, 51, auto_source=True),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning == pass_cap_warning(3, 50, 51, auto_source=True)
+
+    def test_every_fact_is_joined_once(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Substitution, cap and unreadable sheets share one warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            rejected=2,
+            substituted_source="Flatbed",
+            cap_reached=PassCapReached(50, 51, auto_source=True),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning is not None
+        substitution = substituted_source_warning("Flatbed")
+        cap = pass_cap_warning(3, 50, 51, auto_source=True)
+        assert result.warning.count(substitution) == 1
+        assert result.warning.count(cap) == 1
+        assert result.warning.count("2 page(s) could not be read") == 1
+
+    def test_a_control_character_in_the_requested_name_is_neutralised(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An escape sequence in the name never reaches the warning raw."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image()], substituted_source="Flat\x1b[2Jbed"
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning is not None
+        assert "\x1b" not in result.warning
+        assert "Flat" in result.warning
+
+
+def _passes_in_turn(
+    *passes: Callable[[str, ScanSettings, PageSink], ScanBatch],
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build one ``side_effect`` that hands each ``scan_pages`` call its own pass.
+
+    ``spooling_in_turn`` spools a different page list per call but gives every
+    call a plain batch; a manual-duplex test that needs a fact on one pass
+    only, such as a cap, composes one ``spooling`` callable per pass instead.
+
+    Args:
+        passes: One ``spooling`` callable per expected call, in call order.
+
+    Returns:
+        One callable with ``scan_pages``' own shape.
+
+    """
+    remaining = list(passes)
+
+    def _next_pass(device_id: str, settings: ScanSettings, sink: PageSink) -> ScanBatch:
+        """Run the pass belonging to this call number."""
+        if not remaining:
+            msg = f"scan_pages was called more than {len(passes)} time(s)"
+            raise AssertionError(msg)
+        return remaining.pop(0)(device_id, settings, sink)
+
+    return _next_pass
+
+
+class TestManualDuplexPassCap:
+    """
+    A manual-duplex pass that stops at its cap never produces mis-paired pages.
+
+    After a capped fronts pass the sheet past the cap is already in the output
+    tray, so no flip is asked for and the fronts are delivered alone. A capped
+    backs pass is delivered as the two halves, even when the counts agree,
+    because the cap says a sheet was fed that the other pass never saw.
+    """
+
+    _CAP = PassCapReached(500, 501, auto_source=False)
+
+    @staticmethod
+    def _run(
+        scanner: MagicMock,
+        paperless: MagicMock,
+        settings: Settings,
+        coordinator: FlipCoordinator,
+        events: list[PipelineEvent],
+    ) -> ScanResult:
+        settings.profiles["default"].source = "ADF"
+        settings.profiles["default"].duplex = "manual"
+        return run_pipeline(
+            scanner=scanner,
+            paperless=paperless,
+            settings=settings,
+            request=PipelineRequest(
+                profile_name="default",
+                title="Capped Duplex",
+                job_id=FIXED_JOB_ID,
+                status_callback=events.append,
+                flip_coordinator=coordinator,
+            ),
+        )
+
+    @staticmethod
+    def _pages(count: int, start: int = 0) -> list[Image.Image]:
+        return [distinct_page(start + index) for index in range(count)]
+
+    def test_a_capped_fronts_pass_ends_the_job_without_a_flip(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """No flip prompt and no backs pass; the fronts go up with both sentences."""
+        events: list[PipelineEvent] = []
+        coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED, events)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), cap_reached=self._CAP),
+            spooling(self._pages(3, start=3)),
+        )
+
+        result = self._run(
+            scanner, mock_paperless, default_settings, coordinator, events
+        )
+
+        assert scanner.scan_pages.call_count == 1
+        assert coordinator.timeouts == []
+        assert PipelineEvent.AWAITING_FLIP not in events
+        assert PipelineEvent.SCANNING_REVERSE not in events
+        mock_paperless.upload_document.assert_called_once()
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 3
+        assert result.warning == " ".join(
+            (
+                pass_cap_warning(3, 500, 501, auto_source=False),
+                backs_not_scanned_warning(501),
+            )
+        )
+
+    def test_a_capped_backs_pass_with_a_different_count_is_two_halves(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """The halves go up apart, and the warning says why and names the sheet."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(4, start=3), cap_reached=self._CAP),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        titles = [
+            call.args[1] for call in mock_paperless.upload_document.call_args_list
+        ]
+        assert len(titles) == 2
+        assert "(fronts)" in titles[0]
+        assert "(backs)" in titles[1]
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 7
+        assert result.warning is not None
+        assert "could not be paired reliably" in result.warning
+        # The cap sentence counts both halves, as pages_uploaded does, and
+        # does not advise resuming from a sheet whose front was never scanned.
+        assert result.warning.count(backs_pass_cap_warning(7, 500, 501)) == 1
+        assert "one scan stops after" not in result.warning
+
+    def test_a_failed_capped_fronts_run_still_names_the_sheet_and_the_backs(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A delivery failure after a capped fronts pass keeps both sentences."""
+        _isolate_dirs(default_settings, tmp_path)
+        mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), cap_reached=self._CAP),
+        )
+
+        with pytest.raises(PaperlessError) as excinfo:
+            self._run(
+                scanner,
+                mock_paperless,
+                default_settings,
+                AlwaysContinueFlipCoordinator(),
+                events,
+            )
+
+        assert failure_text(excinfo.value).endswith(
+            " ".join(
+                (
+                    pass_cap_note(500, 501, auto_source=False),
+                    backs_not_scanned_warning(501),
+                )
+            )
+        )
+
+    def test_a_failed_capped_backs_run_still_names_the_sheet(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A delivery failure after a capped backs pass keeps its own sentence."""
+        _isolate_dirs(default_settings, tmp_path)
+        mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(4, start=3), cap_reached=self._CAP),
+        )
+
+        with pytest.raises(PaperlessError) as excinfo:
+            self._run(
+                scanner,
+                mock_paperless,
+                default_settings,
+                AlwaysContinueFlipCoordinator(),
+                events,
+            )
+
+        assert failure_text(excinfo.value).endswith(backs_pass_cap_note(500, 501))
+
+    def test_a_capped_backs_pass_is_never_interleaved_even_when_counts_agree(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """Equal counts prove nothing once a sheet was fed that pass A never saw."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(3, start=3), cap_reached=self._CAP),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        titles = [
+            call.args[1] for call in mock_paperless.upload_document.call_args_list
+        ]
+        assert len(titles) == 2
+        assert "(fronts)" in titles[0]
+        assert "(backs)" in titles[1]
+        assert result.warning is not None
+        assert "could not be paired reliably" in result.warning
+        # Three fronts and three backs are not a count mismatch, and saying so
+        # would be false.
+        assert "Page count mismatch" not in result.warning
+        assert result.warning.count(backs_pass_cap_warning(6, 500, 501)) == 1
+
+    def test_an_interleaved_run_reports_a_feeder_substitution(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """A flatbed request taken through the feeder is not lost by the interleave."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(2), substituted_source="Flatbed"),
+            spooling(self._pages(2, start=2), substituted_source="Flatbed"),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        mock_paperless.upload_document.assert_called_once()
+        assert result.pages_uploaded == 4
+        assert result.warning == substituted_source_warning("Flatbed")
+
+    def test_a_split_run_reports_a_feeder_substitution_once(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """Both halves came through the same substitution; it is said once."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), substituted_source="Flatbed"),
+            spooling(self._pages(2, start=3), substituted_source="Flatbed"),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        assert mock_paperless.upload_document.call_count == 2
+        assert result.warning is not None
+        assert "Page count mismatch: 3 fronts, 2 backs" in result.warning
+        assert result.warning.count(substituted_source_warning("Flatbed")) == 1
+
+
 class TestTitleLogEscaping:
     """
-    A job title in a pipeline log line is escaped, not pasted (IN-03).
+    A job title in a pipeline log line is escaped, not pasted.
 
-    ``web/errors.py``'s module docstring states the discipline: request input
-    goes into a log line with ``%r`` "so a control character in them is escaped
-    and cannot forge a log line".  A job title is request input, is bounded
-    only in length (``TITLE_MAX_LENGTH``) and never in character set, so a
-    title carrying a newline could otherwise append a record of the operator's
-    own choosing to the log an operator and any log shipper reads.
-
-    Every assertion here is on ``record.getMessage()`` -- the formatted line --
-    rather than on ``record.args``, because the raw argument is the unescaped
-    title by design and asserting on it would pass whatever the format string
-    said.
+    A job title is request input bounded only in length, never in character
+    set, so a title carrying a newline could append a forged record to the
+    log an operator and any log shipper reads.  Every assertion is on
+    ``record.getMessage()``, the formatted line, because ``record.args``
+    holds the unescaped title whatever the format string says.
     """
 
     #: A title whose newline would start a plausible-looking second record.
@@ -4847,6 +7193,9 @@ class TestTitleLogEscaping:
     def _pass_count_message(title: str, caplog: pytest.LogCaptureFixture) -> str:
         """
         Drive ``_note_pass_count``'s failure path and return its log line.
+
+        Every observer failure is logged by one best-effort helper, at
+        WARNING, as "Observer failed at ...".
 
         Args:
             title: The request title to put through the log line.
@@ -4873,16 +7222,20 @@ class TestTitleLogEscaping:
             raise RuntimeError(msg)
 
         request = PipelineRequest(
-            profile_name="default", title=title, pass_count_callback=exploding
+            profile_name="default",
+            title=title,
+            job_id=FIXED_JOB_ID,
+            pass_count_callback=exploding,
         )
 
-        with caplog.at_level(logging.ERROR, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
             _note_pass_count(request, SCAN_LABEL_FRONT, 3)
 
         records = [
             record
             for record in caplog.records
-            if "Pass-count observer failed" in str(record.msg)
+            if "Observer failed at" in str(record.msg)
+            and record.levelno == logging.WARNING
         ]
         assert len(records) == 1
         return records[0].getMessage()
@@ -4899,6 +7252,7 @@ class TestTitleLogEscaping:
         return PipelineRequest(
             profile_name="default",
             title=cls.FORGING_TITLE,
+            job_id=FIXED_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -4945,7 +7299,7 @@ class TestTitleLogEscaping:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        The call this phase added escapes the title it logs (IN-03).
+        The pass-count observer's failure line escapes the title it logs.
 
         Args:
             caplog: pytest's log capture fixture.
@@ -4963,13 +7317,12 @@ class TestTitleLogEscaping:
         default_settings: Settings,
     ) -> None:
         """
-        The simplex completion line gets the same treatment.
+        The simplex completion line escapes the title too.
 
         Args:
             caplog: pytest's log capture fixture.
             mock_paperless: The stub Paperless client.
             default_settings: The fixture settings.
-            tmp_path: pytest's per-test temporary directory.
 
         """
         scanner = MagicMock(spec=ScannerBackend)
@@ -4995,13 +7348,12 @@ class TestTitleLogEscaping:
         default_settings: Settings,
     ) -> None:
         """
-        So does the duplex-mismatch recovery's completion line.
+        The duplex-mismatch recovery's completion line escapes the title too.
 
         Args:
             caplog: pytest's log capture fixture.
             mock_paperless: The stub Paperless client.
             default_settings: The fixture settings.
-            tmp_path: pytest's per-test temporary directory.
 
         """
         default_settings.profiles["default"].source = "ADF"
@@ -5044,14 +7396,1473 @@ class TestTitleLogEscaping:
         for word in ("Q4", "final", "done"):
             assert word in message
 
-    def test_no_quoted_percent_s_interpolation_remains(self) -> None:
+    @pytest.mark.source_structure
+    @pytest.mark.parametrize(
+        "module",
+        [pipeline_module, duplex_module, flip_module, preservation_module],
+        ids=["pipeline", "duplex", "flip", "preservation"],
+    )
+    def test_no_logger_call_quotes_a_percent_s_placeholder(
+        self, module: ModuleType
+    ) -> None:
         """
-        No ``'%s'``-shaped interpolation is left to paste input into a line.
+        No ``logger`` call in these modules quotes a ``'%s'`` placeholder.
 
         A source-level guard rather than a behaviour one: it catches a new
-        call site added later that follows the old style, which no per-call
-        test would notice.
-        """
-        source = inspect.getsource(pipeline_module)
+        call site that quotes its own placeholder, which no per-call test
+        would notice. Only the format constants of logger calls are read, so
+        a comment or docstring can neither satisfy nor break it.
 
-        assert "'%s'" not in source
+        Args:
+            module: The pipeline or one of the modules holding the code it runs.
+
+        """
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
+
+        assert _quoted_percent_s_logger_calls(source) == []
+
+    def test_the_log_format_check_reports_a_quoted_placeholder(self) -> None:
+        """The check names a quoted ``'%s'`` format and ignores comments and docs."""
+        offending = (
+            "import logging\n"
+            "logger = logging.getLogger(__name__)\n"
+            "def scan(title):\n"
+            "    logger.info(\"title '%s'\", title)\n"
+        )
+        harmless = (
+            "def scan(title):\n"
+            '    """Log the title, never as \'%s\'."""\n'
+            "    # logger.info(\"title '%s'\", title)\n"
+            '    logger.info("title %r", title)\n'
+        )
+
+        assert _quoted_percent_s_logger_calls(offending) == [4]
+        assert _quoted_percent_s_logger_calls(harmless) == []
+
+
+def _quoted_percent_s_logger_calls(source: str) -> list[int]:
+    """
+    List the lines of ``logger`` calls whose format constant quotes a ``'%s'``.
+
+    Args:
+        source: Python source to parse.
+
+    Returns:
+        The line number of each offending call, in source order.
+
+    """
+    return sorted(
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "logger"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and "'%s'" in node.args[0].value
+    )
+
+
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
+@pytest.fixture
+def umask_022() -> Iterator[None]:
+    """
+    Run the test under umask 022, the common default.
+
+    Under it a plain ``mkdir`` gives 0755 and a new file 0644, readable by
+    every local user, which is exactly what a preserved scan must not be.
+    """
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def _mode(path: Path) -> int:
+    """Return the permission bits of ``path``."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _fail_the_upload(settings: Settings, job_id: str) -> None:
+    """
+    Run one single-page scan whose upload fails, so its PDF is preserved.
+
+    Args:
+        settings: Settings already pointed at an isolated ``data_dir``.
+        job_id: The job id the preserved PDF is named from.
+
+    """
+    paperless = MagicMock()
+    paperless.upload_document.side_effect = PaperlessError("Upload failed")
+    with pytest.raises(PaperlessError):
+        run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=settings,
+            request=PipelineRequest(
+                profile_name="default", title="Private Scan", job_id=job_id
+            ),
+        )
+
+
+@pytest.mark.usefixtures("umask_022")
+class TestPreservedFilesArePrivate:
+    """
+    A failed scan leaves only owner-only files and directories behind.
+
+    Preserved scans are whole documents. On a fresh ``data_dir`` every
+    directory saneless creates for them is 0700 and every file it moves there
+    is 0600, whatever the umask. Directories that already exist keep the mode
+    an earlier release gave them.
+    """
+
+    def test_preserved_pdf_mode_is_private_on_a_fresh_data_dir(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """``data_dir`` and ``failed/`` are 0700 and the PDF is 0600."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        _fail_the_upload(default_settings, "job-mode-1")
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_pdf_mode_survives_a_cross_filesystem_move(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A move between filesystems copies the file and still keeps it 0600.
+
+        ``tmp_dir`` and ``data_dir`` may be different volumes, where the hard
+        link the move starts with fails with EXDEV and a copy is made instead.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        real_link = os.link
+        crossed: list[str] = []
+
+        def cross_device(src: str | Path, dst: str | Path) -> None:
+            if Path(dst).parent == failed_dir:
+                crossed.append(str(dst))
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            real_link(src, dst)
+
+        monkeypatch.setattr(os, "link", cross_device)
+
+        _fail_the_upload(default_settings, "job-mode-2")
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert crossed == [str(preserved[0])]
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_pdf_is_private_while_it_crosses_filesystems(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The copy a cross-filesystem move makes is 0600 before any byte lands.
+
+        A ``failed/`` an earlier release made 0755 lets every local user reach
+        the files inside, so a copy created with the umask's mode would be
+        readable by all of them for as long as the document takes to copy.
+        The kernel's fast copies, ``copy_file_range`` and ``sendfile``, are
+        refused here so that every copy, the standard library's included,
+        goes through ``copyfileobj``, where the mode of the file being
+        written can be read.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+        failed_dir.chmod(0o755)
+        real_link = os.link
+        real_copyfileobj = shutil.copyfileobj
+        modes: list[int] = []
+
+        def cross_device(src: str | Path, dst: str | Path) -> None:
+            if Path(dst).parent == failed_dir:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            real_link(src, dst)
+
+        def no_fast_copy(*_args: object, **_kwargs: object) -> NoReturn:
+            raise OSError(errno.ENOTSOCK, os.strerror(errno.ENOTSOCK))
+
+        def recording(source: BinaryIO, target: BinaryIO, *args: int) -> None:
+            modes.append(stat.S_IMODE(os.fstat(target.fileno()).st_mode))
+            real_copyfileobj(source, target, *args)
+
+        monkeypatch.setattr(os, "link", cross_device)
+        monkeypatch.setattr(os, "copy_file_range", no_fast_copy, raising=False)
+        monkeypatch.setattr(os, "sendfile", no_fast_copy)
+        monkeypatch.setattr(shutil, "copyfileobj", recording)
+
+        _fail_the_upload(default_settings, "job-mode-6")
+
+        [preserved] = list(failed_dir.glob("*.pdf"))
+        assert modes == [_PRIVATE_FILE_MODE]
+        assert _mode(preserved) == _PRIVATE_FILE_MODE
+        assert preserved.read_bytes().startswith(b"%PDF")
+
+    def test_partial_pdf_mode_is_private(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A mid-batch jam's partial PDF is 0600 in a 0700 ``failed/``."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=_jamming_scanner(
+                    2, ScanError("Scanner error on page 3: Document feeder jammed")
+                ),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Jammed", job_id="job-mode-3"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "partial" in preserved[0].name
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_page_files_mode_is_private(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Pages kept after an assembly failure are 0600 in a 0700 directory."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(2)]
+        )
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Pages", job_id="job-mode-4"
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        pages = sorted(kept[0].iterdir())
+        assert len(pages) == 2
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(kept[0]) == _PRIVATE_DIR_MODE
+        assert [_mode(page) for page in pages] == [_PRIVATE_FILE_MODE] * 2
+
+    def test_existing_failed_dir_mode_is_kept(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """
+        A ``failed/`` an earlier release made 0755 stays 0755.
+
+        Files and directories left by earlier releases are not re-moded; the
+        upgrade notes give the commands to tighten them. The new PDF inside is
+        still private.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+        failed_dir.parent.chmod(0o755)
+        failed_dir.chmod(0o755)
+
+        _fail_the_upload(default_settings, "job-mode-5")
+
+        assert _mode(failed_dir.parent) == 0o755
+        assert _mode(failed_dir) == 0o755
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+
+# --------------------------------------------------------------------------
+# One guard over the whole run, and observers that cannot change its outcome.
+# --------------------------------------------------------------------------
+
+# What a job-store write raises on a busy SQLite database: the realistic way
+# the web worker's progress callbacks fail.
+_STORE_FAULT = "database is locked"
+
+# Pages the fake scanner feeds: three sheets simplex, or three sheets whose
+# backs come back last-sheet-first after the flip.
+_SIMPLEX_PASSES: tuple[tuple[int, ...], ...] = ((0, 1, 2),)
+_DUPLEX_PASSES: tuple[tuple[int, ...], ...] = ((0, 2, 4), (5, 3, 1))
+
+
+def _recording_client(
+    settings: Settings, recorder: RecordingPaperless
+) -> PaperlessClient:
+    """
+    Build a real paperless-ngx client whose every request goes to ``recorder``.
+
+    Args:
+        settings: The settings whose paperless-ngx URL and token it uses.
+        recorder: The in-memory paperless-ngx.
+
+    Returns:
+        A client that never opens a socket; the caller closes it.
+
+    """
+    return PaperlessClient(
+        url=settings.paperless.url,
+        token=settings.paperless.token.get_secret_value(),
+        transport=httpx2.MockTransport(recorder),
+        timing=PaperlessTiming(send_budget=0.0),
+    )
+
+
+@dataclass
+class _ObserverFault:
+    """
+    One observer that raises the job store's error at one moment of a run.
+
+    Attributes:
+        label: The parametrize id.
+        passes: The pages each scanner pass feeds.
+        event: The status event whose callback raises, or None.
+        thumbnail: Whether the thumbnail callback raises.
+        pass_count: Whether the pass-count callback raises.
+        raised: How many times the observer raised, so a test can prove the
+            fault really fired.
+
+    """
+
+    label: str
+    passes: tuple[tuple[int, ...], ...]
+    event: PipelineEvent | None = None
+    thumbnail: bool = False
+    pass_count: bool = False
+    raised: int = 0
+
+    def _fail(self) -> NoReturn:
+        """
+        Raise the error a locked job store raises, and count it.
+
+        Raises:
+            sqlite3.OperationalError: Always.
+
+        """
+        self.raised += 1
+        raise sqlite3.OperationalError(_STORE_FAULT)
+
+    def on_status(self, event: PipelineEvent) -> None:
+        """
+        Fail at the chosen event, and accept every other one.
+
+        Args:
+            event: The event the run reported.
+
+        """
+        if event is self.event:
+            self._fail()
+
+    def on_thumbnail(self, _thumbnail: str) -> None:
+        """Fail on the thumbnail, if this fault is the thumbnail's."""
+        if self.thumbnail:
+            self._fail()
+
+    def on_pass_count(self, _label: str, _count: int) -> None:
+        """Fail on a pass count, if this fault is the pass count's."""
+        if self.pass_count:
+            self._fail()
+
+    def request(self) -> PipelineRequest:
+        """
+        Build the request carrying all three observers.
+
+        Returns:
+            A request that can run simplex or manual duplex.
+
+        """
+        return PipelineRequest(
+            profile_name="default",
+            title="Observed",
+            job_id="job-observed",
+            status_callback=self.on_status,
+            thumbnail_callback=self.on_thumbnail,
+            pass_count_callback=self.on_pass_count,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+        )
+
+
+_OBSERVER_FAULTS = [
+    *(
+        _ObserverFault(
+            label=f"simplex-{event.value}", passes=_SIMPLEX_PASSES, event=event
+        )
+        for event in (
+            PipelineEvent.SCANNING,
+            PipelineEvent.ASSEMBLING,
+            PipelineEvent.UPLOADING,
+            PipelineEvent.DONE,
+        )
+    ),
+    *(
+        _ObserverFault(
+            label=f"duplex-{event.value}", passes=_DUPLEX_PASSES, event=event
+        )
+        for event in (PipelineEvent.AWAITING_FLIP, PipelineEvent.SCANNING_REVERSE)
+    ),
+    _ObserverFault(label="thumbnail", passes=_SIMPLEX_PASSES, thumbnail=True),
+    _ObserverFault(label="pass-count", passes=_DUPLEX_PASSES, pass_count=True),
+]
+
+
+class TestRaisingObserver:
+    """
+    An observer that raises never loses the pages and never re-labels the fault.
+
+    The web worker's progress callbacks write to the job store, which raises
+    ``sqlite3.OperationalError`` when the database is locked.  Every callback
+    is an observer of the run, not part of it: whichever one raises, at
+    whichever moment, the real spool, the real assembly and a real
+    paperless-ngx client still deliver the document exactly once.
+    """
+
+    @pytest.mark.parametrize(
+        "spec", _OBSERVER_FAULTS, ids=[spec.label for spec in _OBSERVER_FAULTS]
+    )
+    def test_a_raising_observer_leaves_the_run_to_deliver(
+        self,
+        spec: _ObserverFault,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The run delivers once and keeps nothing, and the fault is logged.
+
+        Delivered means the run returned, so it raised no ``ScanError`` (or
+        anything else); and a delivered run leaves ``failed/`` empty.  Either
+        an upload or a kept scan, never neither -- here, always the upload.
+        """
+        fault = dataclasses.replace(spec)
+        failed_dir = (
+            _duplex_settings(default_settings, tmp_path)
+            if len(fault.passes) == 2
+            else _isolate_dirs(default_settings, tmp_path)
+        )
+        recorder = RecordingPaperless()
+        paperless = _recording_client(default_settings, recorder)
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                result = run_pipeline(
+                    scanner=DistinctPageScanner(passes=fault.passes),
+                    paperless=paperless,
+                    settings=default_settings,
+                    request=fault.request(),
+                )
+        finally:
+            paperless.close()
+
+        assert fault.raised >= 1
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert len(recorder.uploads()) == 1
+        assert _preserved_page_dirs(failed_dir) == []
+        assert not failed_dir.exists() or list(failed_dir.iterdir()) == []
+        logged = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and record.exc_info is not None
+            and isinstance(record.exc_info[1], sqlite3.OperationalError)
+        ]
+        assert len(logged) == fault.raised
+
+
+class TestRunGuard:
+    """
+    One guard over the whole run keeps the most finished artefact, stage by stage.
+
+    A fault is injected at each stage and the kept artefact is checked by
+    kind: each spooled pass as its own PDF during acquisition, the whole
+    unfiltered document once acquisition has finished, the page files when
+    assembly fails, and the assembled PDF when delivery fails.  The failure
+    escapes as the very object that was raised, with a note naming what was
+    kept -- read through ``failure_text``, because ``str()`` ignores notes.
+    """
+
+    def test_run_guard_keeps_each_pass_of_an_interrupted_simplex_scan(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Two sheets spooled, then a jam: one ``(partial)`` PDF of two pages."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 3: Paper jam")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(2, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Guarded", job_id="job-guard-1"
+                ),
+            )
+
+        assert excinfo.value is original
+        assert _preserved_page_counts(failed_dir) == {"partial": 2}
+        kept = next(iter(failed_dir.glob("*.pdf")))
+        assert failure_text(excinfo.value) == (
+            "Scanner error on page 3: Paper jam. The 2 page(s) scanned before "
+            f"the error were preserved at {kept}"
+        )
+
+    def test_run_guard_keeps_both_passes_of_a_failed_pass_b(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Pass B jams after one back: ``(fronts)`` and ``(backs)`` are both kept."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 2 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(3, 1, original)
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Guarded Duplex",
+                    job_id="job-guard-2",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert excinfo.value is original
+        assert _preserved_page_counts(failed_dir) == {"fronts": 3, "backs": 1}
+        assert "4 page(s) scanned before the error were preserved at" in (
+            failure_text(excinfo.value)
+        )
+
+    def test_run_guard_keeps_the_unfiltered_document_when_every_page_is_blank(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """All blank: one PDF of every page, in document order, and no upload."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_empty_image() for _ in range(3)]
+        )
+        paperless = MagicMock()
+
+        with pytest.raises(AllPagesBlankError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Blank Stack", job_id="job-guard-3"
+                ),
+            )
+
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert "partial" not in kept[0].name
+        with pikepdf.open(kept[0]) as pdf:
+            assert len(pdf.pages) == 3
+        assert classify_error(excinfo.value) is ErrorCategory.ALL_BLANK
+        assert f"The 3 scanned page(s) were preserved at {kept[0]}" in failure_text(
+            excinfo.value
+        )
+        paperless.upload_document.assert_not_called()
+
+    def test_run_guard_keeps_the_page_files_when_assembly_fails(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """No PDF could be built, so the three page files are kept."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(3)]
+        )
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Pdf", job_id="job-guard-4"
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert len(list(kept[0].iterdir())) == 3
+        assert list(failed_dir.glob("*.pdf")) == []
+        assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in (
+            failure_text(excinfo.value)
+        )
+
+    def test_run_guard_keeps_a_coding_error_in_the_upload_as_itself(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """
+        A ``TypeError`` from the upload stays a ``TypeError``, with the PDF kept.
+
+        Re-raised as a ``PaperlessError``, a bug in saneless's own code would
+        read as "paperless-ngx is unreachable" and exit 3; kept as itself it
+        is UNKNOWN, which the CLI exits 5 for.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = TypeError("upload_document() got an unexpected keyword argument")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = original
+
+        with pytest.raises(TypeError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Coding Error", job_id="job-guard-5"
+                ),
+            )
+
+        assert excinfo.value is original
+        assert classify_error(excinfo.value) is ErrorCategory.UNKNOWN
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert f"preserved at {kept[0]}" in failure_text(excinfo.value)
+
+    def test_run_guard_keeps_a_poll_timeout_as_itself(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A ``PaperlessTimeoutError`` from the poll is not flattened to its base."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = PaperlessTimeoutError("Timed out after 300s waiting for task")
+        paperless = _delivering_to_api()
+        paperless.poll_task.side_effect = original
+
+        with pytest.raises(PaperlessTimeoutError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Slow Task", job_id="job-guard-6"
+                ),
+            )
+
+        assert excinfo.value is original
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        # paperless-ngx had accepted the upload before the poll timed out, so
+        # the kept copy says so: uploading it unchecked would duplicate it.
+        assert failure_text(excinfo.value) == (
+            f"Timed out after 300s waiting for task. The scan was preserved at "
+            f"{kept[0]}. {kept[0].name} had already been accepted by paperless-ngx "
+            f"as task task-uuid-1, which had not confirmed it was consumed, so "
+            f"check paperless-ngx before uploading it again"
+        )
+
+    def test_run_guard_cautions_the_copy_of_an_upload_with_no_answer(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """
+        An upload sent whole with no usable answer puts the caution on the copy.
+
+        That is where a duplicate is likeliest, so the kept sentence -- which
+        is all some surfaces show -- has to say to check paperless-ngx first,
+        as it does for an interrupted send.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = PaperlessUncertainSendError("Timed out reading the answer")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = original
+
+        with pytest.raises(PaperlessUncertainSendError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Answer", job_id="job-guard-7"
+                ),
+            )
+
+        assert excinfo.value is original
+        paperless.poll_task.assert_not_called()
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert failure_text(excinfo.value) == (
+            f"Timed out reading the answer. The scan was preserved at {kept[0]}. "
+            f"{kept[0].name} was sent to paperless-ngx without a usable answer and "
+            f"may have arrived, so check paperless-ngx before uploading it again"
+        )
+
+    def test_run_guard_keeps_the_pages_of_an_interrupted_run(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """An interruption is not a cancel: the pages are kept, and it re-raises."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = ScanInterrupted("Interrupted by SIGTERM", signum=signal.SIGTERM)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _spooling_then_failing(
+            [distinct_page(index) for index in range(2)], original
+        )
+
+        with pytest.raises(ScanInterrupted) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Stopped", job_id="job-guard-7"
+                ),
+            )
+
+        assert excinfo.value is original
+        assert excinfo.value.signum == signal.SIGTERM
+        assert _preserved_page_counts(failed_dir) == {"partial": 2}
+        assert "2 page(s) scanned before the error were preserved at" in (
+            failure_text(excinfo.value)
+        )
+
+    def test_run_guard_keeps_nothing_for_a_cancel_at_the_flip(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The operator chose to stop, so ``failed/`` stays empty."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(2)]
+        )
+
+        with pytest.raises(ScanCancelledError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Abandoned",
+                    job_id="job-guard-8",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
+                ),
+            )
+
+        assert not failed_dir.exists()
+        assert getattr(excinfo.value, "__notes__", None) is None
+
+    def test_run_guard_keeps_nothing_for_ctrl_c(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """``KeyboardInterrupt`` is the operator's cancel and passes the guard."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _spooling_then_failing(
+            [distinct_page(index) for index in range(2)], KeyboardInterrupt()
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Ctrl C", job_id="job-guard-9"
+                ),
+            )
+
+        assert not failed_dir.exists()
+        assert list(default_settings.output.tmp_dir.iterdir()) == []
+
+
+class TestJobWorkspace:
+    """
+    The run works in a locked workspace named after its job.
+
+    A sweep of ``tmp_dir`` has to tell a live run's workspace from one a
+    killed process left behind; the lock is how, and the name is how the
+    survivor is traced back to its job.
+    """
+
+    def test_workspace_is_named_after_the_job_and_locked_while_the_run_lives(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """While assembling: one ``job-*`` directory, locked; afterwards, none."""
+        tmp_dir = default_settings.output.tmp_dir
+        seen: list[tuple[list[str], list[str]]] = []
+
+        def look(event: PipelineEvent) -> None:
+            """Record what ``tmp_dir`` holds, and what a sweep could claim."""
+            if event is not PipelineEvent.ASSEMBLING:
+                return
+            orphans = find_orphans(tmp_dir)
+            claimed = [orphan.path.name for orphan in orphans]
+            for orphan in orphans:
+                orphan.close()
+            seen.append((sorted(entry.name for entry in tmp_dir.iterdir()), claimed))
+
+        result = run_pipeline(
+            scanner=mock_scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default",
+                title="Locked",
+                job_id="4f2a9c1e-0000-4000-8000-000000000000",
+                status_callback=look,
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert len(seen) == 1
+        names, claimed = seen[0]
+        assert len(names) == 1
+        assert names[0].startswith("job-4f2a9c1e-")
+        assert claimed == []
+        assert list(tmp_dir.iterdir()) == []
+
+
+class TestBuildPipelineRequest:
+    """The one builder the worker and the CLI both make their request with."""
+
+    def test_metadata_and_every_hook_reach_the_request(self) -> None:
+        """Tags, correspondent, callbacks and coordinators arrive unchanged."""
+
+        def on_status(_event: PipelineEvent) -> None:
+            """Observe nothing."""
+
+        def on_thumbnail(_data: str) -> None:
+            """Observe nothing."""
+
+        def on_pass_count(_job_id: str, _count: int) -> None:
+            """Observe nothing."""
+
+        hooks = RequestHooks(
+            status_callback=on_status,
+            thumbnail_callback=on_thumbnail,
+            pass_count_callback=on_pass_count,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+            multi_page=True,
+            pass_coordinator=ScriptedPassCoordinator([]),
+            device_memory=DeviceMemory(),
+            preserving=threading.Event(),
+            abort=threading.Event(),
+            scan_child_live=threading.Event(),
+            settled=Settled(),
+        )
+
+        request = build_pipeline_request(
+            profile_name="receipts",
+            title="Receipt",
+            job_id="job-1",
+            metadata=ScanMetadata(tags=(3,), correspondent=12),
+            hooks=hooks,
+        )
+
+        assert request.profile_name == "receipts"
+        assert request.title == "Receipt"
+        assert request.job_id == "job-1"
+        assert request.tags == [3]
+        assert request.correspondent == 12
+        assert request.status_callback is on_status
+        assert request.thumbnail_callback is on_thumbnail
+        assert request.pass_count_callback is on_pass_count
+        assert request.flip_coordinator is hooks.flip_coordinator
+        assert request.multi_page is True
+        assert request.pass_coordinator is hooks.pass_coordinator
+        assert request.device_memory is hooks.device_memory
+        assert request.preserving is hooks.preserving
+        assert request.abort is hooks.abort
+        assert request.scan_child_live is hooks.scan_child_live
+        assert request.settled is hooks.settled
+
+    def test_no_tags_is_none_on_the_request(self) -> None:
+        """An empty tag tuple becomes the request's "no tags", ``None``."""
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Bare",
+            job_id="job-2",
+            metadata=ScanMetadata(tags=(), correspondent=None),
+            hooks=RequestHooks(),
+        )
+
+        assert request.tags is None
+        assert request.correspondent is None
+
+    def test_default_hooks_leave_every_surface_field_unset(self) -> None:
+        """A bare ``RequestHooks`` matches a request built with no hooks at all."""
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Bare",
+            job_id="job-3",
+            metadata=ScanMetadata(tags=(), correspondent=None),
+            hooks=RequestHooks(),
+        )
+
+        assert request == PipelineRequest(
+            profile_name="default", title="Bare", job_id="job-3"
+        )
+
+    def test_the_hooks_cover_every_surface_field_of_the_request(self) -> None:
+        """
+        A field added to the request is either metadata or a hook.
+
+        Otherwise the builder would silently leave it at its default for both
+        callers, and whichever surface needed it would have no way to set it.
+        """
+        request_fields = {field.name for field in dataclasses.fields(PipelineRequest)}
+        hook_fields = {field.name for field in dataclasses.fields(RequestHooks)}
+        identity = {"profile_name", "title", "job_id", "tags", "correspondent"}
+
+        assert request_fields == identity | hook_fields
+
+    def test_the_metadata_lookup_reaches_the_request(self) -> None:
+        """The surface's lookup is the one the run checks ids with."""
+        lookup = _FixedLookup(tags=frozenset(), correspondents=frozenset())
+
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Looked up",
+            job_id="job-4",
+            metadata=ScanMetadata(tags=(3,), correspondent=None),
+            hooks=RequestHooks(metadata_lookup=lookup),
+        )
+
+        assert request.metadata_lookup is lookup
+
+
+class _FixedLookup:
+    """
+    A metadata lookup with fixed answers that notes the scanner's state at each call.
+
+    Attributes:
+        calls: Each call's list and ``fresh`` flag, in order.
+        devices_listed: How many times ``scanner.get_devices`` had been called
+            when each lookup call was made, when a scanner mock is watched.
+
+    """
+
+    def __init__(
+        self,
+        *,
+        tags: frozenset[int] | None,
+        correspondents: frozenset[int] | None,
+        scanner: MagicMock | None = None,
+    ) -> None:
+        """Answer every call for a list with the same ids, or None."""
+        self._tags = tags
+        self._correspondents = correspondents
+        self._scanner = scanner
+        self.calls: list[tuple[str, bool]] = []
+        self.devices_listed: list[int] = []
+
+    def _note(self, what: str, *, fresh: bool) -> None:
+        """Record the call and how far the scanner had been touched."""
+        self.calls.append((what, fresh))
+        if self._scanner is not None:
+            self.devices_listed.append(self._scanner.get_devices.call_count)
+
+    def tag_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Answer the tag list."""
+        self._note("tags", fresh=fresh)
+        return self._tags
+
+    def correspondent_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Answer the correspondent list."""
+        self._note("correspondents", fresh=fresh)
+        return self._correspondents
+
+
+def _metadata_gets(recorder: RecordingPaperless) -> list[str]:
+    """
+    Return the path of every tag or correspondent list request, in order.
+
+    Args:
+        recorder: The in-memory paperless-ngx.
+
+    Returns:
+        One path per metadata list request.
+
+    """
+    return [
+        request.url.path
+        for request in recorder.requests
+        if request.method == "GET"
+        and request.url.path in {TAGS_PATH, CORRESPONDENTS_PATH}
+    ]
+
+
+class TestStaleIdsAreDroppedBeforeScanning:
+    """
+    Tag and correspondent ids are checked before any paper moves.
+
+    The check runs in ``run_pipeline`` itself, so the web and the CLI behave
+    the same: an id paperless-ngx does not list is dropped and the upload is
+    a warned success, and an unreachable paperless-ngx lets the ids through.
+    """
+
+    def test_stale_ids_are_checked_before_the_scanner_is_touched(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Both lookups run before device discovery, the first scanner contact."""
+        default_settings.scanner.device = ""
+        scanner = _scanner_listing()
+        lookup = _FixedLookup(
+            tags=frozenset({3, 9}), correspondents=frozenset({12}), scanner=scanner
+        )
+
+        with pytest.raises(NoScannerFoundError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Checked",
+                    job_id=FIXED_JOB_ID,
+                    tags=[3, 9],
+                    correspondent=12,
+                    metadata_lookup=lookup,
+                ),
+            )
+
+        assert lookup.calls == [("tags", False), ("correspondents", False)]
+        assert lookup.devices_listed == [0, 0]
+        scanner.get_devices.assert_called_once()
+
+    def test_a_stale_tag_is_dropped_and_the_upload_is_warned(
+        self, default_settings: Settings
+    ) -> None:
+        """Tag 9 is gone: the upload carries tag 3 only, and the run exits 7."""
+        recorder = RecordingPaperless(tags=(3,))
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Stale",
+                    job_id=FIXED_JOB_ID,
+                    tags=[3, 9],
+                ),
+            )
+        finally:
+            paperless.close()
+
+        dropped = dropped_ids_warning((9,), None)
+        assert dropped is not None
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == dropped
+        assert (
+            exit_code_for_outcome(result.outcome, result.warning)
+            is ExitCode.UPLOADED_WITH_WARNING
+        )
+        assert len(recorder.uploads()) == 1
+        tags = [value for name, value in recorder.upload_fields(0) if name == "tags"]
+        assert tags == ["3"]
+        # The client's own fetch is already fresh, so it is not asked twice.
+        assert _metadata_gets(recorder) == [TAGS_PATH]
+
+    def test_a_stale_correspondent_is_dropped_before_the_other_warnings(
+        self, default_settings: Settings
+    ) -> None:
+        """The dropped-id sentence comes first, then what the scan itself says."""
+        recorder = RecordingPaperless(correspondents=())
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES, rejected=(1,)),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Stale",
+                    job_id=FIXED_JOB_ID,
+                    correspondent=12,
+                ),
+            )
+        finally:
+            paperless.close()
+
+        dropped = dropped_ids_warning((), 12)
+        assert dropped is not None
+        assert result.warning is not None
+        assert result.warning.startswith(f"{dropped} ")
+        assert len(result.warning) > len(dropped) + 1
+        fields = recorder.upload_fields(0)
+        assert [name for name, _ in fields if name == "correspondent"] == []
+
+    def test_a_scan_with_no_ids_makes_no_metadata_request(
+        self, default_settings: Settings
+    ) -> None:
+        """Nothing to check: paperless-ngx's lists are never asked for."""
+        recorder = RecordingPaperless()
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Bare", job_id=FIXED_JOB_ID
+                ),
+            )
+        finally:
+            paperless.close()
+
+        assert result.warning is None
+        assert _metadata_gets(recorder) == []
+
+    def test_an_unreachable_lookup_sends_the_ids_unchecked(
+        self, default_settings: Settings
+    ) -> None:
+        """With the id lookup unreachable, every id is uploaded and nothing is warned."""
+        recorder = RecordingPaperless(tags=(3,))
+        paperless = _recording_client(default_settings, recorder)
+        lookup = _FixedLookup(tags=None, correspondents=None)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Unchecked",
+                    job_id=FIXED_JOB_ID,
+                    tags=[3, 9],
+                    metadata_lookup=lookup,
+                ),
+            )
+        finally:
+            paperless.close()
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+        tags = [value for name, value in recorder.upload_fields(0) if name == "tags"]
+        assert tags == ["3", "9"]
+        assert lookup.calls == [("tags", False)]
+
+
+class _SessionSpanScanner(DistinctPageScanner):
+    """A distinct-page scanner that logs its session, passes and restarts, in order."""
+
+    def __init__(
+        self,
+        log: list[str],
+        *,
+        passes: Sequence[Sequence[int]],
+        fail_on: Mapping[int, BaseException] | None = None,
+    ) -> None:
+        """
+        Prepare the passes, the shared log and an empty session record.
+
+        Args:
+            log: Where every session entry and exit, pass and restart is
+                appended, beside whatever else the test logs.
+            passes: The page indices each successive pass feeds.
+            fail_on: The exception a pass raises, keyed by its 1-based number.
+
+        """
+        super().__init__(passes=passes, fail_on=fail_on if fail_on is not None else {})
+        self.log = log
+        self.sessions: list[tuple[threading.Event | None, threading.Event | None]] = []
+
+    @override
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """
+        Record the session's Events, and log its entry and exit.
+
+        Args:
+            abort: Recorded.
+            live: Recorded.
+
+        Returns:
+            A context manager that logs ``enter`` and ``exit``.
+
+        """
+        self.sessions.append((abort, live))
+        return self._logged_session()
+
+    @contextlib.contextmanager
+    def _logged_session(self) -> Generator[None]:
+        """
+        Log the session's entry, then its exit however the block ends.
+
+        Yields:
+            Nothing.
+
+        """
+        self.log.append("enter")
+        try:
+            yield
+        finally:
+            self.log.append("exit")
+
+    @override
+    def reinitialise(self) -> None:
+        """Log a restart."""
+        self.log.append("reinitialise")
+
+    @override
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Log a pass, then feed it.
+
+        Args:
+            device_id: Passed through.
+            settings: Passed through.
+            sink: Passed through.
+
+        Returns:
+            The pass's batch.
+
+        """
+        self.log.append("scan")
+        return super().scan_pages(device_id, settings, sink)
+
+
+class _LoggedFlip(AlwaysContinueFlipCoordinator):
+    """A flip coordinator that logs the flip wait before answering it at once."""
+
+    def __init__(self, log: list[str]) -> None:
+        """
+        Keep the shared log.
+
+        Args:
+            log: Where ``flip`` is appended at each wait.
+
+        """
+        super().__init__()
+        self.log = log
+
+    @override
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Log the wait, then report the stack flipped.
+
+        Args:
+            timeout: Passed through.
+
+        Returns:
+            ``FlipOutcome.CONTINUED``.
+
+        """
+        self.log.append("flip")
+        return super().wait_for_flip(timeout)
+
+
+def _logged[**P, R](log: list[str], name: str, real: Callable[P, R]) -> Callable[P, R]:
+    """
+    Wrap a pipeline step so each call logs its name before it runs.
+
+    Args:
+        log: Where ``name`` is appended at each call.
+        name: What to log.
+        real: The step to run.
+
+    Returns:
+        The wrapped step.
+
+    """
+
+    def _step(*args: P.args, **kwargs: P.kwargs) -> R:
+        log.append(name)
+        return real(*args, **kwargs)
+
+    return _step
+
+
+def _log_the_finish(monkeypatch: pytest.MonkeyPatch, log: list[str]) -> None:
+    """
+    Log each blank filter and each assembly the run makes, then make it.
+
+    Args:
+        monkeypatch: Replaces the pipeline's own references.
+        log: Where ``filter`` and ``assemble`` are appended.
+
+    """
+    monkeypatch.setattr(
+        pipeline_module,
+        "filter_blank_pages",
+        _logged(log, "filter", pipeline_module.filter_blank_pages),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "assemble_pdf",
+        _logged(log, "assemble", pipeline_module.assemble_pdf),
+    )
+
+
+_SPAN_RUNS: Final = {
+    "simplex": ("adf", ((0, 1),), False, []),
+    "manual-duplex": (DUPLEX_PROFILE, ((0, 1), (3, 2)), False, []),
+    "multi-page": (
+        "default",
+        ((0,), (1,), (2,)),
+        True,
+        [PassAnswer.NEXT, PassAnswer.NEXT, PassAnswer.FINISH],
+    ),
+}
+
+_SPAN_LOGS: Final = {
+    "simplex": ["enter", "scan", "exit", "filter", "assemble"],
+    "manual-duplex": ["enter", "scan", "flip", "scan", "exit", "filter", "assemble"],
+    "multi-page": [
+        "enter",
+        "scan",
+        "prompt",
+        "reinitialise",
+        "scan",
+        "prompt",
+        "reinitialise",
+        "scan",
+        "prompt",
+        "exit",
+        "assemble",
+    ],
+}
+
+
+def _run_logged(
+    tmp_path: Path,
+    paperless: MagicMock,
+    scanner: _SessionSpanScanner,
+    mode: str,
+    events: tuple[threading.Event | None, threading.Event | None] = (None, None),
+) -> ScanResult:
+    """
+    Run one pipeline in the named mode, logging its flip waits and prompts.
+
+    Both are logged to the scanner's own log, between its passes.
+
+    Args:
+        tmp_path: The test's own temporary directory.
+        paperless: The client stand-in.
+        scanner: The scanner the run feeds from.
+        mode: A key of ``_SPAN_RUNS``.
+        events: The request's abort and live-child Events.
+
+    Returns:
+        How the run resolved.
+
+    """
+    profile, _passes, multi_page, answers = _SPAN_RUNS[mode]
+    log = scanner.log
+    abort, scan_child_live = events
+    return run_pipeline(
+        scanner=scanner,
+        paperless=paperless,
+        settings=multi_page_settings(tmp_path),
+        request=PipelineRequest(
+            profile_name=profile,
+            title="Session Span",
+            job_id=FIXED_JOB_ID,
+            flip_coordinator=_LoggedFlip(log),
+            multi_page=multi_page,
+            pass_coordinator=ScriptedPassCoordinator(
+                answers, on_ask=lambda _prompt: log.append("prompt")
+            )
+            if multi_page
+            else None,
+            abort=abort,
+            scan_child_live=scan_child_live,
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", list(_SPAN_RUNS))
+def test_one_scan_session_spans_the_whole_acquisition(
+    mode: str,
+    tmp_path: Path,
+    mock_paperless: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One session opens before the first pass and ends before the pages are judged.
+
+    Every pass, the flip wait and every prompt fall inside it, so a backend
+    that scans through a helper process keeps one for the job; and it has ended
+    before the blank filter or the assembly, so that process is gone before the
+    run's slow tail.  Only multi-page passes after the first restart the library.
+    """
+    log: list[str] = []
+    _log_the_finish(monkeypatch, log)
+    scanner = _SessionSpanScanner(log, passes=_SPAN_RUNS[mode][1])
+
+    result = _run_logged(tmp_path, mock_paperless, scanner, mode)
+
+    assert result.outcome is ScanOutcome.SUCCESS
+    assert log == _SPAN_LOGS[mode]
+
+
+@pytest.mark.parametrize("surface", ["worker", "cli"])
+def test_the_request_events_reach_the_scan_session(
+    surface: str,
+    tmp_path: Path,
+    mock_paperless: MagicMock,
+) -> None:
+    """
+    The request's abort and live-child Events are the session's, unchanged.
+
+    The worker passes its own; ``saneless scan`` passes neither, so its
+    session gets ``None`` for both.
+    """
+    log: list[str] = []
+    given = surface == "worker"
+    abort = threading.Event() if given else None
+    live = threading.Event() if given else None
+    scanner = _SessionSpanScanner(log, passes=((0,),))
+
+    _run_logged(tmp_path, mock_paperless, scanner, "simplex", (abort, live))
+
+    assert len(scanner.sessions) == 1
+    ((session_abort, session_live),) = scanner.sessions
+    assert session_abort is abort
+    assert session_live is live
+
+
+def test_a_failed_pass_ends_the_session_before_the_error_leaves_the_run(
+    tmp_path: Path, mock_paperless: MagicMock
+) -> None:
+    """A pass that raises still ends the session, and the error is the pass's own."""
+    log: list[str] = []
+    jam = ScanError("Document feeder jammed")
+    scanner = _SessionSpanScanner(log, passes=((0,),), fail_on={1: jam})
+
+    with pytest.raises(ScanError) as raised:
+        _run_logged(tmp_path, mock_paperless, scanner, "simplex")
+
+    assert raised.value is jam
+    assert log == ["enter", "scan", "exit"]

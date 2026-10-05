@@ -2,27 +2,23 @@
 The one place a scanned page is materialised on disk.
 
 ``SpooledPageSink`` is the concrete ``PageSink`` the pipeline hands to the
-backend.  It takes one acquired page at a time, checks there is room for it,
-writes it as a PNG under the job's workspace, measures it, and returns a
-``PageRecord``.  Nothing accumulates a list of page images anywhere, which is
-the whole of the memory bound: peak memory is a property of who holds a page,
-not of how many pages a job has.  The old shape was measured at 1395 MB for a
-48-page job; with the spool the ceiling is a small constant number of decoded
-pages, independent of page count.
+backend.  It takes one acquired page at a time, brings it to a mode it can
+store (or refuses it), checks there is room for it, writes it as a PNG under
+the job's workspace, measures it, and returns a ``PageRecord``.  Nothing here
+accumulates page images, so peak memory does not grow with page count.
+See docs/explanation/decisions/0005-page-sink-contract.md.
 
-The spooled PNG is not scratch: it *is* the PDF's page content, embedded
-losslessly by ``assemble_pdf`` with no second encode.  It is therefore
-written at Pillow's default compression level, 6, which this module gets by
-**not** passing the argument at all.  Measured on a noisy A4 300 DPI colour
-page: level 6 gives 13.7 MB in 1.57 s, level 1 gives 15.8 MB in 0.62 s.
-The 13% is saved in the PDF, on the Paperless upload and in Paperless storage
-forever, while the extra second is paid once against a 10-15 s per-page scan.
-Level 1 is the documented throughput fallback if ADF speed ever matters more
-than output size -- recorded here, deliberately, rather than added as a config
-key.
+The spooled PNG *is* the PDF's page content, embedded losslessly by
+``assemble_pdf`` with no second encode.  It is written at Pillow's default
+compression level by not passing the argument: measured on a noisy A4 300 DPI
+colour page, level 1 saves about a second but is 13% larger in Paperless
+storage for good.
 
-The spool knows nothing about SANE: the backend hands it one image at a time,
-and this module only decides where that image lands and measures it.
+Each page is written to ``<name>.png.part`` and renamed into place once
+complete, so a killed process never leaves a truncated PNG under a page's
+name.  Nothing is fsynced: a fed sheet cannot be re-fed either way, and a
+per-page fsync would stall the feeder.  The PNG's pHYs chunk carries the
+read-back dpi, so a sweep with no ``PageRecord`` can still lay the page out.
 """
 
 from __future__ import annotations
@@ -30,45 +26,88 @@ from __future__ import annotations
 import contextlib
 import logging
 import shutil
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from PIL.ImageStat import Stat
-
-from .exceptions import ScanError, describe
-from .pages import generate_thumbnail
+from .exceptions import (
+    DiskSpaceError,
+    ScanError,
+    ScanInterrupted,
+    SpoolError,
+    describe,
+    is_out_of_space,
+)
+from .pages import generate_thumbnail, measure_ink
 from .scanner.base import PageRecord, PageSink
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
     from PIL import Image
 
-__all__ = ["SpooledPageSink"]
+__all__ = ["BYTES_PER_MB", "SpooledPageSink"]
 
 logger = logging.getLogger(__name__)
 
-# One megabyte, as the free-space arithmetic counts them.  Matches
-# ``pipeline._check_disk_space``, so the per-page shortfall and the up-front
-# one are reported in the same units.
-_BYTES_PER_MB: Final[int] = 1024 * 1024
+# One megabyte, 10**6 bytes, as ``min_free_space_mb``, the docs and every
+# message count it.
+BYTES_PER_MB: Final[int] = 1_000_000
+
+# The modes a page is spooled in exactly as it arrived.
+_KEPT_MODES: Final[frozenset[str]] = frozenset({"1", "L", "RGB"})
+
+# Modes that are converted, and to what: each breaks the thumbnail or the PNG
+# write as it is.
+_CONVERTED_MODES: Final[Mapping[str, str]] = MappingProxyType(
+    {"LA": "L", "RGBA": "RGB", "RGBX": "RGB", "P": "RGB", "PA": "RGB"}
+)
+
+# 16-bit greyscale, in each byte order Pillow names it by.
+_SIXTEEN_BIT_MODES: Final[frozenset[str]] = frozenset({"I;16", "I;16B", "I;16L"})
+
+_SIXTEEN_TO_EIGHT_BITS: Final[float] = 1 / 256
+
+
+def _normalise_mode(image: Image.Image, sequence: int) -> Image.Image:
+    """
+    Return the page in a mode the spool can store, or refuse it by name.
+
+    16-bit greyscale is **scaled, not clipped**: ``convert("L")`` clips every
+    value above 255, so a mid-grey page would come out white and be called
+    blank.  The scale goes through mode ``I`` because Pillow applies a point
+    transform to ``I;16`` but not to its byte-order spellings.  Anything else
+    has no range to scale from or is not what a scanner sends, so it is refused.
+    """
+    mode = image.mode
+    if mode in _KEPT_MODES:
+        return image
+    converted = _CONVERTED_MODES.get(mode)
+    if converted is not None:
+        return image.convert(converted)
+    if mode in _SIXTEEN_BIT_MODES:
+        return (
+            image.convert("I")
+            .point(lambda value: value * _SIXTEEN_TO_EIGHT_BITS)
+            .convert("L")
+        )
+    msg = (
+        f"Could not spool page {sequence}: the scanner delivered it in image "
+        f"mode {mode!r}, which saneless does not store (it takes 1, L and RGB, "
+        "and converts LA, RGBA, RGBX, P, PA and 16-bit greyscale)"
+    )
+    raise ScanError(msg)
 
 
 class SpooledPageSink(PageSink):
     """
     Write each acquired page to a directory and report what it was.
 
-    One sink serves one acquisition pass.  A manual-duplex job therefore builds
-    two, ``"a"`` for the fronts and ``"b"`` for the backs, so the spooled names
-    stay distinguishable while the two passes share a directory.  That is for
-    debuggability only: document order comes from ``PageRecord.sequence`` and
-    the order of ``records``, never from sorting or globbing the directory.
-    After the duplex interleave the names do not sort into document order at
-    all, so a sort would silently scramble the document.
-
-    The constructor takes four arguments beside ``self``, which is ruff's
-    ``PLR0913`` ceiling.  Any further knob has to be a method, not a fifth
-    parameter.
+    One sink serves one acquisition pass; a manual-duplex job builds ``"a"``
+    for the fronts and ``"b"`` for the backs.  Document order comes from
+    ``PageRecord.sequence`` and the order of ``records``, never from sorting
+    the directory: after the duplex interleave the names do not sort into
+    document order.
     """
 
     def __init__(
@@ -82,26 +121,21 @@ class SpooledPageSink(PageSink):
         Prepare a sink that spools this pass's pages into ``directory``.
 
         Args:
-            directory: Where the pages land.  The pipeline's per-job
-                ``TemporaryDirectory`` owns it, so the spool's lifetime is the
-                job's and anything to be preserved must be moved out before
-                that workspace closes.
+            directory: Where the pages land, inside the job's workspace, so
+                anything to be preserved must be moved out before it closes.
             pass_label: The short prefix every file of this pass carries, e.g.
                 ``"a"`` for a simplex job or a duplex job's fronts.
             min_free_space_mb: The reserve to keep free beyond the page being
-                written, so PDF assembly still has room afterwards.  It is the
-                operator's ``min_free_space_mb``, the same value the up-front
-                check uses.
+                written, so PDF assembly still has room afterwards.
             thumbnail_callback: Called once, with the first page's base64 JPEG
-                thumbnail, at the moment that page is spooled.  None
-                when nobody is watching.
+                thumbnail, when that page is spooled.  None when nobody is
+                watching.
 
         """
         self._directory = directory
         self._pass_label = pass_label
         self._min_free_space_mb = min_free_space_mb
         self._thumbnail_callback = thumbnail_callback
-        self._sequence = 0
         self._records: list[PageRecord] = []
 
     @property
@@ -109,9 +143,7 @@ class SpooledPageSink(PageSink):
         """
         Every page spooled so far, in acquisition order.
 
-        A tuple rather than the internal list, so a caller holding the result
-        of a failed pass cannot append to the sink's own bookkeeping while the
-        preservation path is reading it.
+        A tuple, so a caller cannot append to the sink's own bookkeeping.
 
         Returns:
             The records, oldest first.
@@ -119,78 +151,111 @@ class SpooledPageSink(PageSink):
         """
         return tuple(self._records)
 
-    def add(self, image: Image.Image) -> PageRecord:
+    def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
         """
         Spool one acquired page and return the record describing it.
 
-        The page is measured exactly once, here, while it is already decoded:
-        the greyscale conversion the blank-page thresholds need used to happen
-        again later in ``is_empty_page``, and this one replaces it.  The first
-        page's thumbnail is generated here for the same reason -- reopening a
-        26 MB page afterwards would be a second decode of something that is in
-        memory right now.
+        The order is fixed: normalise, check room, measure, write, record.  A
+        refused mode is refused before anything is written, and the record is
+        appended the moment the page is on disk, since a page file the records
+        do not name is a sheet the run's guard would not keep.
+
+        A ``ScanInterrupted`` anywhere in that sequence does not lose the page:
+        the sheet has left the feeder and this image is its only copy, so the
+        sequence runs again, the page is recorded, and only then does the
+        interruption go on.  The signal handler ignores both signals by then,
+        so nothing interrupts the second attempt.
+
+        The page is measured, and the first page's thumbnail made, here while
+        it is already decoded, so nothing opens the file again.
 
         Args:
             image: The page the device produced, already cropped if the
                 requested paper size required it.
+            dpi: The resolution the device read back, stored on the record and
+                in the PNG's pHYs chunk.
 
         Returns:
             A PageRecord with the next 1-based sequence, the spooled path, the
-            page's size and mode, and its greyscale mean and stddev.
+            page's size, its mode as spooled, its dpi, and its ink coverage and
+            paper white.
 
         Raises:
-            ScanError: If the page plus the assembly reserve would not fit, or
-                if writing it failed.  No raw OSError escapes this method.
+            ScanError: If the page's mode is one the spool refuses: the
+                scanner delivered a page saneless cannot store.
+            DiskSpaceError: If the page plus the assembly reserve would not
+                fit, or if writing it ran out of space or quota.  Not a
+                ``ScanError``, so no scanner handler can claim a full disk.
+            SpoolError: If free space could not be measured, or if writing it
+                failed for any other reason.  No raw OSError escapes this
+                method.
 
         """
-        self._sequence += 1
-        sequence = self._sequence
-        png_path = self._directory / f"{self._pass_label}-{sequence:04d}.png"
+        # No call sits between the page reaching disk and the append for a
+        # signal to land in.  _spool changes nothing on the sink, and the
+        # page's number is the count recorded, so a retry writes the same file.
+        recorded = len(self._records)
+        try:
+            record, spooled = self._spool(image, dpi)
+            self._records.append(record)
+        except ScanInterrupted:
+            if len(self._records) == recorded:
+                record, spooled = self._spool(image, dpi)
+                self._records.append(record)
+            raise
 
-        self._check_room_for(image, sequence, png_path)
-        self._write(image, sequence, png_path)
-
-        grey = image.convert("L")
-        stats = Stat(grey)
-        record = PageRecord(
-            sequence=sequence,
-            path=png_path,
-            size=image.size,
-            mode=image.mode,
-            mean=stats.mean[0],
-            stddev=stats.stddev[0],
-        )
-
-        self._records.append(record)
-
-        if sequence == 1 and self._thumbnail_callback is not None:
-            # Not wrapped in a suppression: a thumbnail is a visible part of
-            # what the operator sees, so a failure here should surface rather
-            # than leave the strip silently blank.
-            #
-            # The record is appended *first*, and that ordering is load-bearing
-            # rather than tidy.  The callback can raise for reasons that have
-            # nothing to do with the page -- the web worker's is a job-store
-            # write, which raises sqlite3.Error on a locked or closed database,
-            # and generate_thumbnail itself raises OSError for a mode JPEG
-            # cannot encode.  Appending afterwards meant a raise here left
-            # a-0001.png on disk with no record of it: page_count() answered 0,
-            # so _preserving_partial_scan took its "nothing reached the spool"
-            # branch and let the workspace delete a sheet that had really been
-            # fed.
-            self._thumbnail_callback(generate_thumbnail(image))
+        if record.sequence == 1 and self._thumbnail_callback is not None:
+            # Best-effort: a failed thumbnail must not stop the feeder over a
+            # missing picture.  The record is appended first, so anything that
+            # escaped anyway still leaves the fed page recorded and kept.
+            try:
+                self._thumbnail_callback(generate_thumbnail(spooled))
+            except Exception:
+                logger.warning(
+                    "Could not make or hand on the thumbnail of %s; the scan continues",
+                    record.path,
+                    exc_info=True,
+                )
 
         logger.debug(
-            "Spooled page %d to %s (%dx%d %s, mean %.1f, stddev %.1f)",
-            sequence,
-            png_path,
+            "Spooled page %d to %s (%dx%d %s at %d dpi, ink %r%%, paper white %d)",
+            record.sequence,
+            record.path,
             record.size[0],
             record.size[1],
             record.mode,
-            record.mean,
-            record.stddev,
+            record.dpi,
+            record.ink_coverage,
+            record.paper_white,
         )
         return record
+
+    def _spool(self, image: Image.Image, dpi: int) -> tuple[PageRecord, Image.Image]:
+        """
+        Normalise, check, measure and write the next page, recording nothing.
+
+        Returns:
+            The page's record, and the page as it was written.
+
+        """
+        sequence = len(self._records) + 1
+        png_path = self._directory / f"{self._pass_label}-{sequence:04d}.png"
+
+        page = _normalise_mode(image, sequence)
+        self._check_room_for(page, sequence, png_path)
+
+        measurement = measure_ink(page)
+        record = PageRecord(
+            sequence=sequence,
+            path=png_path,
+            size=page.size,
+            mode=page.mode,
+            dpi=dpi,
+            ink_coverage=measurement.coverage,
+            paper_white=measurement.paper_white,
+        )
+        self._write(page, sequence, png_path, dpi)
+        return record, page
 
     def _check_room_for(
         self, image: Image.Image, sequence: int, png_path: Path
@@ -198,72 +263,64 @@ class SpooledPageSink(PageSink):
         """
         Refuse the page if it plus the assembly reserve would not fit.
 
-        The page's decoded size is computed from its dimensions and band
-        count, which is an upper bound on the PNG because the PNG is
-        compressed.
-
-        Args:
-            image: The page about to be written.
-            sequence: Its 1-based page number, for the message.
-            png_path: Where it would have been written, for the message.
+        The decoded size estimates the PNG rather than bounding it: an
+        incompressible page was measured slightly larger as a PNG than raw.
 
         Raises:
-            ScanError: If free space is below the page plus the reserve, or if
-                it could not be measured at all.  ``add``'s "no raw OSError
-                escapes this method" promise covers the measurement as
-                well as the write: a spool directory that has been removed, or
-                whose mount went away, raises ``FileNotFoundError`` here, and
-                untranslated it escaped past ``_acquire_pages``' ``except
-                ScanError`` ladder into its generic handler -- where it came
-                out as "Scanner error on page N", blaming the scanner for a
-                disk fault -- and past the flatbed path's handler entirely,
-                because ``_snap_flatbed``'s ``sink.add`` call sits outside its
-                ``try``.
+            DiskSpaceError: If free space is below the page plus the reserve.
+            SpoolError: If free space could not be measured, so a vanished
+                spool directory is never blamed on the scanner.
 
         """
-        # From size and band count, never len(image.tobytes()): that copied
-        # the whole page -- 26 MB at A4 300 dpi colour -- just to measure its
-        # length.  Exact for the "L" and "RGB" modes a SANE snap produces.
+        # From size and band count, never len(image.tobytes()), which copies
+        # the whole page.  Exact for the normalised "L" and "RGB"; for "1" it
+        # overstates eightfold, which errs on the safe side.
         decoded_bytes = image.size[0] * image.size[1] * len(image.getbands())
-        page_mb = (decoded_bytes + _BYTES_PER_MB - 1) // _BYTES_PER_MB
+        page_mb = (decoded_bytes + BYTES_PER_MB - 1) // BYTES_PER_MB
         required_mb = page_mb + self._min_free_space_mb
         try:
-            free_mb = shutil.disk_usage(self._directory).free // _BYTES_PER_MB
+            free_mb = shutil.disk_usage(self._directory).free // BYTES_PER_MB
         except OSError as exc:
             measure_msg = (
                 f"Could not measure free space for page {sequence} in "
                 f"{self._directory}: {describe(exc)}"
             )
-            raise ScanError(measure_msg) from exc
+            raise SpoolError(measure_msg) from exc
         if free_mb < required_mb:
             msg = (
                 f"Insufficient disk space for page {sequence}: "
                 f"{free_mb} MB free in {png_path}, {required_mb} MB required "
                 "(configure min_free_space_mb to adjust)"
             )
-            raise ScanError(msg)
+            raise DiskSpaceError(msg)
 
-    def _write(self, image: Image.Image, sequence: int, png_path: Path) -> None:
+    def _write(
+        self, image: Image.Image, sequence: int, png_path: Path, dpi: int
+    ) -> None:
         """
-        Write the page as a PNG, translating any OSError.
+        Write the page as a PNG under ``.part``, then rename it into place.
 
-        Args:
-            image: The page to write.
-            sequence: Its 1-based page number, for the message.
-            png_path: Where to write it.
+        ``Path.replace`` is atomic within one directory, so ``png_path`` exists
+        only once the whole page does.
 
         Raises:
-            ScanError: If the write failed, chained from the original OSError.
+            DiskSpaceError: If the write or the rename ran out of space or
+                quota.
+            SpoolError: If the write or the rename failed for any other reason.
 
         """
+        part_path = png_path.with_name(f"{png_path.name}.part")
         try:
-            # No compress_level argument, deliberately: Pillow's default 6 is
-            # what the module docstring's measurement chose.
-            image.save(png_path, format="PNG")
+            # No compress_level argument, deliberately: the module docstring
+            # says why.
+            image.save(part_path, format="PNG", dpi=(dpi, dpi))
+            part_path.replace(png_path)
         except OSError as exc:
-            # Remove whatever the failed write left behind, so the spool never
-            # hands a truncated page to assembly or to the preservation path.
+            # Remove the partial file, so the spool never hands a truncated
+            # page to assembly, preservation or a sweep.
             with contextlib.suppress(OSError):
-                png_path.unlink(missing_ok=True)
+                part_path.unlink(missing_ok=True)
             msg = f"Could not write page {sequence} to {png_path}: {describe(exc)}"
-            raise ScanError(msg) from exc
+            if is_out_of_space(exc):
+                raise DiskSpaceError(msg) from exc
+            raise SpoolError(msg) from exc

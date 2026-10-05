@@ -1,0 +1,9 @@
+{# The loader is the primary target and the primary content is nothing: the
+   loader is removed and everything else arrives out of band.  The hold
+   reason is emptied byte-empty so :empty hides it, but not on a blocked
+   appliance, whose page has no hold line: an out-of-band element with no
+   target is an htmx error. #}
+{% if show_tags %}{% with list_oob = true %}{% include "partials/tags.html" %}{% endwith %}{% endif %}
+{% if show_correspondent %}{% with list_oob = true %}{% include "partials/correspondent_select.html" %}{% endwith %}{% endif %}
+{% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
+{% if not scan_blocked %}<small id="scan-hold-reason" hx-swap-oob="true"></small>{% endif %}

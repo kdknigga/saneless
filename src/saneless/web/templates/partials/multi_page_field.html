@@ -1,0 +1,24 @@
+{# The wrapper is its own refresh's outerHTML target, so it is rendered here,
+   and it names its own hx-target and hx-swap so it never inherits the scan
+   form's.  The include carries the box, so a tick survives a change to a
+   profile that allows it; a disabled box is not sent, so leaving a
+   manual-duplex profile unticks it.  Always rendered, never hidden by CSS: on
+   a manual-duplex profile the box is really disabled and the reason takes the
+   help text's place in the same element. #}
+<div id="multi-page-field"
+     hx-get="/api/profiles/multi-page"
+     hx-trigger="change from:#profile-select"
+     hx-include="#profile-select, #multi-page"
+     hx-target="this"
+     hx-swap="outerHTML">
+    <fieldset>
+        <label for="multi-page" class="multi-page-option">
+            <input type="checkbox" id="multi-page" name="multi_page"
+                   autocomplete="off"
+                   aria-describedby="multi-page-help"
+                   {%- if multi_page_disabled %} disabled{% elif multi_page_checked %} checked{% endif %}>
+            {{ multi_page_label }}
+        </label>
+    </fieldset>
+    <small id="multi-page-help">{{ multi_page_help }}</small>
+</div>

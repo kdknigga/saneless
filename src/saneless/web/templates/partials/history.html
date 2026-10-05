@@ -1,25 +1,19 @@
 <tbody id="history-body">
 {% for job in jobs %}
 <tr>
-  {# The zone is named on every row, never once as a column caption, so a
-     copy-pasted line is self-describing.  The filter
-     below is the same object cli.py imports, so this table and `saneless jobs`
-     cannot disagree about the zone or the format. #}
+  {# The zone is named on every row, so a copy-pasted line describes itself. #}
   <td>{{ job.created_at | local_time }}</td>
   <td>{{ job.profile }}</td>
-  {# The counts are a second line in the Title cell, NOT a fifth column
-     Three reasons, so a later reader does not "fix" this:
-     no colspan drift -- the four headers in index.html and the empty-state
-     colspan below stay as they are, which designs a header/colspan mismatch
-     out rather than guarding against it;
-     it works on a phone, because the existing @media (max-width: 576px) rule
-     already gives #history-body td white-space: normal and word-break, so a
-     two-line cell wraps with no new breakpoint; and a fifth column would
-     compete with the Time column, which the zone name already widens.
-     The guard is the filter returning None, never truthiness. #}
-  <td>{{ job.title }}{% set counts = job | page_counts %}{% if counts %}<span class="page-counts">{{ counts }}</span>{% endif %}</td>
-  <td class="{% if job.state == JobState.DONE %}status-done{% elif job.state == JobState.FALLBACK %}status-fallback{% elif job.state == JobState.ERROR %}status-error{% elif job.state == JobState.CANCELLED %}status-cancelled{% endif %}">
-    {{ job.state | state_label }}
+  {# The counts are a second line in the Title cell, not a fifth column: the
+     headers and the empty-state colspan stay at four, and the narrow-screen
+     rule in app.css already wraps this cell.  Guard on the filter returning
+     None, never on truthiness. #}
+  <td>{{ job.title }}{% set counts = job | page_counts %}{% if counts %}<span class="page-counts">{{ counts }}</span>{% endif %}{% set removed = job | removed_pages %}{% if removed %}<span class="page-counts">{{ removed }}</span>{% endif %}</td>
+  {# Colour and label come from the vocabulary, never a state comparison
+     here.  A job with no colour gets no class attribute at all. #}
+  {% set status_class = job.state | job_status_class(job.warning, job.error_category) %}
+  <td{% if status_class %} class="{{ status_class }}"{% endif %}>
+    {{ job.state | job_label(job.warning, job.error_category) }}
   </td>
 </tr>
 {% endfor %}

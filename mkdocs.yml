@@ -34,6 +34,19 @@ markdown_extensions:
   - attr_list
   - def_list
   - tables
+  - pymdownx.snippets:
+      check_paths: true
+
+# By default mkdocs only logs a dead `page.md#anchor` at INFO, so `--strict` lets
+# it through. At `warn`, `mkdocs build --strict` fails on one. Do not add `-q` to
+# that build: quiet mode drops the warnings and the build exits 0 anyway.
+validation:
+  anchors: warn
+  unrecognized_links: warn
+
+# The decision records ship in the repository but stay out of the site navigation.
+not_in_nav: |
+  /explanation/decisions/
 
 nav:
   - Home: index.md
@@ -47,6 +60,7 @@ nav:
     - Deploy with Docker Compose: how-to/deploy-docker-compose.md
     - Configure Scan Profiles: how-to/configure-scan-profiles.md
     - Set Up ADF Duplex Scanning: how-to/set-up-adf-duplex.md
+    - Scan a Multi-Page Document: how-to/scan-a-multi-page-document.md
     - Scanner Host Discovery (Containers): how-to/scanner-host-discovery.md
     - Use the CLI for Scripting: how-to/cli-scripting.md
     - Troubleshoot a Failed Scan: how-to/troubleshoot-a-failed-scan.md
@@ -60,3 +74,4 @@ nav:
     - Architecture Overview: explanation/architecture.md
     - Empty Page Detection: explanation/empty-page-detection.md
     - Consume Directory Fallback: explanation/consume-directory-fallback.md
+  - Changelog: changelog.md

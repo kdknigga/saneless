@@ -1,17 +1,21 @@
 """
-JobStore migration, list, prune, and error category tests.
+The job store: its schema migrations, reads, writes, pruning and lock rules.
 
-Covers requirements: UI-05, UI-06, PKG-01, STOR-01, STOR-02, STOR-03, STOR-04,
-STOR-05, APPL-08, APPL-09.
+Every public method is serialised on one lock, no transaction nests another,
+and each terminal write lands in one statement.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import logging
+import os
 import sqlite3
+import stat
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -19,10 +23,18 @@ import pytest
 
 from saneless import job as job_module
 from saneless.exceptions import StorageError
-from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
+from saneless.job import (
+    REJECTED_HISTORY_ROWS,
+    ErrorCategory,
+    Job,
+    JobResult,
+    JobState,
+    JobStore,
+)
 from saneless.vocabulary import (
     ACTIVE_STATES,
     QUEUE_FULL_JOB_ERROR,
+    RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
     WORKER_DOWN_JOB_ERROR,
     ScanOutcome,
@@ -31,12 +43,13 @@ from saneless.vocabulary import (
 from saneless.vocabulary import RESTART_REASON as SERVER_RESTART_REASON
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
-HEAD_VERSION = 2
+HEAD_VERSION = 3
 """The schema version a fully migrated job database reports."""
 
-HEAD_COLUMN_COUNT = 16
+HEAD_COLUMN_COUNT = 17
 """The number of columns the jobs table carries at HEAD_VERSION."""
 
 S2_COLUMNS = (
@@ -62,12 +75,25 @@ V2_COLUMNS = (
 )
 """The six columns migration step 2 adds, spelled out independently of job.py."""
 
-PUBLIC_METHOD_FLOOR = 7
-"""The number of public JobStore methods that exist today.
+V2_COLUMN_TYPES = (
+    ("outcome", "TEXT"),
+    ("pages_scanned", "INTEGER"),
+    ("pages_removed", "INTEGER"),
+    ("pages_uploaded", "INTEGER"),
+    ("warning", "TEXT"),
+    ("owner_token", "TEXT"),
+)
+"""The version 2 columns with their SQL types, for building a v2 database."""
 
-A floor, not a roster.  The reflective lock-coverage test asserts the
-enumeration found at least this many, so a predicate that silently matches
-nothing -- the way a reflective test quietly dies -- cannot pass.
+V3_COLUMNS = (("pages_removed_at", "TEXT"),)
+"""The one column migration step 3 adds, spelled out independently of job.py."""
+
+PUBLIC_METHOD_FLOOR = 7
+"""The fewest methods the structural lock tests may find.
+
+A floor, not a roster.  The lock-coverage and nested-transaction tests assert
+their enumerations found at least this many, so a predicate that silently
+matches nothing -- the way a reflective test quietly dies -- cannot pass.
 """
 
 STRESS_ROUNDS = 200
@@ -84,6 +110,13 @@ BARRIER_TIMEOUT = 30.0
 
 Inside the project's 60 s per-test timeout, so a worker that never arrives
 fails the test with a BrokenBarrierError instead of hanging the suite.
+"""
+
+STRESS_JOIN_SECONDS = 45.0
+"""Seconds every stress worker together has to finish before the test fails.
+
+Past the start barrier's timeout and inside the 60 s per-test timeout, so a
+deadlocked worker fails the test with its name instead of hanging the run.
 """
 
 STRESS_STATES = (
@@ -132,13 +165,10 @@ SAFE_AGE_DAYS = 365
 """An age bound generous enough that a prune under it deletes nothing by age."""
 
 CONCURRENT_ROWS = 20
-"""Jobs the concurrent prune tests insert before racing a create_job against prune."""
+"""Jobs the prune trace test inserts before pruning down to CONCURRENT_MAX_ROWS."""
 
 CONCURRENT_MAX_ROWS = 5
-"""The row cap the concurrent prune tests prune against -- below CONCURRENT_ROWS."""
-
-RACERS = 2
-"""Threads the concurrent prune test starts on its barrier: one prune, one insert."""
+"""The row cap the prune trace test prunes against -- below CONCURRENT_ROWS."""
 
 TRANSACTION_VERBS = frozenset(
     {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
@@ -150,21 +180,107 @@ TRANSACTION_VERBS = frozenset(
 are what the single-statement assertion filters out.
 """
 
-RESTART_REASON = "Interrupted by restart"
-"""The reason ``fail_active_jobs()`` records when the caller names none.
+PAGE_MAINTENANCE_VERBS = frozenset({"PRAGMA"})
+"""Leading SQL verbs that maintain the file's pages rather than touch a row.
 
-Spelled out here rather than imported from ``job.py``, so a change to that
-default surfaces as a visible test failure instead of a constant that silently
-agrees with whatever the source now says.
+A delete that removed rows is followed by ``PRAGMA incremental_vacuum``, which
+hands the freed pages back to the file system.  It reads and writes pages, not
+jobs, so it is filtered out alongside transaction control: the single-statement
+assertions are about rows a concurrent writer could observe half-changed.
 """
 
-CUSTOM_REASON = "server restarted"
-"""The caller-supplied reason the custom-reason case passes.
+PRIVATE_MODE = 0o600
+"""The mode a job database this release creates is given, with its -wal/-shm."""
 
-STOR-05's own prose asks for "a 'server restarted' reason" while M-03's
-prescription is the ``Interrupted by restart`` default; a defaulted parameter
-satisfies both, and this constant is what proves the parameter is honoured.
+LEGACY_MODE = 0o644
+"""The mode an earlier release left on its job database under umask 022."""
+
+TEST_UMASK = 0o022
+"""The common default umask, under which an unforced create lands at 0644."""
+
+SIDECAR_SUFFIXES = ("", "-wal", "-shm")
+"""The database file and the two WAL-mode sidecars SQLite creates beside it."""
+
+AUTO_VACUUM_NONE = 0
+"""``PRAGMA auto_vacuum``'s answer for a database that never shrinks."""
+
+AUTO_VACUUM_INCREMENTAL = 2
+"""``PRAGMA auto_vacuum``'s answer for INCREMENTAL, the mode a new database gets."""
+
+REJECTED_FLOOD = 30
+"""Refused submits the cap case records -- more than REJECTED_HISTORY_ROWS."""
+
+REJECTED_FINISH_FLOOD = 25
+"""Jobs the finish_job case marks REJECTED -- more than REJECTED_HISTORY_ROWS."""
+
+SPLIT_RUN_CAP = 5
+"""The ``max_rows`` the split-prune cases pass: far below the refused rows kept."""
+
+SPLIT_RUN_ROWS = 8
+"""Run rows the over-cap split-prune case creates -- more than SPLIT_RUN_CAP."""
+
+VACUUM_ROWS = 200
+"""Rows the shrink case inserts before pruning all but VACUUM_KEEP of them."""
+
+VACUUM_KEEP = 5
+"""Rows the shrink case keeps."""
+
+VACUUM_THUMBNAIL = "T" * 8192
+"""A thumbnail large enough that each row spills onto overflow pages of its own.
+
+Two 4 KiB pages or more per row, so deleting rows frees whole pages and the
+freelist a non-shrinking database would keep is far from empty.
 """
+
+VACUUM_ERROR = "E" * 8192
+"""A refused row's error text, sized like VACUUM_THUMBNAIL for the trim case."""
+
+CONTROL_TITLE = "a\nb"
+"""A title carrying a newline, which a ``%s`` log line would split in two."""
+
+KEPT_SENTENCE = "The scan was preserved at /data/failed/one.pdf"
+"""The kept-file sentence the recovered-row cases pass for a job."""
+
+OTHER_KEPT_SENTENCE = "The scan was preserved at /data/failed/two.pdf"
+"""A second kept-file sentence, so two recovered rows cannot be confused."""
+
+
+def _restart_text(state: JobState, kept: str | None = None) -> str:
+    """
+    Spell out the text a restart leaves on a row, independently of the source.
+
+    Written here rather than read from ``restart_error``, so the tests pin the
+    wording instead of repeating whatever the function says.
+
+    Args:
+        state: The state the row was in when the restart ended it.
+        kept: The sentence naming the kept file, if any.
+
+    Returns:
+        The expected error text.
+
+    """
+    reason = (
+        RESTART_UPLOADING_REASON
+        if state is JobState.UPLOADING
+        else SERVER_RESTART_REASON
+    )
+    return f"{reason}. {kept}" if kept else reason
+
+
+def _restart_category(state: JobState) -> ErrorCategory | None:
+    """
+    Spell out the category a restart leaves on a row, independently of the source.
+
+    Args:
+        state: The state the row was in when the restart ended it.
+
+    Returns:
+        ``UNCONFIRMED_SEND`` for an uploading row, else None.
+
+    """
+    return ErrorCategory.UNCONFIRMED_SEND if state is JobState.UPLOADING else None
+
 
 QUEUE_ROWS = 6
 """Jobs the ``list_pending()`` ordering case creates."""
@@ -195,13 +311,12 @@ CREATE_JOB_PARAMETERS = (
     "correspondent",
     "owner_token",
 )
-"""The exact parameter tuple ``JobStore.create_job`` is pinned to (APPL-09).
+"""The exact parameter tuple ``JobStore.create_job`` is pinned to.
 
 Five non-``self`` parameters is ruff's ``PLR0913`` ceiling, and this project
 adds no suppressions.  Spelled out here so a sixth parameter cannot be added
 without editing a constant whose docstring says why it may not be, and so
-``thumbnail`` cannot be silently restored to the slot ``owner_token`` now holds
-(RESEARCH Pitfall 5).
+``thumbnail`` cannot be silently put back in the slot ``owner_token`` holds.
 """
 
 OWNER_TOKEN = "owner-token-4NcRfUjXn2r5u8x_A?D(G+KbPeShVmYq"
@@ -249,6 +364,31 @@ def _build_s3_schema(db_path: str) -> None:
         conn.close()
 
 
+def _build_v2_schema(db_path: str) -> None:
+    """
+    Write a database at schema version 2 holding one finished, counted row.
+
+    Built from the S3 shape the way the real ladder built it -- the six
+    version 2 columns added by ``ALTER`` -- and stamped ``user_version = 2``,
+    so opening it runs only the steps after version 2.
+    """
+    _build_s3_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        for name, sqltype in V2_COLUMN_TYPES:
+            # Both values come from the module-level literal above.
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sqltype}")
+        conn.execute(
+            "UPDATE jobs SET outcome = ?, pages_scanned = ?, pages_removed = ?, "
+            "pages_uploaded = ?, warning = ?, owner_token = ? WHERE id = ?",
+            (ScanOutcome.SUCCESS.value, 4, 1, 3, None, "tok-v2", "legacy-1"),
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _build_s2_schema(db_path: str) -> None:
     """Write a jobs table at the 5bd6158 (S2) shape, which has no error_category."""
     conn = sqlite3.connect(db_path)
@@ -260,6 +400,18 @@ def _build_s2_schema(db_path: str) -> None:
             correspondent INTEGER, thumbnail TEXT, created_at TEXT NOT NULL
         )"""
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_stamped_schema(db_path: str, version: int) -> None:
+    """Write a rollback-journal database stamped with the given schema version."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY)")
+        # A PRAGMA argument cannot be bound; version is an int from the caller.
+        conn.execute(f"PRAGMA user_version = {version}")
         conn.commit()
     finally:
         conn.close()
@@ -313,6 +465,123 @@ def _public_self_calls(method: ast.FunctionDef) -> list[str]:
         ):
             names.append(func.attr)
     return names
+
+
+def _is_self_conn(node: ast.AST) -> bool:
+    """Return whether an expression is exactly ``self._conn``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr == "_conn"
+    )
+
+
+def _transactions(node: ast.AST) -> list[ast.With]:
+    """Return every ``with self._conn:`` block beneath an AST node."""
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.With)
+        and any(_is_self_conn(item.context_expr) for item in child.items)
+    ]
+
+
+def _self_method_calls(nodes: list[ast.stmt]) -> set[str]:
+    """Return the name of every ``self.<name>(...)`` call, public or private."""
+    return {
+        child.func.attr
+        for node in nodes
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and isinstance(child.func.value, ast.Name)
+        and child.func.value.id == "self"
+    }
+
+
+def _nested_transactions(store: ast.ClassDef) -> list[str]:
+    """
+    List every call path from inside a transaction to a method that opens one.
+
+    Calls are followed transitively through methods that open no transaction
+    of their own, so a private helper in the middle of the chain hides nothing.
+
+    Args:
+        store: The parsed ``JobStore`` class.
+
+    Returns:
+        Each offending path, written ``caller -> ... -> opener``.
+
+    """
+    methods = {
+        node.name: node for node in store.body if isinstance(node, ast.FunctionDef)
+    }
+    opens = {name for name, method in methods.items() if _transactions(method)}
+    offenders: list[str] = []
+    for name, method in methods.items():
+        for block in _transactions(method):
+            pending = [
+                (callee, [name, callee]) for callee in _self_method_calls(block.body)
+            ]
+            seen: set[str] = set()
+            while pending:
+                callee, path = pending.pop()
+                if callee in seen or callee not in methods:
+                    continue
+                seen.add(callee)
+                if callee in opens:
+                    offenders.append(" -> ".join(path))
+                    continue
+                pending.extend(
+                    (onward, [*path, onward])
+                    for onward in _self_method_calls(methods[callee].body)
+                )
+    return sorted(offenders)
+
+
+def _run_stress_workers(
+    worker: Callable[
+        [JobStore, threading.Barrier, dict[str, JobState], threading.Lock], None
+    ],
+    store: JobStore,
+    seen: dict[str, JobState],
+) -> None:
+    """
+    Run ``worker`` on STRESS_WORKERS daemon threads and re-raise its failure.
+
+    The threads are daemons joined against one deadline, so a worker stuck
+    inside the store fails the test rather than keeping the run alive, and an
+    exception a worker raises is carried back and raised here.
+
+    Raises:
+        BaseException: The first exception a worker raised.
+
+    """
+    guard = threading.Lock()
+    barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            worker(store, barrier, seen, guard)
+        except BaseException as exc:  # carried back to the test thread below
+            with guard:
+                raised.append(exc)
+
+    threads = [
+        threading.Thread(target=run, name=f"stress-{n}", daemon=True)
+        for n in range(STRESS_WORKERS)
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + STRESS_JOIN_SECONDS
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    hung = [thread.name for thread in threads if thread.is_alive()]
+    assert hung == [], f"stress workers still running: {hung}"
+    if raised:
+        raise raised[0]
 
 
 def _stress_worker(
@@ -429,18 +698,6 @@ def _insert_shuffled(store: JobStore, count: int, expired: int) -> list[str]:
     return ranked
 
 
-def _barrier_prune(store: JobStore, barrier: threading.Barrier) -> int:
-    """Wait at the barrier, then prune, returning the count prune reported."""
-    barrier.wait()
-    return store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=CONCURRENT_MAX_ROWS)
-
-
-def _barrier_create(store: JobStore, barrier: threading.Barrier) -> None:
-    """Wait at the barrier, then insert one job into the store prune is pruning."""
-    barrier.wait()
-    store.create_job(profile="default", title="Racer")
-
-
 def _row_touching(traced: list[str]) -> list[str]:
     """
     Filter a trace log down to the statements that touch rows.
@@ -449,13 +706,15 @@ def _row_touching(traced: list[str]) -> list[str]:
         traced: Every statement the connection's trace callback reported.
 
     Returns:
-        Those whose leading verb is not transaction control.
+        Those whose leading verb is neither transaction control nor page
+        maintenance.
 
     """
     return [
         text
         for text in traced
-        if (words := text.split()) and words[0].upper() not in TRANSACTION_VERBS
+        if (words := text.split())
+        and words[0].upper() not in TRANSACTION_VERBS | PAGE_MAINTENANCE_VERBS
     ]
 
 
@@ -463,8 +722,8 @@ def _seed_one_per_state(store: JobStore) -> dict[str, JobState]:
     """
     Create one job in every JobState, each carrying an error text of its own.
 
-    Iterates ``JobState`` itself rather than a hand-written roster, so a member
-    added in a later phase is covered here without editing this helper.  Every
+    Iterates ``JobState`` itself rather than a hand-written roster, so a new
+    member is covered here without editing this helper.  Every
     job is given a distinct ``error`` before the call under test, which is what
     lets the terminal rows be asserted unchanged rather than merely
     still-terminal.  ``error_category`` is left ``None`` on purpose.
@@ -488,9 +747,8 @@ def _seed_queue(store: JobStore) -> list[str]:
     """
     Create QUEUE_ROWS jobs whose created_at order is the reverse of insertion order.
 
-    Backdating by raw SQL is what ``_insert_shuffled`` already does for the prune
-    cases.  It keeps the ordering deterministic without sleeping: D-32 leaves the
-    two existing sleeps in the prune tests alone, and this phase adds no third.
+    Backdated by raw SQL, as ``_insert_shuffled`` does for the prune cases, so
+    the ordering is deterministic without sleeping.
 
     Args:
         store: The store to write to.
@@ -544,7 +802,7 @@ def _create_in_order(store: JobStore, count: int) -> list[str]:
 
 def _reject(store: JobStore, job_id: str) -> None:
     """
-    Finish a job the way a refused submit records it (D-05, D-06).
+    Finish a job the way a refused submit records it.
 
     Args:
         store: The store to write to.
@@ -560,7 +818,7 @@ def _reject(store: JobStore, job_id: str) -> None:
 
 
 def test_list_recent() -> None:
-    """List recent jobs returns entries in reverse chronological order (UI-05)."""
+    """List recent jobs returns entries in reverse chronological order."""
     store = JobStore()
     try:
         ids = _create_in_order(store, 5)
@@ -587,7 +845,7 @@ def test_history_limits_are_named_in_the_job_module() -> None:
 
 
 def test_list_recent_empty() -> None:
-    """List recent jobs returns empty list when no jobs exist (UI-05)."""
+    """List recent jobs returns empty list when no jobs exist."""
     store = JobStore()
     try:
         jobs = store.list_recent()
@@ -597,7 +855,7 @@ def test_list_recent_empty() -> None:
 
 
 def test_prune_by_age() -> None:
-    """Prune removes jobs older than specified age (UI-06)."""
+    """Prune removes jobs older than specified age."""
     store = JobStore()
     try:
         old_job = store.create_job(profile="default", title="Old Job")
@@ -621,7 +879,7 @@ def test_prune_by_age() -> None:
 
 
 def test_prune_by_count() -> None:
-    """Prune keeps only the N most recent jobs (UI-06)."""
+    """Prune keeps only the N most recent jobs."""
     store = JobStore()
     try:
         ids = _create_in_order(store, 5)
@@ -634,7 +892,7 @@ def test_prune_by_count() -> None:
 
 
 def test_prune_no_deletions() -> None:
-    """Prune with no matching criteria deletes nothing (UI-06)."""
+    """Prune with no matching criteria deletes nothing."""
     store = JobStore()
     try:
         store.create_job(profile="default", title="Job A")
@@ -642,35 +900,6 @@ def test_prune_no_deletions() -> None:
 
         deleted = store.prune(max_age_days=365, max_rows=500)
         assert deleted == 0
-    finally:
-        store.close()
-
-
-def test_delete_job_removes_only_the_named_row() -> None:
-    """delete_job removes the job it names and leaves every other row alone."""
-    store = JobStore()
-    try:
-        doomed = store.create_job(profile="default", title="Doomed")
-        kept = store.create_job(profile="default", title="Kept")
-
-        assert store.delete_job(doomed.id) is True
-
-        assert store.get_job(doomed.id) is None
-        remaining = store.list_recent()
-        assert [job.title for job in remaining] == ["Kept"]
-        assert remaining[0].id == kept.id
-    finally:
-        store.close()
-
-
-def test_delete_job_reports_a_missing_id() -> None:
-    """delete_job returns False for an unknown id rather than raising."""
-    store = JobStore()
-    try:
-        store.create_job(profile="default", title="Untouched")
-
-        assert store.delete_job("no-such-job") is False
-        assert len(store.list_recent()) == 1
     finally:
         store.close()
 
@@ -713,7 +942,7 @@ class TestMigrationLadder:
     """PRAGMA user_version migration ladder tests."""
 
     def test_fresh_store_runs_the_whole_migration(self) -> None:
-        """A fresh in-memory store opens at the head schema version (STOR-02)."""
+        """A fresh in-memory store opens at the head schema version."""
         store = JobStore()
         try:
             version, columns = _read_schema(store._conn)
@@ -725,7 +954,7 @@ class TestMigrationLadder:
     def test_migration_legacy_s3_database_joins_the_ladder(
         self, tmp_path: Path
     ) -> None:
-        """A legacy S3 database migrates to head and keeps its rows (STOR-02)."""
+        """A legacy S3 database migrates to head and keeps its rows."""
         db_path = str(tmp_path / "legacy.db")
         _build_s3_schema(db_path)
 
@@ -743,7 +972,7 @@ class TestMigrationLadder:
             store.close()
 
     def test_migration_guard_rejects_an_s2_database(self, tmp_path: Path) -> None:
-        """An S2 database raises StorageError and is left untouched (STOR-02)."""
+        """An S2 database raises StorageError and is left untouched."""
         db_path = str(tmp_path / "s2.db")
         _build_s2_schema(db_path)
 
@@ -767,13 +996,80 @@ class TestMigrationLadder:
         assert str(exc_info.value).startswith(f"job database at {db_path} ")
         assert exc_info.value.__cause__ is None
 
+    def test_newer_schema_database_is_refused(self, tmp_path: Path) -> None:
+        """A database written by a newer release is refused with a precise message."""
+        db_path = str(tmp_path / "newer.db")
+        supported = len(job_module._MIGRATIONS)
+        newer = supported + 1
+        _build_stamped_schema(db_path, newer)
+
+        with pytest.raises(StorageError, match="newer") as exc_info:
+            JobStore(db_path=db_path)
+
+        message = str(exc_info.value)
+        assert db_path in message
+        assert f"schema version {newer}" in message
+        assert f"({supported})" in message
+        assert "restore a backup" in message
+        assert "run a newer saneless" in message
+        assert "\n" not in message
+        assert exc_info.value.__cause__ is None
+
+    def test_newer_schema_database_is_left_untouched(self, tmp_path: Path) -> None:
+        """
+        A refused newer database is left exactly as it was found.
+
+        The fixture stays in rollback-journal mode, whose header the WAL pragma
+        would rewrite, so the refusal must come before any statement that writes.
+        """
+        db_file = tmp_path / "newer.db"
+        _build_stamped_schema(str(db_file), len(job_module._MIGRATIONS) + 1)
+        before = hashlib.sha256(db_file.read_bytes()).hexdigest()
+
+        with pytest.raises(StorageError):
+            JobStore(db_path=str(db_file))
+
+        assert hashlib.sha256(db_file.read_bytes()).hexdigest() == before
+        assert not (tmp_path / "newer.db-wal").exists()
+        assert not (tmp_path / "newer.db-shm").exists()
+
+    @pytest.mark.parametrize("stamp", [-1, -2, -5, -(2**31)])
+    def test_negative_schema_version_is_refused_and_left_untouched(
+        self, tmp_path: Path, stamp: int
+    ) -> None:
+        """
+        A negative schema version is refused before anything writes to the file.
+
+        user_version is a signed 32-bit field. Unguarded, the ladder indexes
+        its migrations from the end for a negative value: -2 runs the last two
+        steps and commits each before failing, and -5 escapes as a bare
+        IndexError that neither the CLI nor the web lifespan maps.
+        """
+        db_file = tmp_path / "negative.db"
+        _build_stamped_schema(str(db_file), stamp)
+        before = hashlib.sha256(db_file.read_bytes()).hexdigest()
+
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=str(db_file))
+
+        message = str(exc_info.value)
+        assert str(db_file) in message
+        assert f"schema version {stamp}" in message
+        assert "restore a backup" in message
+        assert "\n" not in message
+        assert exc_info.value.__cause__ is None
+        assert hashlib.sha256(db_file.read_bytes()).hexdigest() == before
+        assert not (tmp_path / "negative.db-wal").exists()
+        assert not (tmp_path / "negative.db-shm").exists()
+
     def test_unusable_non_sqlite_file_is_a_storage_error(self, tmp_path: Path) -> None:
         """
-        A file that is not SQLite raises StorageError naming the path (D-07).
+        A file that is not SQLite raises StorageError naming the path.
 
-        sqlite3 raises ``DatabaseError: file is not a database`` at the WAL
-        pragma; the CLI guard maps StorageError to exit 2 by type, so the raw
-        sqlite3 error must not escape as an unexpected error.
+        sqlite3 raises ``DatabaseError: file is not a database`` at the first
+        statement that reads the file; the CLI guard maps StorageError to exit
+        2 by type, so the raw sqlite3 error must not escape as an unexpected
+        error.
         """
         db_file = tmp_path / "jobs.db"
         db_file.write_bytes(b"this is not a database\n" * 64)
@@ -793,7 +1089,7 @@ class TestMigrationLadder:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        IN-06: a rollback that fails on the same broken file is not the story.
+        A rollback that fails on the same broken file does not hide the cause.
 
         The migration's own sqlite3 error must still be translated to a
         StorageError (exit 2), not replaced by the rollback's raw one (exit 5).
@@ -844,7 +1140,7 @@ class TestMigrationLadder:
         assert isinstance(exc_info.value.__cause__, sqlite3.Error)
 
     def test_migration_idempotent_on_reopen(self, tmp_path: Path) -> None:
-        """Reopening an already-migrated database changes nothing (STOR-03)."""
+        """Reopening an already-migrated database changes nothing."""
         db_path = str(tmp_path / "reopen.db")
 
         store = JobStore(db_path=db_path)
@@ -885,7 +1181,7 @@ class TestMigrationLadder:
 
     def test_journal_mode_is_wal_on_a_file_database(self, tmp_path: Path) -> None:
         """
-        A file-backed store reads back WAL journalling (STOR-02).
+        A file-backed store reads back WAL journalling.
 
         WAL must be set before the connection flips to explicit transaction
         control: SQLite refuses the switch inside a transaction on a file
@@ -905,7 +1201,7 @@ class TestResultColumns:
     """The six result columns, the one column list, and the one row mapping."""
 
     def test_job_result_columns_default_to_none(self) -> None:
-        """A bare Job exposes all six result columns, every one None (STOR-03)."""
+        """A bare Job exposes all six result columns, every one None."""
         job = Job(id="test", profile="default", title="Test")
         assert job.outcome is None
         assert job.pages_scanned is None
@@ -915,7 +1211,7 @@ class TestResultColumns:
         assert job.owner_token is None
 
     def test_created_job_result_columns_stay_none(self) -> None:
-        """A newly created job records nothing, so all six stay NULL (STOR-03)."""
+        """A newly created job records nothing, so all six stay NULL."""
         store = JobStore()
         try:
             created = store.create_job("default", "Unwritten")
@@ -931,7 +1227,7 @@ class TestResultColumns:
             store.close()
 
     def test_outcome_roundtrip_preserves_value_and_python_type(self) -> None:
-        """Each result column reads back with its value and its type (STOR-03)."""
+        """Each result column reads back with its value and its type."""
         store = JobStore()
         try:
             created = store.create_job("default", "Result Doc")
@@ -971,7 +1267,7 @@ class TestResultColumns:
             store.close()
 
     def test_outcome_roundtrip_of_a_null_column_is_none(self) -> None:
-        """A NULL outcome reads back as None, not as a ScanOutcome (STOR-03)."""
+        """A NULL outcome reads back as None, not as a ScanOutcome."""
         store = JobStore()
         try:
             created = store.create_job("default", "Null Outcome")
@@ -989,7 +1285,7 @@ class TestResultColumns:
             store.close()
 
     def test_outcome_roundtrip_survives_list_recent(self) -> None:
-        """list_recent uses the same mapping get_job does (STOR-04)."""
+        """list_recent uses the same mapping get_job does."""
         store = JobStore()
         try:
             created = store.create_job("default", "Listed Doc")
@@ -1008,7 +1304,7 @@ class TestResultColumns:
             store.close()
 
     def test_single_mapping_column_list_matches_the_live_schema(self) -> None:
-        """_COLUMNS is exactly the fresh table's column set (STOR-04)."""
+        """_COLUMNS is exactly the fresh table's column set."""
         assert len(job_module._COLUMNS) == HEAD_COLUMN_COUNT
         store = JobStore()
         try:
@@ -1018,49 +1314,62 @@ class TestResultColumns:
             store.close()
 
     def test_single_mapping_ladder_reconciles_with_the_column_list(self) -> None:
-        """The ladder and the live column list cannot drift apart (STOR-04)."""
-        ladder = job_module._S3_COLUMNS | {
-            name for name, _sqltype in job_module._V2_COLUMNS
-        }
+        """The ladder and the live column list cannot drift apart."""
+        ladder = (
+            job_module._S3_COLUMNS
+            | {name for name, _sqltype in job_module._V2_COLUMNS}
+            | {name for name, _sqltype in job_module._V3_COLUMNS}
+        )
         assert ladder == set(job_module._COLUMNS)
 
     def test_single_mapping_has_no_handwritten_select_list(self) -> None:
-        """No hand-written SELECT column list survives in job.py (STOR-04)."""
+        """No hand-written SELECT column list survives in job.py."""
         assert "SELECT id, profile" not in _job_source()
 
     def test_single_mapping_defines_exactly_one_row_to_job(self) -> None:
-        """Exactly one function converts a database row into a Job (STOR-04)."""
+        """Exactly one function converts a database row into a Job."""
         tree = ast.parse(_job_source())
         definitions = [
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-            and node.name == "_row_to_job"
+            and node.name == "_job_from_row"
         ]
         assert len(definitions) == 1
 
+    @pytest.mark.source_structure
     def test_single_mapping_constructs_a_job_in_one_place(self) -> None:
-        """JobStore builds a Job only inside _row_to_job (STOR-04)."""
+        """job.py builds a Job only inside the module-level row mapper."""
         tree = ast.parse(_job_source())
-        store = next(
+        job_from_row = next(
             node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef) and node.name == "JobStore"
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_job_from_row"
         )
+        assert _count_job_constructions(tree) == 1
+        assert _count_job_constructions(job_from_row) == 1
+
+    @pytest.mark.source_structure
+    def test_the_store_maps_rows_through_the_shared_mapper(self) -> None:
+        """The store's own row conversion delegates rather than copying."""
         row_to_job = next(
             node
-            for node in store.body
+            for node in _job_store_classdef().body
             if isinstance(node, ast.FunctionDef) and node.name == "_row_to_job"
         )
-        assert _count_job_constructions(store) == 1
-        assert _count_job_constructions(row_to_job) == 1
+        calls = [
+            node.func.id
+            for node in ast.walk(row_to_job)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert calls == ["_job_from_row"]
 
 
 class TestFinishJob:
     """The terminal write: what it records, what it leaves NULL, and its lock."""
 
     def test_finish_job_records_a_successful_run(self) -> None:
-        """A SUCCESS finish persists state, outcome and three counts (OUTC-01)."""
+        """A SUCCESS finish persists state, outcome and three counts."""
         store = JobStore()
         try:
             created = store.create_job("default", "Finished Doc")
@@ -1098,7 +1407,7 @@ class TestFinishJob:
             store.close()
 
     def test_finish_job_records_a_fallback_run(self) -> None:
-        """A FALLBACK finish persists FALLBACK, its outcome and warning (OUTC-02)."""
+        """A FALLBACK finish persists FALLBACK, its outcome and warning."""
         store = JobStore()
         try:
             created = store.create_job("default", "Fallback Doc")
@@ -1126,8 +1435,8 @@ class TestFinishJob:
         finally:
             store.close()
 
-    def test_finish_job_records_a_duplex_mismatch_warning(self) -> None:
-        """A warning rides alongside SUCCESS and its counts (OUTC-03)."""
+    def test_finish_job_records_the_warning_of_a_duplex_mismatch(self) -> None:
+        """A warning rides alongside SUCCESS and its counts."""
         store = JobStore()
         try:
             created = store.create_job("default", "Mismatch Doc")
@@ -1155,7 +1464,7 @@ class TestFinishJob:
             store.close()
 
     def test_finish_job_failure_leaves_the_counts_null_not_zero(self) -> None:
-        """An ERROR finish records the failure and records no counts (OUTC-01)."""
+        """An ERROR finish records the failure and records no counts."""
         store = JobStore()
         try:
             created = store.create_job("default", "Doomed Doc")
@@ -1184,7 +1493,7 @@ class TestFinishJob:
             store.close()
 
     def test_finish_job_survives_list_recent(self) -> None:
-        """What finish_job wrote reads back through list_recent too (STOR-04)."""
+        """What finish_job wrote reads back through list_recent too."""
         store = JobStore()
         try:
             created = store.create_job("default", "Listed Finish")
@@ -1210,7 +1519,7 @@ class TestFinishJob:
             store.close()
 
     def test_finish_job_on_an_unknown_id_is_a_no_op(self) -> None:
-        """An unknown job id neither raises nor touches another row (STOR-02)."""
+        """An unknown job id neither raises nor touches another row."""
         store = JobStore()
         try:
             created = store.create_job("default", "Bystander")
@@ -1235,11 +1544,11 @@ class TestFinishJob:
             store.close()
 
     def test_finish_job_carries_the_lock_marker(self) -> None:
-        """finish_job is serialised on the store's lock like every peer (STOR-01)."""
+        """finish_job is serialised on the store's lock like every peer."""
         assert getattr(JobStore.finish_job, job_module._LOCKED_MARKER, False) is True
 
     def test_finish_job_calls_no_other_public_method(self) -> None:
-        """finish_job opens its own transaction rather than nesting one (STOR-01)."""
+        """finish_job opens its own transaction rather than nesting one."""
         # sqlite3 connection context managers do not nest: an inner
         # `with conn:` commits the OUTER transaction, so half the caller's work
         # lands early.  _locked is re-entrant, so there is no deadlock to warn
@@ -1252,31 +1561,38 @@ class TestFinishJob:
         )
         assert _public_self_calls(finish) == []
 
+    @pytest.mark.source_structure
     def test_finish_job_writes_every_column_in_one_statement(self) -> None:
-        """One UPDATE carries state, outcome, warning, counts and error (OUTC-01)."""
+        """One UPDATE carries state, outcome, warning, counts and error."""
         # A half-written terminal row is the failure mode this guards: two
         # statements could be observed between by the web request thread.
-        finish_source = inspect.getsource(JobStore.finish_job)
-        assert finish_source.count("self._conn.execute") == 1
-        assert finish_source.count("with self._conn:") == 1
+        finish = next(
+            node
+            for node in _job_store_classdef().body
+            if isinstance(node, ast.FunctionDef) and node.name == "finish_job"
+        )
+        executes = [
+            node
+            for node in ast.walk(finish)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+            and _is_self_conn(node.func.value)
+        ]
+        assert len(executes) == 1
+        assert len(_transactions(finish)) == 1
+        statement = executes[0].args[0]
+        assert isinstance(statement, ast.Constant)
+        assert isinstance(statement.value, str)
         for column in ("state", "outcome", "warning", *V2_COLUMNS[1:5], "error"):
-            assert f"{column} = ?" in finish_source
+            assert f"{column} = ?" in statement.value
 
     def test_finish_job_stress_two_threads_survive_two_hundred_rounds(self) -> None:
-        """Two threads interleave finish_job and update_state cleanly (STOR-01)."""
+        """Two threads interleave finish_job and update_state cleanly."""
         store = JobStore()
         seen: dict[str, JobState] = {}
-        guard = threading.Lock()
-        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
         try:
-            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
-                futures = [
-                    pool.submit(_finish_stress_worker, store, barrier, seen, guard)
-                    for _ in range(STRESS_WORKERS)
-                ]
-                for future in futures:
-                    # Future.result() re-raises the worker's exception here.
-                    future.result()
+            _run_stress_workers(_finish_stress_worker, store, seen)
 
             assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
             for job_id, expected in seen.items():
@@ -1292,10 +1608,11 @@ class TestFinishJob:
 
 
 class TestLockDiscipline:
-    """Lock coverage, the no-public-self-call rule, and the concurrency claim."""
+    """Lock coverage, the rules against nested transactions, and concurrency."""
 
+    @pytest.mark.source_structure
     def test_locked_coverage_spans_every_public_method(self) -> None:
-        """Every public JobStore method carries the lock marker (STOR-01)."""
+        """Every public JobStore method carries the lock marker."""
         # Blind spot, recorded deliberately: inspect.isfunction does not see a
         # public @property.  JobStore has none today; if one is ever added this
         # test will not notice that it is unserialised.
@@ -1321,7 +1638,7 @@ class TestLockDiscipline:
         )
 
     def test_no_public_method_calls_another_public_method(self) -> None:
-        """No public JobStore method calls another public method (STOR-01)."""
+        """No public JobStore method calls another public method."""
         # A correctness rule, not style: sqlite3 connection context managers do
         # not nest, so an inner `with conn:` commits the OUTER transaction and
         # half the caller's work lands early.  RLock re-entrancy prevents the
@@ -1338,23 +1655,37 @@ class TestLockDiscipline:
             f"{', '.join(offenders)}"
         )
 
+    @pytest.mark.source_structure
+    def test_no_transaction_reaches_a_method_that_opens_its_own(self) -> None:
+        """No call made inside a transaction reaches a method that opens another."""
+        # sqlite3 connection context managers do not nest: the inner exit
+        # commits the outer transaction, and the re-entrant lock turns what
+        # would be a deadlock into a silent half-commit.
+        store = _job_store_classdef()
+        transactional = [
+            node.name
+            for node in store.body
+            if isinstance(node, ast.FunctionDef) and _transactions(node)
+        ]
+        assert len(transactional) >= PUBLIC_METHOD_FLOOR, (
+            f"only {len(transactional)} methods open a transaction; a structural "
+            f"check that matches nothing passes vacuously"
+        )
+        offenders = _nested_transactions(store)
+        assert offenders == [], (
+            f"JobStore transactions reaching a method that opens its own: "
+            f"{', '.join(offenders)}"
+        )
+
     def test_stress_two_threads_survive_two_hundred_rounds(self) -> None:
-        """Two threads run 200 rounds of mixed traffic uncorrupted (STOR-01)."""
+        """Two threads run 200 rounds of mixed traffic uncorrupted."""
         store = JobStore()
         seen: dict[str, JobState] = {}
-        guard = threading.Lock()
-        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
         try:
-            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
-                futures = [
-                    pool.submit(_stress_worker, store, barrier, seen, guard)
-                    for _ in range(STRESS_WORKERS)
-                ]
-                for future in futures:
-                    # Future.result() re-raises the worker's exception here.  A
-                    # raw threading.Thread swallows it into threading.excepthook
-                    # and this test would pass green on a broken store.
-                    future.result()
+            # A raw thread would swallow a worker's exception into
+            # threading.excepthook, and this test would pass green on a broken
+            # store, so the runner carries it back and re-raises it.
+            _run_stress_workers(_stress_worker, store, seen)
 
             # 1. Every insert committed exactly once -- none lost, none doubled.
             assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
@@ -1383,13 +1714,13 @@ class TestPruneSingleStatement:
     """Prune's single-statement shape: shuffled ordering and the count's provenance."""
 
     def test_prune_shuffled_order_retains_the_newest_rows(self) -> None:
-        """Prune keeps exactly the newest max_rows under shuffled insertion (STOR-04)."""
+        """Prune keeps exactly the newest max_rows under shuffled insertion."""
         # A pin, not a discriminator.  The single statement is correct only
         # because SQLite materialises the IN (SELECT ... ORDER BY ... LIMIT ?)
         # right-hand side as a LIST SUBQUERY before the outer scan begins, and
-        # sqlite.org/isolation.html explicitly declines to guarantee that.  This
-        # machine ships libsqlite 3.34.1 while CI and Docker ship newer, so this
-        # test is what makes a future plan change loud instead of silent.
+        # sqlite.org/isolation.html explicitly declines to guarantee that.  The
+        # libsqlite versions in development, CI and Docker differ, so this test
+        # is what makes a query-plan change loud instead of silent.
         store = JobStore()
         try:
             ranked = _insert_shuffled(store, SHUFFLE_ROWS, expired=0)
@@ -1406,7 +1737,7 @@ class TestPruneSingleStatement:
             store.close()
 
     def test_prune_shuffled_order_with_an_age_cutoff_active(self) -> None:
-        """Prune unions the age and row-cap predicates correctly (STOR-04)."""
+        """Prune unions the age and row-cap predicates correctly."""
         store = JobStore()
         try:
             ranked = _insert_shuffled(store, SHUFFLE_ROWS, expired=SHUFFLE_EXPIRED)
@@ -1424,36 +1755,8 @@ class TestPruneSingleStatement:
         finally:
             store.close()
 
-    def test_prune_concurrent_insert_cannot_corrupt_the_count(self) -> None:
-        """A create_job racing prune cannot make the returned count wrong (STOR-04)."""
-        store = JobStore()
-        try:
-            for index in range(CONCURRENT_ROWS):
-                store.create_job(profile="default", title=f"Row {index:02d}")
-            before = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
-            barrier = threading.Barrier(RACERS, timeout=BARRIER_TIMEOUT)
-
-            with ThreadPoolExecutor(max_workers=RACERS) as pool:
-                pruner = pool.submit(_barrier_prune, store, barrier)
-                creator = pool.submit(_barrier_create, store, barrier)
-                # Future.result() re-raises the worker's exception here; a raw
-                # threading.Thread would bury it in threading.excepthook and
-                # this test would pass green on a broken store.
-                deleted = pruner.result()
-                creator.result()
-
-            after = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
-            # The old before-minus-after arithmetic could be forced to -1.
-            assert deleted >= 0
-            assert deleted <= before
-            # Exactly one insert and one prune ran, in one order or the other,
-            # so this reconciliation holds under both interleavings.
-            assert after == before + 1 - deleted
-        finally:
-            store.close()
-
     def test_prune_concurrent_window_between_count_and_delete_is_closed(self) -> None:
-        """Prune runs one row-touching statement, leaving no race window (STOR-04)."""
+        """Prune runs one row-touching statement, leaving no race window."""
         store = JobStore()
         try:
             for index in range(CONCURRENT_ROWS):
@@ -1467,8 +1770,8 @@ class TestPruneSingleStatement:
 
             statements = _row_touching(traced)
             assert deleted == CONCURRENT_ROWS - CONCURRENT_MAX_ROWS
-            # The race the review recorded needed a gap between two counting
-            # reads for a concurrent insert to land in.  One statement is not a
+            # A concurrent insert can only corrupt the count through a gap
+            # between two counting reads.  One statement is not a
             # smaller gap; it is no gap, which is why the count is exact rather
             # than merely serialised behind the store's lock.
             assert len(statements) == 1, (
@@ -1483,10 +1786,10 @@ class TestPruneSingleStatement:
 
 
 class TestQueryMethods:
-    """fail_active_jobs() and list_pending(): the two STOR-05 query methods."""
+    """The query methods: restart failures, the queue, the latest run, the probe."""
 
     def test_fail_active_jobs_moves_every_active_job_to_error(self) -> None:
-        """fail_active_jobs fails every active job and reports how many (STOR-05)."""
+        """fail_active_jobs fails every active job and reports how many."""
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
@@ -1499,7 +1802,8 @@ class TestQueryMethods:
                 assert job is not None
                 if original in ACTIVE_STATES:
                     assert job.state == JobState.ERROR
-                    assert job.error == RESTART_REASON
+                    assert job.error == _restart_text(original)
+                    assert job.error_category is _restart_category(original)
                 else:
                     # Not merely "still terminal": the same state AND the same
                     # error text it carried before the call.  A predicate that
@@ -1512,7 +1816,7 @@ class TestQueryMethods:
             store.close()
 
     def test_fail_active_jobs_with_nothing_active_returns_zero(self) -> None:
-        """fail_active_jobs on a settled store changes nothing (STOR-05)."""
+        """fail_active_jobs on a settled store changes nothing."""
         store = JobStore()
         try:
             job = store.create_job(profile="default", title="Finished")
@@ -1528,46 +1832,62 @@ class TestQueryMethods:
         finally:
             store.close()
 
-    def test_fail_active_jobs_honours_a_custom_reason(self) -> None:
-        """A caller-supplied reason is the text recorded on the failed row (STOR-05)."""
+    def test_fail_active_jobs_words_a_restart_by_the_row_state(self) -> None:
+        """An uploading row may have arrived; a scanning row never finished."""
         store = JobStore()
         try:
-            job = store.create_job(profile="default", title="In flight")
-            store.update_state(job.id, JobState.SCANNING)
+            uploading, scanning, done = _create_in_order(store, 3)
+            store.update_state(uploading, JobState.UPLOADING)
+            store.update_state(scanning, JobState.SCANNING)
+            store.finish_job(done, JobState.DONE)
 
-            failed = store.fail_active_jobs(reason=CUSTOM_REASON)
+            failed = store.fail_active_jobs()
 
-            assert failed == 1
-            stopped = store.get_job(job.id)
-            assert stopped is not None
-            assert stopped.state == JobState.ERROR
-            assert stopped.error == CUSTOM_REASON
+            assert failed == 2
+            sent = store.get_job(uploading)
+            assert sent is not None
+            assert sent.state == JobState.ERROR
+            assert sent.error == RESTART_UPLOADING_REASON
+            assert sent.error_category is ErrorCategory.UNCONFIRMED_SEND
+            unfinished = store.get_job(scanning)
+            assert unfinished is not None
+            assert unfinished.state == JobState.ERROR
+            assert unfinished.error == SERVER_RESTART_REASON
+            assert unfinished.error_category is None
+            finished = store.get_job(done)
+            assert finished is not None
+            assert finished.state == JobState.DONE
+            assert finished.error is None
+            assert finished.error_category is None
         finally:
             store.close()
 
-    def test_fail_active_jobs_leaves_error_category_unset(self) -> None:
-        """fail_active_jobs writes no error_category on the rows it fails (STOR-05)."""
-        # A deliberate assertion, not an omission.  N-14 records error_category
-        # as written but never read, Phase 21's D-12 left it unwired, and Phase
-        # 30 (APPL-04) owns giving it a consumer -- a second unread writer here
-        # would work against the milestone that has to justify or delete the
-        # field.  ErrorCategory.UNKNOWN would additionally be wrong: an
-        # interrupted restart is not an unknown failure.
+    def test_fail_active_jobs_restart_category_only_on_the_uploading_row(
+        self,
+    ) -> None:
+        """Every restarted row but the uploading one shows its text, not a category."""
+        # UNKNOWN would be wrong for any of them: an interrupted restart is a
+        # precisely known failure.  The uploading row is the one exception,
+        # because its amber category's advice says to check paperless-ngx
+        # before scanning again.
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
 
             store.fail_active_jobs()
 
-            for job_id in seeded:
+            categorised = set()
+            for job_id, original in seeded.items():
                 job = store.get_job(job_id)
                 assert job is not None
-                assert job.error_category is None
+                if job.error_category is not None:
+                    categorised.add(original)
+            assert categorised == {JobState.UPLOADING}
         finally:
             store.close()
 
     def test_fail_active_jobs_transitions_exactly_the_active_states(self) -> None:
-        """The states fail_active_jobs moves are exactly ACTIVE_STATES (STOR-05)."""
+        """The states fail_active_jobs moves are exactly ACTIVE_STATES."""
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
@@ -1580,11 +1900,10 @@ class TestQueryMethods:
                 assert job is not None
                 if job.state != original:
                     transitioned.add(original)
-            # Computed from the real frozenset rather than spelled out.  This is
-            # what makes Phase 23's FALLBACK and Phase 25's SCANNING_REVERSE get
-            # picked up the moment they join ACTIVE_STATES, with no edit to
-            # fail_active_jobs -- and what fails loudly if the predicate is ever
-            # hand-written back into a fixed list.
+            # Computed from the real frozenset rather than spelled out, so a state
+            # that joins ACTIVE_STATES is picked up with no edit to
+            # fail_active_jobs, and a predicate hand-written as a fixed list
+            # fails loudly.
             assert transitioned == ACTIVE_STATES
             # The seeding covered the whole enum, so "exactly ACTIVE_STATES" is
             # a statement about every state and not only about the ones seeded.
@@ -1592,17 +1911,113 @@ class TestQueryMethods:
         finally:
             store.close()
 
+    def test_fail_recovered_jobs_fails_only_the_named_active_rows(self) -> None:
+        """Each named active row gets its own kept sentence; nothing else is touched."""
+        store = JobStore()
+        try:
+            seeded = _seed_one_per_state(store)
+            active = next(i for i, s in seeded.items() if s is JobState.SCANNING)
+            terminal = next(i for i, s in seeded.items() if s is JobState.DONE)
+
+            failed = store.fail_recovered_jobs(
+                {
+                    active: KEPT_SENTENCE,
+                    terminal: "must not land on a finished job",
+                    "no-such-job": "must not land anywhere",
+                }
+            )
+
+            assert failed == 1
+            for job_id, original in seeded.items():
+                job = store.get_job(job_id)
+                assert job is not None
+                if job_id == active:
+                    assert job.state == JobState.ERROR
+                    assert job.error == f"{SERVER_RESTART_REASON}. {KEPT_SENTENCE}"
+                    assert job.error_category is None
+                else:
+                    # The unnamed active row is left for fail_active_jobs, and
+                    # the terminal row keeps its recorded history.
+                    assert job.state == original
+                    assert job.error == f"before {original.value}"
+            assert store.get_job("no-such-job") is None
+        finally:
+            store.close()
+
+    def test_fail_recovered_jobs_restart_words_each_row_by_its_state(self) -> None:
+        """An uploading row with kept pages reads as maybe delivered, and is amber."""
+        store = JobStore()
+        try:
+            uploading, scanning = _create_in_order(store, 2)
+            store.update_state(uploading, JobState.UPLOADING)
+            store.update_state(scanning, JobState.SCANNING)
+
+            failed = store.fail_recovered_jobs(
+                {uploading: KEPT_SENTENCE, scanning: OTHER_KEPT_SENTENCE}
+            )
+
+            assert failed == 2
+            sent = store.get_job(uploading)
+            assert sent is not None
+            assert sent.state == JobState.ERROR
+            assert sent.error == f"{RESTART_UPLOADING_REASON}. {KEPT_SENTENCE}"
+            assert sent.error_category is ErrorCategory.UNCONFIRMED_SEND
+            unfinished = store.get_job(scanning)
+            assert unfinished is not None
+            assert unfinished.state == JobState.ERROR
+            assert unfinished.error == (
+                f"{SERVER_RESTART_REASON}. {OTHER_KEPT_SENTENCE}"
+            )
+            assert unfinished.error_category is None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES, key=str))
+    def test_fail_recovered_jobs_restart_text_for_every_active_state(
+        self, state: JobState
+    ) -> None:
+        """Every active state gets the text and category its restart deserves."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="In flight")
+            store.update_state(job.id, state)
+
+            assert store.fail_recovered_jobs({job.id: KEPT_SENTENCE}) == 1
+
+            ended = store.get_job(job.id)
+            assert ended is not None
+            assert ended.state == JobState.ERROR
+            assert ended.error == _restart_text(state, KEPT_SENTENCE)
+            assert ended.error_category is _restart_category(state)
+        finally:
+            store.close()
+
+    def test_fail_recovered_jobs_with_no_texts_changes_nothing(self) -> None:
+        """An empty mapping writes nothing and reports zero."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="In flight")
+            store.update_state(job.id, JobState.SCANNING)
+
+            assert store.fail_recovered_jobs({}) == 0
+
+            still = store.get_job(job.id)
+            assert still is not None
+            assert still.state == JobState.SCANNING
+        finally:
+            store.close()
+
     def test_job_state_has_no_failed_member(self) -> None:
-        """FAILED in the STOR-05 prose means the existing JobState.ERROR (STOR-05)."""
-        # D-19, pinned as a test because a future reader taking the requirement
-        # prose literally could reasonably invent a JobState.FAILED.  The value
+        """JobState has no FAILED member: a failed job is JobState.ERROR."""
+        # "Failed" is the natural English word, so a JobState.FAILED is easy
+        # to invent.  The value
         # is persisted as SQLite TEXT and read back through the enum
         # constructor, so adding or renaming a member is a data migration.
         assert "FAILED" not in JobState.__members__
         assert JobState.ERROR.value == "ERROR"
 
     def test_list_pending_returns_only_pending_jobs_oldest_first(self) -> None:
-        """list_pending returns the still-queued jobs in creation order (STOR-05)."""
+        """list_pending returns the still-queued jobs in creation order."""
         store = JobStore()
         try:
             ids = _seed_queue(store)
@@ -1625,7 +2040,7 @@ class TestQueryMethods:
             store.close()
 
     def test_list_pending_on_an_empty_store_returns_an_empty_list(self) -> None:
-        """list_pending on a store with no jobs returns an empty list (STOR-05)."""
+        """list_pending on a store with no jobs returns an empty list."""
         store = JobStore()
         try:
             assert store.list_pending() == []
@@ -1633,7 +2048,7 @@ class TestQueryMethods:
             store.close()
 
     def test_list_pending_returns_jobs_in_the_pending_state(self) -> None:
-        """Every object list_pending returns is a PENDING Job (STOR-05)."""
+        """Every object list_pending returns is a PENDING Job."""
         store = JobStore()
         try:
             ids = _seed_queue(store)
@@ -1650,7 +2065,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_on_an_empty_store_is_none(self) -> None:
-        """latest_run_job on a store with no jobs returns None (D-06)."""
+        """latest_run_job on a store with no jobs returns None."""
         store = JobStore()
         try:
             assert store.latest_run_job() is None
@@ -1658,7 +2073,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_skips_a_newer_rejection(self) -> None:
-        """A rejection newer than a finished job does not replace it (D-06)."""
+        """A rejection newer than a finished job does not replace it."""
         store = JobStore()
         try:
             done_id, rejected_id = _create_in_order(store, 2)
@@ -1676,7 +2091,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_returns_a_real_failure(self) -> None:
-        """A newer non-rejected failure is a run job and is returned (D-06)."""
+        """A newer non-rejected failure is a run job and is returned."""
         store = JobStore()
         try:
             scanning_id, rejected_id, failed_id = _create_in_order(store, 3)
@@ -1697,7 +2112,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_returns_a_restart_failed_job(self) -> None:
-        """A job failed by restart recovery has no category and is returned (D-06)."""
+        """A job failed by restart recovery has no category and is returned."""
         store = JobStore()
         try:
             interrupted_id, rejected_id = _create_in_order(store, 2)
@@ -1710,7 +2125,7 @@ class TestQueryMethods:
             )
             store._conn.commit()
             store.update_state(interrupted_id, JobState.SCANNING)
-            store.fail_active_jobs(SERVER_RESTART_REASON)
+            store.fail_active_jobs()
 
             latest = store.latest_run_job()
 
@@ -1722,7 +2137,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_with_only_rejections_is_none(self) -> None:
-        """A store holding only rejected rows has no run job (D-06)."""
+        """A store holding only rejected rows has no run job."""
         store = JobStore()
         try:
             for job_id in _create_in_order(store, 2):
@@ -1733,7 +2148,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_survives_a_reopen(self, tmp_path: Path) -> None:
-        """The REJECTED marker is durable across a close and reopen (D-06)."""
+        """The REJECTED marker is durable across a close and reopen."""
         db_path = str(tmp_path / "jobs.db")
         store = JobStore(db_path=db_path)
         try:
@@ -1753,7 +2168,7 @@ class TestQueryMethods:
             reopened.close()
 
     def test_latest_run_job_skips_excluded_ids(self) -> None:
-        """Excluded ids are passed over, however many newer rows they cover (IN-08)."""
+        """Excluded ids are passed over, however many newer rows they cover."""
         store = JobStore()
         try:
             older, middle, newest = _create_in_order(store, 3)
@@ -1774,7 +2189,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_exclusions_combine_with_the_rejection_skip(self) -> None:
-        """An owed rejection and a written one are both skipped (IN-08, D-06)."""
+        """An owed rejection and a written one are both skipped."""
         store = JobStore()
         try:
             done, owed, rejected = _create_in_order(store, 3)
@@ -1789,7 +2204,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_ignores_excluded_ids_that_match_no_row(self) -> None:
-        """Excluding ids that match no row changes nothing (IN-08)."""
+        """Excluding ids that match no row changes nothing."""
         store = JobStore()
         try:
             only = _create_in_order(store, 1)[0]
@@ -1804,7 +2219,7 @@ class TestQueryMethods:
             store.close()
 
     def test_probe_on_a_healthy_store_changes_nothing(self) -> None:
-        """A probe returns None and leaves rows and user_version untouched (D-12)."""
+        """A probe returns None and leaves rows and user_version untouched."""
         store = JobStore()
         try:
             first_id, second_id = _create_in_order(store, 2)
@@ -1821,8 +2236,19 @@ class TestQueryMethods:
         finally:
             store.close()
 
+    def test_probe_fails_on_a_read_only_store(self, tmp_path: Path) -> None:
+        """A probe raises on a store that can be read but not written."""
+        store = JobStore(tmp_path / "jobs.db")
+        try:
+            store._conn.execute("PRAGMA query_only = ON")
+
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                store.probe()
+        finally:
+            store.close()
+
     def test_probe_after_close_raises(self) -> None:
-        """A probe touches the connection, so a closed store raises (D-12)."""
+        """A probe touches the connection, so a closed store raises."""
         store = JobStore()
         store.close()
 
@@ -1831,10 +2257,10 @@ class TestQueryMethods:
 
 
 class TestCreateRejectedJob:
-    """create_rejected_job(): a refused submit recorded in one statement (WR-01)."""
+    """create_rejected_job(): a refused submit recorded in one statement."""
 
     def test_create_rejected_job_writes_a_terminal_rejected_row(self) -> None:
-        """The row is already ERROR/REJECTED and reads back unchanged (D-05, D-06)."""
+        """The row is already ERROR/REJECTED and reads back unchanged."""
         store = JobStore()
         try:
             job = store.create_rejected_job(
@@ -1866,7 +2292,7 @@ class TestCreateRejectedJob:
             store.close()
 
     def test_create_rejected_job_runs_one_insert_and_no_update(self) -> None:
-        """One INSERT and no UPDATE, so no failure can strand a PENDING row (WR-01)."""
+        """One INSERT and no UPDATE, so no failure can strand a PENDING row."""
         store = JobStore()
         traced: list[str] = []
         try:
@@ -1878,7 +2304,7 @@ class TestCreateRejectedJob:
             verbs = [text.split()[0].upper() for text in statements]
             # Create-then-finish is two transactions; if the second one raises,
             # the first has already committed a PENDING row with no REJECTED
-            # marker, and nothing ever reconciles it (WR-01, D-06).
+            # marker, and nothing ever reconciles it.
             assert verbs.count("INSERT") == 1, (
                 f"create_rejected_job ran {verbs.count('INSERT')} INSERTs: "
                 f"{'; '.join(statements)}"
@@ -1886,12 +2312,18 @@ class TestCreateRejectedJob:
             assert "UPDATE" not in verbs, (
                 f"create_rejected_job ran an UPDATE: {'; '.join(statements)}"
             )
+            # The refused-row trim is a DELETE in the same transaction, which
+            # is allowed: it cannot strand a PENDING row.  Anything else is not.
+            assert set(verbs) <= {"INSERT", "DELETE", "SELECT"}, (
+                f"create_rejected_job ran an unexpected statement: "
+                f"{'; '.join(statements)}"
+            )
         finally:
             store._conn.set_trace_callback(None)
             store.close()
 
     def test_latest_run_job_skips_a_created_rejected_job(self) -> None:
-        """The status area skips the row while history still lists it (D-05, D-06)."""
+        """The status area skips the row while history still lists it."""
         store = JobStore()
         try:
             # Backdated, so the rejected row is strictly newer without sleeping.
@@ -1914,7 +2346,7 @@ class TestOwnerToken:
     """create_job's owner_token: round-trip, NULL-means-unowned, and the arg cap."""
 
     def test_create_job_records_the_owner_token_it_was_given(self) -> None:
-        """A job created with an owner token carries it and re-reads it (APPL-09)."""
+        """A job created with an owner token carries it and re-reads it."""
         store = JobStore()
         try:
             job = store.create_job(
@@ -1922,9 +2354,8 @@ class TestOwnerToken:
             )
 
             assert job.owner_token == OWNER_TOKEN
-            # Re-read rather than trusting the returned object: the point of
-            # the change is that the column now has a writer, not that the
-            # dataclass can hold the value (it already could -- job.py:501).
+            # Re-read rather than trusting the returned object: the column, not
+            # the dataclass, is what must hold the token.
             reread = store.get_job(job.id)
             assert reread is not None
             assert reread.owner_token == OWNER_TOKEN
@@ -1932,7 +2363,7 @@ class TestOwnerToken:
             store.close()
 
     def test_create_job_without_an_owner_token_reads_back_none(self) -> None:
-        """An unowned job stores NULL, which is what every older row holds (D-23)."""
+        """An unowned job stores NULL, which is what every older row holds."""
         store = JobStore()
         try:
             job = store.create_job(profile="default", title="Unowned Doc")
@@ -1945,17 +2376,17 @@ class TestOwnerToken:
             store.close()
 
     def test_create_job_parameter_tuple_ends_at_owner_token(self) -> None:
-        """create_job's parameters are pinned to five non-self names (APPL-09)."""
-        # A pin against two separate regressions: a sixth parameter, which
-        # would trip PLR0913 and tempt a suppression, and a silent restoration
-        # of `thumbnail` to the slot owner_token now occupies.
+        """create_job's parameters are pinned to five non-self names."""
+        # Two mistakes are caught here: a sixth parameter, which would trip
+        # PLR0913 and tempt a suppression, and `thumbnail` put back in the slot
+        # owner_token occupies.
         parameters = tuple(inspect.signature(JobStore.create_job).parameters)
 
         assert parameters == CREATE_JOB_PARAMETERS
         assert "thumbnail" not in parameters
 
     def test_create_rejected_job_still_records_a_null_owner_token(self) -> None:
-        """A refused submit is still unowned and still recorded nothing (D-05)."""
+        """A refused submit is stored with no owner token and no page counts."""
         store = JobStore()
         try:
             job = store.create_rejected_job(
@@ -1973,7 +2404,7 @@ class TestOwnerToken:
             store.close()
 
     def test_owner_token_reaches_no_other_text_column(self) -> None:
-        """The token lands in owner_token alone -- never in error or title (T-30-09)."""
+        """The token lands in owner_token alone -- never in error or title."""
         store = JobStore()
         try:
             job = store.create_job(
@@ -1999,7 +2430,7 @@ class TestOwnerToken:
             store.close()
 
     def test_two_jobs_keep_their_own_owner_tokens(self) -> None:
-        """Two owned jobs do not share or overwrite each other's token (D-23)."""
+        """Two owned jobs do not share or overwrite each other's token."""
         store = JobStore()
         try:
             first = store.create_job(
@@ -2019,7 +2450,7 @@ class TestOwnerToken:
             store.close()
 
     def test_owner_token_survives_a_close_and_reopen(self, tmp_path: Path) -> None:
-        """Both the written token and a NULL one are durable on disk (APPL-09)."""
+        """Both the written token and a NULL one are durable on disk."""
         db_path = str(tmp_path / "jobs.db")
         store = JobStore(db_path=db_path)
         try:
@@ -2039,17 +2470,17 @@ class TestOwnerToken:
             assert unowned is not None
             assert owned.owner_token == OWNER_TOKEN
             # A row written with no owner stays NULL across the reopen: NULL
-            # means unowned, and no migration backfills it (RESEARCH OQ 1).
+            # means unowned, and no migration backfills it.
             assert unowned.owner_token is None
         finally:
             reopened.close()
 
 
 class TestQueuePosition:
-    """queue_position(): the zero-based "N ahead of you" source (APPL-08)."""
+    """queue_position(): the zero-based "N ahead of you" source."""
 
     def test_queue_position_counts_the_jobs_ahead_of_each_pending_job(self) -> None:
-        """Three jobs queued in order report 0, 1 and 2 ahead (APPL-08)."""
+        """Three jobs queued in order report 0, 1 and 2 ahead."""
         store = JobStore()
         try:
             first, second, third = _create_in_order(store, 3)
@@ -2060,7 +2491,7 @@ class TestQueuePosition:
 
             # Zero-based: the job at the head of the queue has nothing ahead of
             # it, which the UI renders as "(next in line)" rather than the
-            # technically-true "(0 ahead of you)" (UI-SPEC S5).
+            # technically-true "(0 ahead of you)".
             assert positions == [0, 1, 2]
         finally:
             store.close()
@@ -2073,8 +2504,25 @@ class TestQueuePosition:
             store.update_state(running, JobState.SCANNING)
 
             assert store.queue_position(running) is None
-            # The job behind it moves up: the running job is no longer counted.
+            # The job behind it moves up: the running job is not counted.
             assert store.queue_position(waiting) == 0
+        finally:
+            store.close()
+
+    def test_queue_position_skips_the_running_job_still_reading_pending(
+        self,
+    ) -> None:
+        """The worker's job waiting for the scanner is not counted ahead."""
+        store = JobStore()
+        try:
+            running, second, third = _create_in_order(store, 3)
+
+            positions = [
+                store.queue_position(job_id, running=running)
+                for job_id in (running, second, third)
+            ]
+
+            assert positions == [None, 0, 1]
         finally:
             store.close()
 
@@ -2089,7 +2537,7 @@ class TestQueuePosition:
             store.close()
 
     def test_queue_position_agrees_with_list_pending_ordering(self) -> None:
-        """Every pending job's position is its index in list_pending (APPL-08)."""
+        """Every pending job's position is its index in list_pending."""
         store = JobStore()
         try:
             created = _create_in_order(store, QUEUE_POSITION_ROWS)
@@ -2110,7 +2558,7 @@ class TestQueuePosition:
             store.close()
 
     def test_queue_position_on_an_empty_store_is_none(self) -> None:
-        """An empty queue answers None rather than raising (APPL-08)."""
+        """An empty queue answers None rather than raising."""
         store = JobStore()
         try:
             assert store.list_pending() == []
@@ -2118,3 +2566,903 @@ class TestQueuePosition:
             assert store.queue_position("not-a-job-id") is None
         finally:
             store.close()
+
+
+def _raw_scalar(db_path: Path, statement: str) -> int:
+    """
+    Read one integer through a raw connection that bypasses JobStore.
+
+    Used after the store is closed, so the WAL has been checkpointed into the
+    main file and the answer reflects what is on disk.
+
+    Args:
+        db_path: The job database to read.
+        statement: A fixed PRAGMA statement written by the calling test.
+
+    Returns:
+        The first column of the first row the statement answers.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        value: int = conn.execute(statement).fetchone()[0]
+    finally:
+        conn.close()
+    return value
+
+
+def _mode(path: Path) -> int:
+    """Return a file's permission bits alone."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _sidecars(db_path: Path) -> list[Path]:
+    """Return the database file and its -wal and -shm files, in that order."""
+    return [db_path.with_name(db_path.name + suffix) for suffix in SIDECAR_SUFFIXES]
+
+
+def _rejected_titles(store: JobStore) -> set[str]:
+    """Return the titles of every refused row the store still holds."""
+    return {
+        job.title
+        for job in store.list_recent(limit=VACUUM_ROWS)
+        if job.error_category is ErrorCategory.REJECTED
+    }
+
+
+def _run_titles(store: JobStore) -> set[str]:
+    """Return the titles of every row the store holds that was not refused."""
+    return {
+        job.title
+        for job in store.list_recent(limit=VACUUM_ROWS)
+        if job.error_category is not ErrorCategory.REJECTED
+    }
+
+
+class TestPrivateDatabaseMode:
+    """A database this release creates is owner-only; an older one keeps its mode."""
+
+    def test_fresh_database_mode_is_owner_only_with_its_sidecars(
+        self, tmp_path: Path
+    ) -> None:
+        """The db, -wal and -shm files are 0600 under umask 022."""
+        db_path = tmp_path / "fresh.db"
+        previous = os.umask(TEST_UMASK)
+        try:
+            store = JobStore(db_path=str(db_path))
+            try:
+                store.create_job(profile="default", title="Private")
+
+                # Read while the store is open: a clean close checkpoints and
+                # removes both sidecars.
+                modes = {path.name: _mode(path) for path in _sidecars(db_path)}
+            finally:
+                store.close()
+        finally:
+            os.umask(previous)
+
+        assert modes == {path.name: PRIVATE_MODE for path in _sidecars(db_path)}
+
+    def test_existing_database_mode_is_left_as_it_was(self, tmp_path: Path) -> None:
+        """A 0644 database from an earlier release is not re-moded."""
+        db_path = tmp_path / "legacy.db"
+        sqlite3.connect(db_path).close()
+        db_path.chmod(LEGACY_MODE)
+        previous = os.umask(TEST_UMASK)
+        try:
+            store = JobStore(db_path=str(db_path))
+            try:
+                store.create_job(profile="default", title="Legacy")
+
+                modes = {path.name: _mode(path) for path in _sidecars(db_path)}
+            finally:
+                store.close()
+        finally:
+            os.umask(previous)
+
+        assert modes == {path.name: LEGACY_MODE for path in _sidecars(db_path)}
+
+
+class TestRejectedRowCap:
+    """Refused rows keep their own small cap and never count against history."""
+
+    def test_create_rejected_job_rejected_cap_keeps_the_newest(self) -> None:
+        """30 refused submits leave the newest 20 and touch no run row."""
+        store = JobStore()
+        try:
+            done = store.create_job(profile="default", title="Real scan")
+            store.finish_job(done.id, JobState.DONE)
+            titles = [f"Refused {index:02d}" for index in range(REJECTED_FLOOD)]
+            for title in titles:
+                store.create_rejected_job("default", title, error=QUEUE_FULL_JOB_ERROR)
+
+            assert _rejected_titles(store) == set(titles[-REJECTED_HISTORY_ROWS:])
+            assert _run_titles(store) == {"Real scan"}
+            for job in store.list_recent(limit=VACUUM_ROWS):
+                if job.error_category is ErrorCategory.REJECTED:
+                    # The refused row stays unowned.
+                    assert job.owner_token is None
+        finally:
+            store.close()
+
+    def test_a_refused_row_survives_a_clock_that_stepped_back(self) -> None:
+        """
+        The row just written is never the one its own trim removes.
+
+        An appliance whose clock is behind at boot, before NTP, stamps a new
+        row earlier than the rows already kept.  The trim keeps the newest by
+        insertion, so the new row -- which the response names -- survives and
+        the oldest written goes.
+        """
+        store = JobStore()
+        try:
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+            ahead = datetime.now(tz=UTC) + timedelta(days=1)
+            store._conn.execute("UPDATE jobs SET created_at = ?", (ahead.isoformat(),))
+            store._conn.commit()
+
+            latest = store.create_rejected_job(
+                "default", "After the step", error=QUEUE_FULL_JOB_ERROR
+            )
+
+            assert store.get_job(latest.id) is not None
+            titles = _rejected_titles(store)
+            assert "After the step" in titles
+            assert "Refused 00" not in titles
+            assert len(titles) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
+    def test_rejected_cap_is_smaller_than_the_visible_history(self) -> None:
+        """A flood can never fill the web history table on its own."""
+        assert REJECTED_HISTORY_ROWS == 20
+        assert job_module.WEB_HISTORY_LIMIT > REJECTED_HISTORY_ROWS
+
+    def test_finish_job_rejected_cap_trims_refused_rows(self) -> None:
+        """finish_job recording REJECTED trims to the newest 20 as well."""
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, REJECTED_FINISH_FLOOD)
+            for job_id in ids:
+                _reject(store, job_id)
+
+            survivors = {
+                job.id
+                for job in store.list_recent(limit=VACUUM_ROWS)
+                if job.error_category is ErrorCategory.REJECTED
+            }
+            assert survivors == set(ids[-REJECTED_HISTORY_ROWS:])
+        finally:
+            store.close()
+
+
+class TestPruneCountsRunRowsOnly:
+    """history_max_rows counts runs; refused rows sit under their own cap."""
+
+    def test_prune_ignores_refused_rows_for_the_row_cap(self) -> None:
+        """Five runs and twenty refused rows all survive max_rows=5."""
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, SPLIT_RUN_CAP)
+            for job_id in ids:
+                store.finish_job(job_id, JobState.DONE)
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=SPLIT_RUN_CAP)
+
+            assert deleted == 0
+            assert len(_run_titles(store)) == SPLIT_RUN_CAP
+            assert len(_rejected_titles(store)) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
+    def test_prune_trims_run_rows_to_the_cap_null_category_included(self) -> None:
+        """Only the newest 5 runs survive, NULL category counted as a run."""
+        # finish_job(DONE) records no category, so most run rows here are NULL
+        # in error_category.  A `!=` predicate would never match NULL and would
+        # keep them all; `IS NOT` is what makes them count.
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, SPLIT_RUN_ROWS)
+            for job_id in ids:
+                store.finish_job(job_id, JobState.DONE)
+            # One run row with a real, non-REJECTED category, and the oldest,
+            # so it is among the rows the cap removes.
+            store.finish_job(
+                ids[0],
+                JobState.ERROR,
+                error="scanner jammed",
+                error_category=ErrorCategory.SCANNER,
+            )
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=SPLIT_RUN_CAP)
+
+            assert deleted == SPLIT_RUN_ROWS - SPLIT_RUN_CAP
+            kept = {
+                job.id
+                for job in store.list_recent(limit=VACUUM_ROWS)
+                if job.error_category is not ErrorCategory.REJECTED
+            }
+            assert kept == set(ids[-SPLIT_RUN_CAP:])
+            assert len(_rejected_titles(store)) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
+
+class TestIncrementalVacuum:
+    """A new database shrinks after deletes; an old one converts once."""
+
+    def test_fresh_database_auto_vacuum_is_incremental(self, tmp_path: Path) -> None:
+        """A database this release creates reports auto_vacuum = 2."""
+        db_path = tmp_path / "fresh.db"
+        JobStore(db_path=str(db_path)).close()
+
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_INCREMENTAL
+
+    def test_enable_incremental_auto_vacuum_converts_once(self, tmp_path: Path) -> None:
+        """An auto_vacuum NONE database converts once, then is a no-op."""
+        db_path = tmp_path / "old.db"
+        JobStore(db_path=str(db_path)).close()
+        raw = sqlite3.connect(db_path)
+        try:
+            raw.execute("PRAGMA auto_vacuum = NONE")
+            raw.execute("VACUUM")
+        finally:
+            raw.close()
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_NONE
+
+        store = JobStore(db_path=str(db_path))
+        try:
+            assert store.enable_incremental_auto_vacuum() is True
+            assert store.enable_incremental_auto_vacuum() is False
+            # The store still writes afterwards: the conversion restored
+            # explicit transaction control rather than leaving autocommit on.
+            job = store.create_job(profile="default", title="After vacuum")
+        finally:
+            store.close()
+
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_INCREMENTAL
+        reopened = JobStore(db_path=str(db_path))
+        try:
+            assert reopened.get_job(job.id) is not None
+        finally:
+            reopened.close()
+
+    def test_conversion_is_announced_before_it_runs(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The rewrite is logged, with the file's size, before it starts.
+
+        It runs before the server binds and can take long enough on an SD
+        card to outlast a container health check's start period, so the log
+        has to say what the pause is while it is happening.
+        """
+        db_path = tmp_path / "old.db"
+        JobStore(db_path=str(db_path)).close()
+        raw = sqlite3.connect(db_path)
+        try:
+            raw.execute("PRAGMA auto_vacuum = NONE")
+            raw.execute("VACUUM")
+        finally:
+            raw.close()
+
+        store = JobStore(db_path=str(db_path))
+        try:
+            with caplog.at_level(logging.INFO, logger=job_module.__name__):
+                assert store.enable_incremental_auto_vacuum() is True
+        finally:
+            store.close()
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == job_module.__name__
+        ]
+        assert len(messages) == 2, messages
+        assert messages[0].startswith("Converting the job database (0 MiB)")
+        assert "runs once" in messages[0]
+        assert messages[1].startswith("Converted the job database")
+
+    def test_prune_vacuum_leaves_no_free_pages(self, tmp_path: Path) -> None:
+        """Pruning 195 thumbnail-heavy rows leaves an empty freelist."""
+        db_path = tmp_path / "bloated.db"
+        store = JobStore(db_path=str(db_path))
+        try:
+            for index in range(VACUUM_ROWS):
+                job = store.create_job(profile="default", title=f"Row {index:03d}")
+                store.update_thumbnail(job.id, VACUUM_THUMBNAIL)
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=VACUUM_KEEP)
+        finally:
+            store.close()
+
+        assert deleted == VACUUM_ROWS - VACUUM_KEEP
+        assert _raw_scalar(db_path, "PRAGMA freelist_count") == 0
+
+    def test_rejected_cap_trim_vacuum_leaves_no_free_pages(
+        self, tmp_path: Path
+    ) -> None:
+        """Trimming large refused rows leaves an empty freelist too."""
+        db_path = tmp_path / "flooded.db"
+        store = JobStore(db_path=str(db_path))
+        try:
+            for index in range(REJECTED_FLOOD):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=VACUUM_ERROR
+                )
+            kept = len(_rejected_titles(store))
+        finally:
+            store.close()
+
+        assert kept == REJECTED_HISTORY_ROWS
+        assert _raw_scalar(db_path, "PRAGMA freelist_count") == 0
+
+
+class TestTitleLogging:
+    """Titles reach the debug log as a repr, so a newline cannot forge a line."""
+
+    def test_create_job_logs_the_title_repr(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Created job ... logs the title with %r."""
+        store = JobStore()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
+                store.create_job(profile="default", title=CONTROL_TITLE)
+        finally:
+            store.close()
+
+        created = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Created job ")
+        ]
+        assert len(created) == 1
+        assert repr(CONTROL_TITLE) in created[0]
+        assert "\n" not in created[0]
+
+    def test_create_rejected_job_logs_the_title_repr(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Created rejected job ... logs the title with %r."""
+        store = JobStore()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
+                store.create_rejected_job(
+                    "default", CONTROL_TITLE, error=QUEUE_FULL_JOB_ERROR
+                )
+        finally:
+            store.close()
+
+        created = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Created rejected job ")
+        ]
+        assert len(created) == 1
+        assert repr(CONTROL_TITLE) in created[0]
+        assert "\n" not in created[0]
+
+
+class TestRemovedPositions:
+    """Migration step 3 and the positions of the pages removed as blank."""
+
+    def test_step_three_adds_exactly_the_positions_column(self) -> None:
+        """The ladder's third step adds the one nullable TEXT column, and no other."""
+        assert job_module._V3_COLUMNS == V3_COLUMNS
+        assert len(job_module._MIGRATIONS) == HEAD_VERSION
+        assert job_module._COLUMNS[-1] == "pages_removed_at"
+
+    def test_a_version_two_database_migrates_and_keeps_its_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """A v2 database opens at v3; its old row reads back unchanged, positions None."""
+        db_path = str(tmp_path / "v2.db")
+        _build_v2_schema(db_path)
+
+        store = JobStore(db_path=db_path)
+        try:
+            version, columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(columns) == HEAD_COLUMN_COUNT
+            assert "pages_removed_at" in columns
+
+            legacy = store.get_job("legacy-1")
+            assert legacy is not None
+            assert legacy.title == "Legacy Doc"
+            assert legacy.state is JobState.DONE
+            assert legacy.outcome is ScanOutcome.SUCCESS
+            assert legacy.pages_scanned == 4
+            assert legacy.pages_removed == 1
+            assert legacy.pages_uploaded == 3
+            assert legacy.owner_token == "tok-v2"
+            assert legacy.removed_positions is None
+        finally:
+            store.close()
+
+    def test_finish_job_records_the_positions(self) -> None:
+        """Positions given in the result read back as the same tuple of ints."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Blank backs")
+            store.finish_job(
+                created.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=4,
+                    pages_removed=2,
+                    pages_uploaded=2,
+                    removed_positions=(2, 4),
+                ),
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.removed_positions == (2, 4)
+            assert isinstance(fetched.removed_positions, tuple)
+            assert all(isinstance(p, int) for p in fetched.removed_positions)
+            # Information, not a warning: the positions never reach it.
+            assert fetched.warning is None
+        finally:
+            store.close()
+
+    def test_finish_job_without_positions_leaves_the_column_null(self) -> None:
+        """A result with no positions, and no result at all, both record NULL."""
+        store = JobStore()
+        try:
+            counted = store.create_job("default", "Counted")
+            store.finish_job(
+                counted.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=2,
+                    pages_removed=0,
+                    pages_uploaded=2,
+                ),
+            )
+            failed = store.create_job("default", "Failed")
+            store.finish_job(failed.id, JobState.ERROR, error="boom")
+
+            for job_id in (counted.id, failed.id):
+                raw = store._conn.execute(
+                    "SELECT pages_removed_at FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()[0]
+                assert raw is None
+                fetched = store.get_job(job_id)
+                assert fetched is not None
+                assert fetched.removed_positions is None
+        finally:
+            store.close()
+
+    def test_new_and_rejected_rows_leave_the_positions_null(self) -> None:
+        """create_job and create_rejected_job record no positions."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "New")
+            rejected = store.create_rejected_job(
+                "default", "Refused", error=QUEUE_FULL_JOB_ERROR
+            )
+            assert created.removed_positions is None
+            assert rejected.removed_positions is None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "stored",
+        ["not json", '[1, "x"]', "[0]", "[-3]", '{"a": 1}', "[true]", "[2.5]"],
+    )
+    def test_a_corrupt_positions_column_reads_back_none_and_warns(
+        self, stored: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Anything but a JSON list of ints >= 1 reads back None with a WARNING."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Tampered")
+            store._conn.execute(
+                "UPDATE jobs SET pages_removed_at = ? WHERE id = ?",
+                (stored, created.id),
+            )
+            store._conn.commit()
+
+            with caplog.at_level(logging.WARNING, logger=job_module.__name__):
+                fetched = store.get_job(created.id)
+
+            assert fetched is not None
+            assert fetched.removed_positions is None
+            warnings = [
+                record
+                for record in caplog.records
+                if record.levelno == logging.WARNING
+                and created.id in record.getMessage()
+            ]
+            assert len(warnings) == 1
+        finally:
+            store.close()
+
+    def test_a_bare_job_and_result_have_no_positions(self) -> None:
+        """removed_positions defaults to None, so a construction may omit it."""
+        assert Job(id="t", profile="default", title="T").removed_positions is None
+        result = JobResult(
+            outcome=None,
+            warning=None,
+            pages_scanned=None,
+            pages_removed=None,
+            pages_uploaded=None,
+        )
+        assert result.removed_positions is None
+
+
+def _store_path(tmp_path: Path, where: str) -> str:
+    """Return a file database path under ``tmp_path``, or ``":memory:"``."""
+    return ":memory:" if where == "memory" else str(tmp_path / "jobs.db")
+
+
+def _created_at_indexes(conn: sqlite3.Connection) -> list[str]:
+    """Return the names of the indexes on the jobs table keyed on created_at alone."""
+    names = [row[1] for row in conn.execute("PRAGMA index_list(jobs)")]
+    return [
+        name
+        for name in names
+        # The index name comes from SQLite's own catalogue, not from a caller,
+        # and a PRAGMA argument cannot be bound.
+        if [row[2] for row in conn.execute(f"PRAGMA index_info({name})")]
+        == ["created_at"]
+    ]
+
+
+class TestOpenLeavesNoSnapshot:
+    """Opening an up-to-date database leaves no read snapshot behind."""
+
+    def test_checkpoint_is_not_busy_after_open(self, tmp_path: Path) -> None:
+        """Another connection's write can be checkpointed while the store sits idle."""
+        db_path = str(tmp_path / "jobs.db")
+        JobStore(db_path=db_path).close()
+
+        # The second open finds nothing to migrate: only the version read runs.
+        store = JobStore(db_path=db_path)
+        other = sqlite3.connect(db_path, isolation_level=None)
+        try:
+            other.execute(
+                "INSERT INTO jobs (id, profile, title, state, tags, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "other-1",
+                    "default",
+                    "Other",
+                    JobState.DONE.value,
+                    "[]",
+                    datetime.now(tz=UTC).isoformat(),
+                ),
+            )
+            busy, _log_frames, _checkpointed = other.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            assert busy == 0
+        finally:
+            other.close()
+            store.close()
+
+
+class TestCreatedAtIndex:
+    """History reads are served by an index on created_at, not a sort."""
+
+    @pytest.mark.parametrize("where", ["file", "memory"])
+    def test_recent_query_uses_the_created_at_index(
+        self, tmp_path: Path, where: str
+    ) -> None:
+        """The newest-first read plans without a temporary B-tree for its ORDER BY."""
+        store = JobStore(db_path=_store_path(tmp_path, where))
+        try:
+            plan = [
+                row[3]
+                for row in store._conn.execute(
+                    f"EXPLAIN QUERY PLAN {job_module._SELECT_RECENT}", (20,)
+                )
+            ]
+            assert not any("TEMP B-TREE" in detail for detail in plan), plan
+            assert _created_at_indexes(store._conn)
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("where", ["file", "memory"])
+    def test_index_leaves_the_schema_version_at_3(
+        self, tmp_path: Path, where: str
+    ) -> None:
+        """The index adds no ladder step, so an earlier release still opens the file."""
+        store = JobStore(db_path=_store_path(tmp_path, where))
+        try:
+            version, _columns = _read_schema(store._conn)
+            assert _created_at_indexes(store._conn)
+            assert version == HEAD_VERSION
+            assert len(job_module._MIGRATIONS) == HEAD_VERSION
+        finally:
+            store.close()
+
+    def test_reopening_with_the_index_present_succeeds(self, tmp_path: Path) -> None:
+        """A database that already carries the index opens again, still with one."""
+        db_path = str(tmp_path / "jobs.db")
+        JobStore(db_path=db_path).close()
+
+        store = JobStore(db_path=db_path)
+        try:
+            version, _columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(_created_at_indexes(store._conn)) == 1
+        finally:
+            store.close()
+
+
+def _sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _names(directory: Path) -> list[str]:
+    """Return the sorted names of every entry in a directory."""
+    return sorted(entry.name for entry in directory.iterdir())
+
+
+def _skip_if_root() -> None:
+    """Skip the calling test when root runs it, since root ignores directory modes."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+
+
+class TestReadRecentJobs:
+    """The read-only history read: it never creates, migrates or writes."""
+
+    def test_a_missing_database_reads_as_empty_and_creates_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """No database is no history, and the read leaves no file behind."""
+        data = tmp_path / "data"
+        data.mkdir()
+
+        assert job_module.read_recent_jobs(data / "jobs.db", 10) == []
+        assert _names(data) == []
+
+    def test_a_database_behind_an_unreadable_folder_is_a_storage_error(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A history the caller cannot reach is an error, never an empty one.
+
+        ``Path.exists()`` answers False for a permission error as well as for
+        a missing file, so a read that asked it would list nothing and exit
+        0, and a script reading ``jobs --json`` would see ``[]``.
+        """
+        _skip_if_root()
+        data = tmp_path / "data"
+        data.mkdir()
+        store = JobStore(db_path=data / "jobs.db")
+        try:
+            store.create_job("default", "Out Of Reach")
+        finally:
+            store.close()
+
+        data.chmod(0o000)
+        try:
+            with pytest.raises(StorageError) as excinfo:
+                job_module.read_recent_jobs(data / "jobs.db", 10)
+        finally:
+            data.chmod(0o755)
+
+        assert str(data / "jobs.db") in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+
+    def test_another_users_read_creates_no_side_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A reader who does not own the database leaves its folder as it was.
+
+        A read-only open of a WAL database creates the ``-wal`` and ``-shm``
+        files beside it and cannot remove them, so ``sudo saneless jobs``
+        would leave root-owned files in the server's ``data_dir``.  With no
+        server holding the database, another user's read creates neither.
+        """
+        directory = tmp_path / "data"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Theirs")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+        assert _names(directory) == ["jobs.db"]
+        someone_else = db.stat().st_uid + 1
+        monkeypatch.setattr(os, "geteuid", lambda: someone_else)
+
+        read = job_module.read_recent_jobs(db, 10)
+
+        assert _names(directory) == ["jobs.db"]
+        assert read == expected
+
+    def test_rows_match_the_store(self, tmp_path: Path) -> None:
+        """The read returns what the open store's own listing returns."""
+        db = tmp_path / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            first = store.create_job("default", "First", tags=[1, 2])
+            store.create_job("receipts", "Second", correspondent=7)
+            store.create_job("default", "Third")
+            store.finish_job(
+                first.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=3,
+                    pages_removed=1,
+                    pages_uploaded=2,
+                    removed_positions=(2,),
+                ),
+            )
+
+            read = job_module.read_recent_jobs(db, 10)
+
+            assert read == store.list_recent(10)
+            assert len(read) == 3
+            assert job_module.read_recent_jobs(db, 2) == store.list_recent(2)
+        finally:
+            store.close()
+
+    def test_an_older_schema_is_refused_and_left_alone(self, tmp_path: Path) -> None:
+        """A version 2 database is named as too old and is not upgraded."""
+        db = tmp_path / "jobs.db"
+        _build_v2_schema(str(db))
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert "schema version 2" in message
+        assert f"({HEAD_VERSION})" in message
+        # The remedy names the one command that upgrades the file without
+        # implying that every install runs a server: a CLI-only install may
+        # hold a database an earlier release's listing created.
+        assert "only saneless serve upgrades a job database" in message
+        assert "start it once with the same config, stop it" in message
+        assert message.endswith("then run saneless jobs again")
+        assert _sha256(db) == before
+        assert _read_schema_raw(str(db))[0] == 2
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_a_legacy_unversioned_table_is_refused(self, tmp_path: Path) -> None:
+        """An unstamped jobs table reads as version 1, too old to list."""
+        db = tmp_path / "jobs.db"
+        _build_s3_schema(str(db))
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert "schema version 1" in message
+        assert f"({HEAD_VERSION})" in message
+        assert "saneless serve" in message
+        assert _sha256(db) == before
+        assert _read_schema_raw(str(db))[0] == 0
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_an_empty_unversioned_database_reads_as_empty(self, tmp_path: Path) -> None:
+        """A database with no jobs table yet holds no history."""
+        db = tmp_path / "jobs.db"
+        db.touch()
+
+        assert job_module.read_recent_jobs(db, 10) == []
+        assert db.stat().st_size == 0
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_a_newer_schema_is_refused(self, tmp_path: Path) -> None:
+        """A database from a newer release gets the read-write open's wording."""
+        db = tmp_path / "jobs.db"
+        _build_stamped_schema(str(db), HEAD_VERSION + 1)
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert f"schema version {HEAD_VERSION + 1}" in message
+        assert "newer than this release supports" in message
+        assert _sha256(db) == before
+
+    def test_a_negative_schema_is_refused(self, tmp_path: Path) -> None:
+        """A negative stamp no release writes is refused as on the read-write open."""
+        db = tmp_path / "jobs.db"
+        _build_stamped_schema(str(db), -1)
+
+        with pytest.raises(StorageError, match="which no saneless release writes"):
+            job_module.read_recent_jobs(db, 10)
+
+    def test_a_path_with_uri_characters_opens_that_file(self, tmp_path: Path) -> None:
+        """A '?', '#' or space in the path is part of the file name, not the URI."""
+        directory = tmp_path / "a dir?x#y"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Odd Path")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+
+        read = job_module.read_recent_jobs(db, 10)
+
+        assert read == expected
+        assert [job.title for job in read] == ["Odd Path"]
+        assert not (tmp_path / "a dir").exists()
+        assert _names(tmp_path) == ["a dir?x#y"]
+
+    def test_a_read_only_directory_is_read(self, tmp_path: Path) -> None:
+        """A closed database in a directory nobody can write to is still listed."""
+        _skip_if_root()
+        directory = tmp_path / "ro"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Kept One")
+            store.create_job("default", "Kept Two")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+        assert _names(directory) == ["jobs.db"]
+
+        directory.chmod(0o555)
+        try:
+            read = job_module.read_recent_jobs(db, 10)
+            assert _names(directory) == ["jobs.db"]
+        finally:
+            directory.chmod(0o755)
+
+        assert read == expected
+
+    def test_a_read_only_directory_with_a_pending_wal_is_a_storage_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Unapplied WAL pages in a read-only directory are a StorageError."""
+        _skip_if_root()
+        live = tmp_path / "live"
+        live.mkdir()
+        copy = tmp_path / "copy"
+        copy.mkdir()
+        store = JobStore(db_path=live / "jobs.db")
+        try:
+            store.create_job("default", "Pending")
+            (copy / "jobs.db").write_bytes((live / "jobs.db").read_bytes())
+            (copy / "jobs.db-wal").write_bytes((live / "jobs.db-wal").read_bytes())
+        finally:
+            store.close()
+        db = copy / "jobs.db"
+
+        copy.chmod(0o555)
+        try:
+            with pytest.raises(StorageError) as excinfo:
+                job_module.read_recent_jobs(db, 10)
+        finally:
+            copy.chmod(0o755)
+
+        assert str(db) in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, sqlite3.Error)

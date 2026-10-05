@@ -1,0 +1,8 @@
+{# Each answer is a fresh copy of this element, so the next ask is timed from
+   the last answer, not on a fixed rate: the cache remembers a failure for
+   retry_seconds from when the fetch ended, and a fixed rate would land inside
+   that memory every other time.  It carries nothing of the form, so an answer
+   cannot put back a tick or an old profile; on success it fires the list's
+   recovery event (see index.html).  Its own hx-target and hx-include stop it
+   inheriting the tag list's and the scan form's: an inherited include would
+   send the Profile select. #}<span class="htmx-hidden" hx-get="/api/metadata/probe?resource={{ retry_resource }}" hx-trigger="every {{ retry_seconds }}s" hx-target="this" hx-include="this" hx-swap="outerHTML"></span>

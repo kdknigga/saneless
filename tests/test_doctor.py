@@ -1,39 +1,31 @@
 """
-Tests for ``saneless doctor``, the CLI half of the shared check registry.
+``saneless doctor`` prints the shared check registry and gates on it.
 
-This file exists because ``doctor`` is the command surface of
-``saneless.checks``.  The index page shows the six checks to a household
-member; ``doctor`` prints the same six, from the same registry and in the same
-words, to a shell that can gate on them (APPL-01, D-02).  What each check
-*decides* is ``tests/test_checks.py``'s subject.  What this file asserts is the
-rendering and the exit code -- the two things that belong to the command.
+The index page and ``doctor`` render the same checks, from the same registry
+and in the same words, to a household member and to a shell.  What each check
+decides is the registry's own subject; these tests cover what belongs to the
+command: the rendering, the config resolution table and the exit code.
 
-Three rules get tests of their own, because each is easy to break and expensive
-to notice afterwards:
+Three rules are easy to break and expensive to notice:
 
-* **D-01** -- a ``WARN`` must not fail a scripted health gate.  ``doctor``
-  exits 2 (``ExitCode.CONFIG``) when any check fails and 0 for everything else.
-  No new ``ExitCode`` member is added: ``tests/test_deployment_config.py`` pins
-  the enum against the documented tables, so a sixth code would break two
-  doc-truth tests and Phase 28's D-07 table at once.
-* **Amendment A-1** -- ``doctor`` never calls ``require_sane()``.  A machine
-  with no python-sane is precisely the machine whose owner needs a diagnosis,
-  so the missing import is rendered as one ``FAIL`` row among six rather than
-  as a refusal to run at all.  ``scan``, ``devices``, ``serve`` and
-  ``auto-profiles`` all refuse; ``doctor`` is the one command that must not.
-* **APPL-01/D-14** -- a placeholder paperless-ngx token makes ``doctor`` exit
-  non-zero.  That one is exercised through the *real* registry rather than a
-  stub, so the wiring between the command and ``run_checks`` is genuinely
+* a ``WARN`` never fails a scripted health gate: ``doctor`` exits 2
+  (``ExitCode.CONFIG``) when any check fails and 0 for everything else;
+* ``doctor`` never calls ``require_sane()``: a machine with no python-sane is
+  the one whose owner most needs a diagnosis, so the missing import is one
+  ``FAIL`` row among the rest rather than a refusal to run;
+* a placeholder paperless-ngx token makes ``doctor`` exit non-zero, through
+  the real registry, so the wiring between the command and ``run_checks`` is
   under test at least once.
 
 The state-permutation tests stub ``saneless.cli.run_checks`` with hand-built
-results, for the same reason ``tests/test_cli.py`` stubs the scanner backend:
-arranging six real checks into a chosen set of states would test the registry,
-which already has 91 tests of its own.
+results: arranging real checks into a chosen set of states would test the
+registry rather than the command.
 """
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -52,6 +44,7 @@ from saneless.checks import (
 )
 from saneless.cli import (
     _MARKER_WIDTH,
+    _NEXT_STEP_INDENT,
     _SKIPPED_MARKER,
     _row_marker,
     _state_marker,
@@ -69,24 +62,38 @@ from saneless.config import (
     discover_config,
     profile_storage_for_loaded,
 )
-from saneless.exceptions import ConfigError, PaperlessError
+from saneless.exceptions import (
+    ConfigError,
+    ListingCrashedError,
+    ListingTimedOutError,
+    PaperlessError,
+    ScanError,
+)
 from saneless.job import JobStore
+from saneless.paperless import ConnectionProbe, PaperlessClient
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import DeviceInfo
-from saneless.vocabulary import ConnectionStatus, ExitCode, ProfileStorage
+from saneless.scanner.sane_backend import SaneBackend
+from saneless.scanner.saned_probe import SanedOutcome
+from saneless.vocabulary import (
+    ConnectionStatus,
+    ExitCode,
+    ProfileStorage,
+    connection_status_message,
+)
 from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
+from tests.fake_sane import FakeSaneError, FakeSaneModule
 
 if TYPE_CHECKING:
     import httpx2
 
-# Every ExitCode member, written out rather than derived, so that adding a
-# member to the enum fails here as well as in the two doc-truth tests.  D-01
-# maps a red check onto the existing 2 and this is the assertion that says so.
-_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 130}
+    from saneless.scanner.base import DeviceCapabilities, DeviceSurvey
 
-# Every call the CLI made to ``require_sane`` during one invocation.  Amendment
-# A-1 is an assertion about a call that must *not* happen, and a silent no-op
-# stand-in cannot tell no call from a call that did nothing.
+# Every call the CLI made to ``require_sane`` during one invocation.  That
+# ``doctor`` never calls it is an assertion about a call that must *not*
+# happen, and a silent no-op stand-in cannot tell no call from a call that did
+# nothing.
 _REQUIRE_SANE_CALLS: list[str] = []
 
 # A configured value ``is_placeholder_token`` accepts, bound to a name with no
@@ -118,15 +125,71 @@ class _ReadyScanner(StubScannerBackend):
         return [DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner")]
 
 
+class _TwoScanners(_ReadyScanner):
+    """A backend reporting two devices, so the choice between them is open."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report a flatbed and a multi-function device.
+
+        Returns:
+            Two devices, in the order discovery would list them.
+
+        """
+        return [
+            DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
+            DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral"),
+        ]
+
+
+class _OtherScannerThatOpens(_ReadyScanner):
+    """
+    A backend that lists a device other than the configured one.
+
+    Opening a device succeeds, the way SANE opens an id it never listed.
+    """
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report a multi-function device that is not the configured flatbed.
+
+        Returns:
+            One device whose id differs from ``_make_settings``'s.
+
+        """
+        return [DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral")]
+
+
+class _WrongScanner(_OtherScannerThatOpens):
+    """A backend that lists another device and cannot open the configured one."""
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Fail the open the way a device that is not there fails it.
+
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ScanError: Always.
+
+        """
+        msg = f"cannot open {device_id}"
+        raise ScanError(msg)
+
+
 class _ConnectedPaperless:
     """A Paperless client whose connection test always succeeds."""
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         """Accept and ignore every constructor argument."""
 
-    def test_connection(
+    def probe_connection(
         self, *, timeout: httpx2.Timeout | None = None
-    ) -> ConnectionStatus:
+    ) -> ConnectionProbe:
         """
         Report a healthy paperless-ngx.
 
@@ -134,17 +197,129 @@ class _ConnectedPaperless:
             timeout: Accepted because the registry passes its own bound.
 
         Returns:
-            ``ConnectionStatus.CONNECTED``.
+            A ``ConnectionStatus.CONNECTED`` probe.
 
         """
-        return ConnectionStatus.CONNECTED
+        return ConnectionProbe(ConnectionStatus.CONNECTED)
 
     def close(self) -> None:
         """Nothing to close."""
 
 
+class _UnreachablePaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test finds nothing listening."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that could not be reached.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.UNREACHABLE`` probe.
+
+        """
+        return ConnectionProbe(ConnectionStatus.UNREACHABLE)
+
+
+class _FailingPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test is answered with a 500."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that answered with a server error.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.SERVER_ERROR`` probe.
+
+        """
+        return ConnectionProbe(ConnectionStatus.SERVER_ERROR)
+
+
+class _RaisingPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test raises, so the check cannot finish."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Fail the way an unexpected bug in the probe would.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            RuntimeError: Always.
+
+        """
+        msg = "unexpected"
+        raise RuntimeError(msg)
+
+
+class _ListingTimesOut(_ReadyScanner):
+    """A backend whose isolated listing is stopped at its deadline."""
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Fail the way a listing stopped at its deadline fails.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ListingTimedOutError: Always.
+
+        """
+        msg = "The scanner library did not finish listing scanners in time"
+        raise ListingTimedOutError(msg)
+
+
+class _ListingCrashes(_ReadyScanner):
+    """A backend whose isolated listing crashes in the scanner library."""
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Fail the way a listing child that died on a signal fails.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ListingCrashedError: Always.
+
+        """
+        msg = "The scanner library failed while listing scanners"
+        raise ListingCrashedError(msg)
+
+
 def _make_settings(
-    tmp_path: Path, token: str = _NOT_A_PLACEHOLDER, consume_dir: str = ""
+    tmp_path: Path,
+    token: str = _NOT_A_PLACEHOLDER,
+    consume_dir: str = "",
+    url: str = "http://paperless.invalid",
 ) -> Settings:
     """
     Build settings whose directories exist and are writable.
@@ -153,10 +328,17 @@ def _make_settings(
     real write and an absent directory is a legitimate red row that would mask
     whatever the test is actually about.
 
+    The configured device is the one ``_ReadyScanner`` lists, so a ready run
+    goes down the path where the configured scanner is listed.  The Scanner
+    check looks for the configured device rather than taking whatever is
+    listed first, and a device id no backend here reports would only pass by
+    way of the open that stands in for an unlisted device.
+
     Args:
         tmp_path: pytest's per-test directory.
         token: The paperless-ngx token to configure.
         consume_dir: The fallback folder, or "" for none.
+        url: The paperless-ngx address, or "" for unset.
 
     Returns:
         Settings ready for ``_patch_doctor``.
@@ -167,9 +349,9 @@ def _make_settings(
     data_dir.mkdir(parents=True, exist_ok=True)
     scratch_dir.mkdir(parents=True, exist_ok=True)
     return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
+        scanner=ScannerConfig(device="epson:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:8000",
+            url=url,
             token=token,
             consume_dir=consume_dir,
         ),
@@ -314,11 +496,10 @@ def _one_skipped_scanner() -> tuple[CheckResult, ...]:
     Build six rows of which the Scanner one was never probed.
 
     ``run_checks`` really can produce this -- ``_scanner_skipped`` and
-    ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it today,
+    ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it,
     because the command builds its context with ``skip_scanner`` defaulted and
-    passes no scanner gate.  The stub is therefore how this row gets in front
-    of the printer at all, which is exactly the half-wiring R3-WR-03 found:
-    until something rendered it, nothing noticed it rendered wrong.
+    passes no scanner gate.  The stub is how this row reaches the printer, so
+    a row the registry can build is never rendered unseen.
 
     Returns:
         Six rows in ``CheckKey`` order, the Scanner one skipped.
@@ -363,8 +544,8 @@ def _lines(output: str) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
-# The caption that separates the check rows from the config resolution table
-# (D-12).  Written out rather than imported so that respelling it in ``cli.py``
+# The caption that separates the check rows from the config resolution table.
+# Written out rather than imported so that respelling it in ``cli.py``
 # is a visible change here, the way the row wording is pinned in
 # ``tests/test_checks.py``.
 _TABLE_CAPTION = "Config files searched, in order:"
@@ -374,10 +555,8 @@ def _rows(output: str) -> list[str]:
     """
     Split off the check rows: everything printed before the resolution table.
 
-    The rows used to be the whole of ``doctor``'s output, so the assertions
-    that count them were written against every printed line.  They are scoped
-    here instead of loosened, because "one line per check and nothing else" is
-    still the contract for *that* section and the table is what follows it.
+    "One line per check and nothing else" is the contract for the rows
+    section, and the resolution table follows it.
 
     Args:
         output: The captured command output.
@@ -459,7 +638,7 @@ class TestDoctorHelp:
     def test_help_works_with_a_broken_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``--help`` never loads settings, so a broken file cannot break it (CFG-10)."""
+        """``--help`` never loads settings, so a broken file cannot break it."""
 
         def _explode(_config_path: str | None = None) -> Settings:
             msg = "Configuration error in /nope.toml: unreadable"
@@ -473,7 +652,7 @@ class TestDoctorHelp:
     def test_json_is_not_an_option(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """``--json`` does not ship, so click refuses it (research: no consumer)."""
+        """``doctor`` has no ``--json`` option, so click refuses it."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         result = runner.invoke(cli, ["doctor", "--json"])
         assert result.exit_code != 0
@@ -481,7 +660,7 @@ class TestDoctorHelp:
 
 
 class TestDoctorExitCodes:
-    """D-01's mapping, one test per state."""
+    """How each check state maps onto ``doctor``'s exit code, one test per state."""
 
     def test_every_check_ok_exits_zero(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -495,7 +674,7 @@ class TestDoctorExitCodes:
     def test_a_warning_does_not_fail_the_gate(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A WARN is a true statement about a deployment that still works (D-01)."""
+        """A WARN exits 0: it is true of a deployment that still works."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         # Six rows, Configuration included, so the stub mirrors what a real
         # run hands the printer rather than a registry one member short.
@@ -529,17 +708,80 @@ class TestDoctorExitCodes:
         assert result.exit_code == ExitCode.CONFIG
         assert result.exit_code == 2
 
-    def test_no_new_exit_code_member_was_added(self) -> None:
+    def test_a_configured_scanner_that_is_absent_fails_and_points_at_devices(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """
-        ``doctor`` reuses 2 rather than growing the enum.
+        A scanner that is there is not the one configured, so doctor fails.
 
-        The two doc-truth tests at ``tests/test_deployment_config.py`` compare
-        the documented global tables against every member, so a sixth code
-        would be a documentation change in three files and a Phase 28 D-07
-        revision, for a command that reports a list and can only carry one
-        code out of one process anyway.
+        The backend lists another device and the configured one does not
+        open, so nothing the configuration names can scan.  The row says so
+        and points at ``saneless devices``, which lists what can be chosen
+        instead.  Neither id is printed: a device id can name a LAN host.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
         """
-        assert {int(code) for code in ExitCode} == _EXPECTED_EXIT_CODES
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=_WrongScanner)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "The configured scanner was not found." in result.output
+        assert "saneless devices" in result.output
+        assert "hp:002" not in result.output
+        assert "epson:001" not in result.output
+
+    def test_a_configured_scanner_that_opens_without_being_listed_is_ready(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        SANE opens ids it never lists, and a device that opens can scan.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(
+            monkeypatch, settings, scanner_cls=_OtherScannerThatOpens
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        assert "The configured scanner is ready." in result.output
+        assert "The configured scanner was not found." not in result.output
+
+    def test_doctor_exits_config_on_any_fail_and_success_otherwise(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``doctor`` exits ``CONFIG`` when any row failed and ``SUCCESS`` otherwise.
+
+        Every state on every check is tried, so a red check always maps onto
+        the existing configuration code and ``doctor`` has no code of its own.
+        """
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        tables = [
+            _all_ok(),
+            _one_skipped_scanner(),
+            *(
+                _all_ok_except(key, state, "Do this.")
+                for key in CheckKey
+                for state in CheckState
+            ),
+        ]
+        for rows in tables:
+            _stub_registry(monkeypatch, rows)
+            failed = any(row.state is CheckState.FAIL for row in rows)
+            expected = ExitCode.CONFIG if failed else ExitCode.SUCCESS
+            result = runner.invoke(cli, ["doctor"])
+            assert result.exit_code == expected, (rows, result.output)
 
 
 class TestDoctorOutput:
@@ -551,10 +793,8 @@ class TestDoctorOutput:
         """
         One line per check and nothing else above the table -- no header, no summary.
 
-        The rows section is still exactly the checks; the config resolution
-        table follows it, which is asserted here rather than left to the
-        table's own tests, so this cannot go on passing after the table stops
-        being printed at all.
+        The table's presence is asserted here too, so the row count cannot
+        pass on output that has lost the table.
         """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
@@ -566,7 +806,7 @@ class TestDoctorOutput:
     def test_rows_are_printed_in_check_key_order(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Member order is the contract both surfaces render in (D-02)."""
+        """Rows print in ``CheckKey`` order, the order both surfaces render in."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
@@ -616,7 +856,11 @@ class TestDoctorOutput:
     def test_a_warn_row_is_followed_by_its_indented_next_step(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """APPL-04: a row nobody can act on is a row that only gets escalated."""
+        """
+        A WARN row is followed by its indented next step.
+
+        A row nobody can act on is a row that only gets escalated.
+        """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         step = "Set a fallback folder in the saneless config."
         # Built from the enum rather than listed: a member added above
@@ -656,13 +900,13 @@ class TestDoctorOutput:
 
 class TestDoctorConfigResolutionTable:
     """
-    D-12: after the rows, where every config file the search looked at ended up.
+    After the rows, ``doctor`` lists where every searched config file ended up.
 
     The Configuration row says *which situation* the appliance is in, in the
     same words the status strip uses.  This table says *which files*, by
     absolute path, which the row may not carry: the strip is reachable by
     anyone on the LAN and ``doctor`` is not, and the resolved path is the half
-    an operator needs to act (D-14).
+    an operator needs to act.
 
     ``doctor`` is what gets run on a machine where the log is not to hand, so
     the table is printed on every run and not only when something is wrong --
@@ -717,6 +961,30 @@ class TestDoctorConfigResolutionTable:
             str(candidate.absolute()) for candidate in candidates
         ]
 
+    def test_a_candidate_in_a_deleted_working_directory_says_why_it_was_not_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A removed working directory leaves the first candidate unanchored.
+
+        It is listed as spelled, with the reason, and the table goes on to the
+        file that did load instead of failing to name the missing directory.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[1].write_text("# the per-user file\n")
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        monkeypatch.chdir(gone)
+        gone.rmdir()
+        discovery = discover_config((Path(CONFIG_FILENAME), *candidates[1:]))
+
+        lines = self._run(monkeypatch, tmp_path, discovery)
+
+        assert lines[0] == (
+            f"not found {CONFIG_FILENAME} (the working directory no longer exists)"
+        )
+        assert lines[1] == f"used {candidates[1]}"
+
     def test_a_candidate_that_does_not_exist_says_not_found(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -742,7 +1010,7 @@ class TestDoctorConfigResolutionTable:
     def test_a_stale_only_search_lists_the_old_name_as_ignored(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The 2026-09-22 failure, named: the file is there and nothing read it."""
+        """A lone superseded-name file is listed as ignored: it is there, unread."""
         candidates = _candidates(tmp_path)
         stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
         stale.write_text("# left behind\n")
@@ -756,7 +1024,7 @@ class TestDoctorConfigResolutionTable:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        D-17's Docker shape: the new file loaded and the old one is still there.
+        The new file loaded and the old one beside it is listed as a leftover.
 
         It is a different sentence from the stale-only one because it is a
         different situation -- nothing is broken, and the old file may still
@@ -796,6 +1064,42 @@ class TestDoctorConfigResolutionTable:
         lines = self._run(monkeypatch, tmp_path, discover_config(()))
         assert lines == ["none recorded"]
 
+    def test_doctor_lists_one_file_seen_twice_as_the_same_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Run from inside the XDG directory, ``./saneless.toml`` is the XDG file.
+
+        One file reached through two candidates is one file: listed once as
+        used, and once more as the same file, so the table neither claims a
+        second file was not read nor that the path held nothing.  Nothing is
+        amiss, so the Configuration row stays quiet as well.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[1].write_text("# in use\n")
+        monkeypatch.chdir(candidates[1].parent)
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(
+            (Path(CONFIG_FILENAME), candidates[1], candidates[2])
+        )
+        runner = _patch_doctor(monkeypatch, settings)
+        monkeypatch.setattr(
+            "saneless.cli.run_checks",
+            lambda context: _all_ok_but_real_configuration(context.settings),
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        lines = _table(result.output)
+        assert lines == [
+            f"used {candidates[1]}",
+            f"same file {candidates[1]} (already listed)",
+            f"not found {candidates[2]}",
+        ]
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert not configuration.startswith(_state_marker(CheckState.WARN))
+
     def test_the_paths_line_up_under_one_label_column(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -824,7 +1128,7 @@ class TestDoctorConfigResolutionTable:
 
 class TestDoctorExitsOnTheConfigurationRow:
     """
-    D-05/D-07: the config situation decides the gate, like every other row.
+    The config situation decides the gate, like every other row.
 
     A lone superseded-name file is red because nothing the operator wrote was
     read; no file at all is amber because configuring saneless entirely through
@@ -836,7 +1140,11 @@ class TestDoctorExitsOnTheConfigurationRow:
     def test_a_stale_only_config_exits_two_through_the_real_registry(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Unstubbed, so the wiring from the recording to the gate is under test."""
+        """
+        A lone superseded-name file exits 2 through the real registry.
+
+        Unstubbed, so the wiring from the recording to the gate is under test.
+        """
         candidates = _candidates(tmp_path)
         stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
         stale.write_text("# left behind\n")
@@ -853,6 +1161,43 @@ class TestDoctorExitsOnTheConfigurationRow:
         assert configuration.startswith(_state_marker(CheckState.FAIL))
         assert f"saneless now reads {CONFIG_FILENAME}" in configuration
         assert str(stale.absolute()) in result.output
+
+    def test_doctor_warns_on_a_shadowed_config_and_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Two config files are amber, named on the row, in the table and on stderr.
+
+        Amber and not red: the appliance runs on the file it found first, and a
+        second file may be deliberate.  So a scripted gate stays green while
+        every terminal surface says which file won.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[0].write_text("# in use\n")
+        candidates[2].write_text("# not read\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(candidates)
+        runner = _patch_doctor(monkeypatch, settings)
+        monkeypatch.setattr(
+            "saneless.cli.run_checks",
+            lambda context: _all_ok_but_real_configuration(context.settings),
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert configuration.startswith(_state_marker(CheckState.WARN))
+        table = _table(result.stdout)
+        assert f"used {candidates[0]}" in table
+        assert f"not used {candidates[2]} (an earlier file won)" in table
+        warnings = [
+            line for line in result.stderr.splitlines() if line.startswith("Warning: ")
+        ]
+        assert len(warnings) == 1, result.stderr
+        assert warnings[0].startswith(f"Warning: Using {candidates[0]}")
+        assert str(candidates[2]) in warnings[0]
 
     def test_no_config_file_at_all_still_exits_zero(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -878,15 +1223,14 @@ class TestDoctorExitsOnTheConfigurationRow:
 
 class TestASkippedRowIsNotAPassingRow:
     """
-    R3-WR-03, the CLI half: ``[ OK ]`` is the token a reader scans for as "fine".
+    A skipped row never prints ``[ OK ]``, the token a reader scans for as "fine".
 
     ``_scanner_skipped`` and ``_scanner_busy`` return ``CheckState.OK`` with
-    ``skipped`` set, so a marker derived from the state alone prints
-    ``[ OK ] Scanner  Not checked while a scan is running.`` -- a captured
-    transcript that says a probe passed when none was taken.  The marker is
-    wired even though no current ``doctor`` invocation can produce the row,
-    because D-02's claim is that one registry feeds both surfaces and a surface
-    that would mis-render a row the registry can build is a latent divergence.
+    ``skipped`` set, so a marker derived from the state alone would print
+    ``[ OK ] Scanner  Not checked while a scan is running.`` -- a transcript
+    that says a probe passed when none was taken.  No ``doctor`` invocation
+    produces the row, but one registry feeds both surfaces, and a surface that
+    would mis-render a row the registry can build is a latent divergence.
     """
 
     @pytest.mark.parametrize("state", list(CheckState))
@@ -938,8 +1282,8 @@ class TestASkippedRowIsNotAPassingRow:
         result = runner.invoke(cli, ["doctor"])
         lines = _rows(result.output)
         assert len(lines) == len(CheckKey)
-        # Found by key, not by position: the Scanner row stopped being the
-        # first one the day Configuration was inserted above it.
+        # Found by key, not by position, so a row inserted above Scanner
+        # cannot move the assertion onto another row.
         skipped = list(CheckKey).index(CheckKey.SCANNER)
         assert lines[skipped].startswith(f"{_SKIPPED_MARKER} ")
         assert not lines[skipped].startswith(_state_marker(CheckState.OK))
@@ -953,12 +1297,11 @@ class TestASkippedRowIsNotAPassingRow:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        D-01: a probe nobody took is not a red appliance.
+        A probe nobody took is not a red appliance, so the gate stays green.
 
-        The state stays ``OK`` for exactly this reason, so wiring the marker
-        must not have moved the exit-code rule -- a scripted health gate that
-        went red for the duration of every scan is what the flag exists to
-        avoid.
+        The state stays ``OK`` for exactly this reason, whatever the marker
+        prints -- a scripted health gate that went red for the duration of
+        every scan is what the flag exists to avoid.
         """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _one_skipped_scanner())
@@ -984,17 +1327,28 @@ class TestDoctorUsesTheRealRegistry:
     def test_a_placeholder_token_exits_two_and_names_the_row(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """APPL-01/D-14: an unset token is a red appliance, with no HTTP request."""
+        """An unset token is a red appliance, reported with no HTTP request."""
         settings = _make_settings(tmp_path, token="changeme")
         runner = _patch_doctor(monkeypatch, settings)
         result = runner.invoke(cli, ["doctor"])
         assert result.exit_code == ExitCode.CONFIG
         assert "The paperless-ngx API token has not been set." in result.output
 
+    def test_an_unset_url_is_named_not_reported_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An empty ``paperless.url`` is a setting to fill in, not a network fault."""
+        settings = _make_settings(tmp_path, url="")
+        runner = _patch_doctor(monkeypatch, settings)
+        result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == ExitCode.CONFIG
+        assert "The paperless-ngx address has not been set." in result.output
+        assert "Could not reach paperless-ngx" not in result.output
+
     def test_the_token_value_is_never_printed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """ASVS V7: a report that reads secrets must not print them."""
+        """The token's value never appears in the report that reads it."""
         secret = "super-secret-token-value"
         settings = _make_settings(tmp_path, token=secret)
         runner = _patch_doctor(monkeypatch, settings)
@@ -1013,14 +1367,36 @@ class TestDoctorUsesTheRealRegistry:
         assert len(rows) == len(CheckKey)
         assert "Connected to paperless-ngx." in result.output
 
+    def test_multiple_devices_without_a_pin_warn_and_exit_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An ambiguous scanner choice is a WARN row, and a WARN passes the gate."""
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        settings.scanner.device = ""
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=_TwoScanners)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        scanner_rows = [
+            line
+            for line in _lines(result.output)
+            if line.startswith(_state_marker(CheckState.WARN))
+            and check_name(CheckKey.SCANNER) in line
+        ]
+        assert len(scanner_rows) == 1
+        assert "2 scanners are visible and none is chosen." in scanner_rows[0]
+        assert "epson:001" not in result.output
+        assert "hp:002" not in result.output
+
 
 class TestDoctorWithoutPythonSane:
-    """Amendment A-1: the machine that most needs a diagnosis still gets one."""
+    """``doctor`` prints every row on a machine without python-sane."""
 
     def test_doctor_never_calls_require_sane(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """``scan``'s first statement is exactly what ``doctor`` must not copy."""
+        """``doctor`` never calls ``require_sane``, which ``scan`` calls first."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
@@ -1053,12 +1429,12 @@ class TestDoctorWithoutPythonSane:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        ``SaneBackend`` reports the missing import as ``ConfigError``, not ``ImportError``.
+        A missing import reported as ``ConfigError`` is still one row among the rest.
 
         ``require_sane`` translates the ``ImportError`` into a ``ConfigError``
         before ``SaneBackend.__init__`` returns, so catching only ``ImportError``
         would let the guard print ``scan``'s refusal line and exit 2 with no
-        rows at all -- which is the exact behaviour Amendment A-1 forbids.
+        rows at all.
         """
 
         class _RefusingBackend:
@@ -1092,7 +1468,8 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         ``PaperlessClient.__init__`` raises ``PaperlessError`` for a URL httpx2
         will not parse, which the group guard would turn into exit 3 -- a code
         ``doctor``'s documented table does not list, and a refusal that would
-        cost the operator the other four rows.
+        cost the operator the other five rows.  The row it becomes names the
+        two settings the client refused, not an address that answered wrongly.
         """
 
         class _UnbuildablePaperless:
@@ -1109,7 +1486,14 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         result = runner.invoke(cli, ["doctor"])
         rows = [line for line in _lines(result.output) if line.startswith("[")]
         assert len(rows) == len(CheckKey)
-        assert "The paperless-ngx API was not found at that URL." in result.output
+        assert "not found at that URL" not in result.output
+        assert (
+            connection_status_message(ConnectionStatus.MISCONFIGURED) in result.output
+        )
+        assert (
+            f"{_NEXT_STEP_INDENT}Correct paperless.url and paperless.token in the "
+            "saneless config file, then restart saneless.\n"
+        ) in result.output
         assert result.exit_code == ExitCode.CONFIG
 
 
@@ -1117,17 +1501,12 @@ class TestProfilesRowAgreement:
     """
     ``doctor`` and a started ``ScanWorker`` give the Profiles row one answer.
 
-    D-02 promises the two surfaces report the same checks in the same words,
-    and ``profile_storage`` is the one field ``checks.py`` is handed rather than
-    computing for itself. CR-01 was that field derived twice, with only one copy
-    correct: ``doctor`` printed ``[ OK ] Profiles  2 scan profiles configured.``
-    while the status strip printed a permanent amber "Generated in memory -- no
-    configuration file is in use, so they are lost on restart", for one machine,
-    at the same moment.
-
-    The rendered ``CheckResult`` is compared rather than the enum alone,
-    because the promise is about the words a household member reads. The enum
-    is compared too, so a failure says which half of the contract broke.
+    ``profile_storage`` is the one field ``checks.py`` is handed rather than
+    computing for itself, so two derivations of it could put a green row in
+    the terminal and an amber one on the status strip for the same machine.
+    The rendered ``CheckResult`` is compared, because the promise is about the
+    words a household member reads, and the enum too, so a failure says which
+    half of the contract broke.
     """
 
     @staticmethod
@@ -1159,7 +1538,7 @@ class TestProfilesRowAgreement:
                 context: What ``doctor`` built.
 
             Returns:
-                One OK result per check, so D-01's exit code stays 0.
+                One OK result per check, so the exit code stays 0.
 
             """
             captured.append(context)
@@ -1236,7 +1615,7 @@ class TestProfilesRowAgreement:
 
         The settings are taken out of the bare default, which is what every
         deployment looks like once ``saneless auto-profiles`` has written the
-        file once -- and the exact shape that made the strip lie.
+        file once.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1268,7 +1647,7 @@ class TestProfilesRowAgreement:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        The row CR-01 got wrong, named rather than merely agreed upon.
+        A loaded config file is the green Profiles row on both surfaces.
 
         Two surfaces can agree and both be wrong, so the value itself is
         pinned: a config file is in use, and the row must say so.
@@ -1294,12 +1673,11 @@ class TestProfilesRowAgreement:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A third copy of the rule has nowhere to hide.
+        ``doctor`` derives the Profiles storage through the shared function.
 
         Agreement alone would still be satisfied by two hand-written
-        conditionals that happen to match today, which is exactly the shape
-        CR-01 grew out of. This asserts the call, so the rule can only be
-        changed in one place.
+        conditionals that happen to match, so this asserts the call, and the
+        rule can only be changed in one place.
         """
         settings = _make_settings(tmp_path)
         config_path = tmp_path / "saneless.toml"
@@ -1325,3 +1703,449 @@ class TestProfilesRowAgreement:
 
         assert seen == [settings]
         assert storage is ProfileStorage.PERSISTED
+
+
+class TestDoctorNamesItsOwnRetry:
+    """
+    One check row, two endings: doctor never tells a terminal to press a button.
+
+    The strip's next steps end in "press Check again", the button beside them.
+    ``saneless doctor`` prints the same rows, and in a terminal that advice
+    points at nothing, so its rows end in "run saneless doctor again" instead.
+    Each case drives the real registry through a failing or warning row.
+    """
+
+    @pytest.mark.parametrize(
+        ("scanner_cls", "paperless_cls", "expected"),
+        [
+            pytest.param(
+                _WrongScanner,
+                _ConnectedPaperless,
+                "Check it is switched on and connected, then run saneless doctor "
+                "again. If saneless devices does not list it, set [scanner] "
+                "device to one it lists, then restart saneless.",
+                id="scanner-not-found",
+            ),
+            pytest.param(
+                _ListingTimesOut,
+                _ConnectedPaperless,
+                "Check the scanner, and its scanner host if it has one, are "
+                "switched on and reachable, then run saneless doctor again.",
+                id="listing-timed-out",
+            ),
+            pytest.param(
+                _ListingCrashes,
+                _ConnectedPaperless,
+                "Run saneless doctor again.",
+                id="listing-crashed",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _UnreachablePaperless,
+                "Check paperless-ngx is running and on the network, then run "
+                "saneless doctor again.",
+                id="paperless-unreachable",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _FailingPaperless,
+                "Check paperless-ngx is healthy, then run saneless doctor again.",
+                id="paperless-500",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _RaisingPaperless,
+                "Restart saneless, then run saneless doctor again.",
+                id="check-raised",
+            ),
+        ],
+    )
+    def test_doctor_never_names_the_web_button(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        scanner_cls: type,
+        paperless_cls: type,
+        expected: str,
+    ) -> None:
+        """
+        The row's next step ends in re-running doctor, and no line says Check again.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            scanner_cls: Stands in for ``SaneBackend``.
+            paperless_cls: Stands in for ``PaperlessClient``.
+            expected: The next step doctor prints for the row that is not green.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(
+            monkeypatch,
+            settings,
+            scanner_cls=scanner_cls,
+            paperless_cls=paperless_cls,
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert "Check again" not in result.output
+        assert "saneless doctor again" in result.output
+        assert f"{_NEXT_STEP_INDENT}{expected}\n" in result.output, result.output
+
+
+def _row_and_step(output: str, key: CheckKey) -> tuple[str, str]:
+    """
+    Find one check's row line and the line printed under it.
+
+    Args:
+        output: The captured command output.
+        key: The check wanted.
+
+    Returns:
+        The row line, and the line after it (its next step, when it has one).
+
+    """
+    lines = _rows(output)
+    index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("[")
+        and line[_MARKER_WIDTH + 1 :].startswith(check_name(key))
+    )
+    following = lines[index + 1] if index + 1 < len(lines) else ""
+    return lines[index], following
+
+
+class TestDoctorNamesEachConfigurationFault:
+    """
+    Each reason doctor could not build a client or a backend is its own row.
+
+    An unreadable TLS trust store is not "not found at that URL", and a
+    scanner library that will not start is not "not installed": either wording
+    would send the reader to fix something that is not broken.  The scanner's
+    start failure is reported by the listing child that tried to start it.
+    """
+
+    def test_an_unreadable_trust_store_is_named(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The real client refuses the trust store, and the row says so.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-bundle.pem"))
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path), paperless_cls=PaperlessClient
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, step = _row_and_step(result.output, CheckKey.PAPERLESS)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "trust store" in row
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert "SSL_CERT_FILE" in step
+        assert "SSL_CERT_DIR" in step
+        assert "not found at that URL" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            (
+                FakeSaneError("Error during device I/O"),
+                "Scanner support could not be started.",
+            ),
+            (
+                ImportError("libsane.so.1: cannot open shared object file"),
+                "Scanner support is not installed on this machine.",
+            ),
+        ],
+        ids=["init", "import"],
+    )
+    def test_a_child_init_failure_shows_would_not_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        error: Exception,
+        message: str,
+    ) -> None:
+        """
+        The Scanner row reports what the listing child saw when SANE started.
+
+        Building the backend starts nothing, so a SANE that will not start is
+        found by the child the check runs, and both surfaces read its report:
+        ``doctor`` and the web path, which runs the same checks under the
+        scanner gate.  An import failure in the child is "not installed"; any
+        other start failure is its own row, whose next step points at the log
+        line the backend wrote with the reason.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            caplog: pytest's log capture.
+            error: What the child's SANE start raised.
+            message: The row that failure must give.
+
+        """
+        broken = FakeSaneModule(init_error=error)
+        monkeypatch.setattr(scan_session_mod, "sane", broken)
+        settings = _make_settings(tmp_path)
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=SaneBackend)
+
+        with caplog.at_level("INFO"):
+            result = runner.invoke(cli, ["doctor"])
+
+        row, step = _row_and_step(result.output, CheckKey.SCANNER)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert message in row, result.output
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert "Check again" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+        if isinstance(error, FakeSaneError):
+            assert "not installed" not in result.output
+            assert "Install saneless" not in step
+            assert "log" in step
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelname == "WARNING"
+        ]
+        assert f"The scanner library could not be started: {error}" in warnings, (
+            warnings
+        )
+        # Building the backend made no SANE call in this process.
+        assert broken.init_call_count == 0
+
+        web = run_checks(
+            CheckContext(
+                settings=settings,
+                scanner=SaneBackend(),
+                paperless=None,
+                profile_storage=ProfileStorage.PERSISTED,
+            ),
+            scanner_gate=threading.Lock(),
+        )
+        web_row = next(found for found in web if found.key is CheckKey.SCANNER)
+        assert web_row.state is CheckState.FAIL
+        assert web_row.message == message
+
+
+_REDIRECT_TARGET = "https://paperless.example/"
+
+
+class _RedirectedPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test is answered with a redirect."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that answered from another address.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.REDIRECTED`` probe naming where it pointed.
+
+        """
+        return ConnectionProbe(
+            ConnectionStatus.REDIRECTED, redirect_target=_REDIRECT_TARGET
+        )
+
+
+def _unwritable(folder: Path) -> Path:
+    """
+    Create ``folder`` and take its write bit away.
+
+    Skips the test as root, which can write to any folder whatever its mode.
+
+    Args:
+        folder: The folder to create.
+
+    Returns:
+        The folder.
+
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can write to a folder whatever its mode")
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o555)
+    return folder
+
+
+class TestDoctorReportsWhatItFinds:
+    """
+    doctor always prints its six rows, and the terminal gets the detail.
+
+    A folder start-up would refuse is one of the things doctor checks, so it
+    is a row rather than a refusal with no rows.  Where paperless-ngx
+    redirected to is printed under its row, because this is a terminal on the
+    machine; the status strip, which anyone on the LAN can load, never shows
+    it.
+    """
+
+    def test_doctor_prints_the_redirect_target(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The sanitised redirect target is on an indented line under the row.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        runner = _patch_doctor(
+            monkeypatch,
+            _make_settings(tmp_path),
+            paperless_cls=_RedirectedPaperless,
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        row, detail = _row_and_step(result.output, CheckKey.PAPERLESS)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert _REDIRECT_TARGET not in row
+        assert detail.startswith(_NEXT_STEP_INDENT), result.output
+        assert _REDIRECT_TARGET in detail, result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_an_unwritable_consume_folder_is_a_row_not_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Start-up's directory refusal does not stop doctor printing its rows.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        consume = _unwritable(tmp_path / "consume")
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path, consume_dir=str(consume))
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, _step = _row_and_step(result.output, CheckKey.FALLBACK)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "consume_dir is not writable" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_a_shared_tmp_dir_is_a_data_folder_row(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A working folder others can write to is the Data folder row.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings.output.tmp_dir.chmod(0o777)
+        runner = _patch_doctor(monkeypatch, settings)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, _step = _row_and_step(result.output, CheckKey.DATA_DIR)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "output.tmp_dir" in row
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_other_commands_still_refuse_an_unwritable_folder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Only doctor reports the folder as a row; ``jobs`` still refuses to start.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        consume = _unwritable(tmp_path / "consume")
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path, consume_dir=str(consume))
+        )
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert "consume_dir is not writable" in result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+
+class TestAnUnansweredScannerHostIsAWarning:
+    """
+    A scanner host that does not answer is amber, and doctor exits 0 for it.
+
+    The check stops before it asks SANE for scanners, so it cannot say none
+    would be found; that is a warning even when the host is the only one
+    configured.  A script that needs a scanner asks ``saneless devices``.
+    """
+
+    def test_a_sole_unanswered_scanner_host_warns_and_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The only configured host timing out is a WARN row and exit 0.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        settings.scanner = ScannerConfig(device="epson:001", host="scanner.lan")
+        probed: list[str] = []
+
+        def _silent(
+            host: str,
+            port: int,
+            connect_timeout: float,
+            handshake_timeout: float,
+            abort: threading.Event | None = None,
+        ) -> SanedOutcome:
+            """
+            Report every host as one that never answered.
+
+            Args:
+                host: The host probed.
+                port: Its port.
+                connect_timeout: Unused.
+                handshake_timeout: Unused.
+                abort: Unused; ``doctor`` passes none.
+
+            Returns:
+                ``TIMED_OUT``.
+
+            """
+            probed.append(f"{host}:{port}")
+            return SanedOutcome.TIMED_OUT
+
+        monkeypatch.setattr("saneless.scanner.saned_probe.probe_saned", _silent)
+        runner = _patch_doctor(monkeypatch, settings)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert probed, "the scanner host was never probed"
+        row, step = _row_and_step(result.output, CheckKey.SCANNER)
+        assert row.startswith(_state_marker(CheckState.WARN)), row
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert result.exit_code == 0, result.output

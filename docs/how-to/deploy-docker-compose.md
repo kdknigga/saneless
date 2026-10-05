@@ -5,7 +5,7 @@ Run saneless alongside paperless-ngx using Docker Compose -- the most common hom
 ## What you'll need
 
 - Docker and Docker Compose installed on your host
-- A running paperless-ngx instance, reachable from this host. This guide covers the saneless side only; stand paperless-ngx up from [its own compose files](https://docs.paperless-ngx.com/setup/) first
+- A running paperless-ngx instance, reachable from this host: paperless-ngx 2.16 or later, which speaks API version 9 or 10. An older paperless-ngx refuses every upload with `406`, and the status strip reports `incompatible_version`. This guide covers the saneless side only; stand paperless-ngx up from [its own compose files](https://docs.paperless-ngx.com/setup/) first
 - A paperless-ngx API token (generate one in paperless-ngx under Settings > API Tokens)
 - For network scanners: the scanner's IP address
 
@@ -22,22 +22,19 @@ Then create `config/saneless.toml` with your paperless-ngx connection details:
 ```toml
 [paperless]
 url = "http://paperless:8000"
-token = "your-paperless-api-token"
-
-[profiles.default]
-source = "Flatbed"
-resolution = 300
-mode = "Color"
+token = "your-api-token-here"
 ```
 
+Leave the scan profiles out. When the file holds none, saneless [generates profiles at startup](configure-scan-profiles.md#generation-at-server-startup) from what the scanner reports and writes them into this file; `docker compose exec saneless saneless auto-profiles` does the same on demand once the container is running. A hand-written `[profiles.default]` turns off that generation at startup.
+
 !!! note
-    The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts; it does not create the file for you. The directory must be writable, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there once it exists. Neither one creates it. Without `saneless.toml`, the server keeps the profiles it generates in memory only, and `docker compose exec saneless saneless auto-profiles` writes `/var/lib/saneless/saneless.toml` (the image's working directory is the durable data directory, so `./saneless.toml` resolves there) instead of anything in `./config`. That file sits in the data volume, so it survives container recreation -- and saneless loads it ahead of any `saneless.toml` you add later, which means it goes on shadowing your real config until you delete it. So before you run `auto-profiles` in the container, create the file with `touch config/saneless.toml` (an empty file is a valid config). Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
+    The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts. The directory must be writable by the container, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there. With no `saneless.toml`, `docker compose exec saneless saneless auto-profiles` creates `/etc/saneless/saneless.toml` in the mounted `./config` directory, because that directory exists and the container can write to it; you do not need to create the file first. The new file has mode `0600`, and when the command runs as root it is given the directory's owner. The profile generation at startup never creates the file: without `saneless.toml`, the server keeps the profiles it generates in memory only. If the container cannot write to `./config`, `auto-profiles` does not fall back to the data volume. It tries the per-user file under the container user's home instead, which the image does not provide, and exits 2 naming it and saying why `/etc/saneless` was passed over: `mounted read-only` means the volume line ends in `:ro`, so remove it; `not writable by this user` means fix the ownership as the next note describes. Then run it again. Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
 
 !!! note "If your user ID is not 1000"
-    The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once:
+    The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once. Only root can give a file to another user, so this needs `sudo`; a plain `chown` fails with `Operation not permitted`:
 
     ```bash
-    chown -R 1000:1000 ./config
+    sudo chown -R 1000:1000 ./config
     ```
 
     A bind mount keeps the host's ownership -- unlike the named data volume, which inherits 1000 from the image -- so without this the container cannot rewrite `saneless.toml`, and saving a generated profile fails. The alternative is the commented `user:` line in the compose file below, which runs the container as your UID instead.
@@ -52,15 +49,16 @@ This file defines saneless and nothing else. paperless-ngx is stood up from its 
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
     ports:
       - "8080:8080"
     # The image already runs as UID/GID 1000, so on a single-user Linux host --
     # where ./config is 1000:1000 because you created it -- this needs no
     # action and stays commented. Uncomment and edit it only if your own UID
-    # differs, or run `chown -R 1000:1000 ./config` once instead. A literal,
-    # not "${UID}:${GID}": compose does not populate UID unless your shell
-    # exports it, and the silent fallback is a container that will not start.
+    # differs, or run `sudo chown -R 1000:1000 ./config` once instead. A
+    # literal, not "${UID}:${GID}": compose does not populate UID unless your
+    # shell exports it, and the silent fallback is a container that will not
+    # start.
     # user: "1000:1000"
     volumes:
       - ./config:/etc/saneless
@@ -81,9 +79,13 @@ services:
       - TZ=America/Chicago
       # The paperless URL and token are NOT set here on purpose: anything set
       # here overrides saneless.toml silently. See below.
-      # Uncomment for network scanners:
+      # Required: uncomment and set to the machine running saned, even when
+      # that is this Docker host. See "Scanner host" below.
       # - SANELESS_SCANNER__HOST=192.168.1.50
     restart: unless-stopped
+    # Time for a stopped scan's pages to be copied into failed/ before Docker
+    # kills saneless. See "Stopping and restarting" below.
+    stop_grace_period: 90s
 
 volumes:
   saneless-data:
@@ -105,15 +107,36 @@ volumes:
 
 Key details:
 
-- **Image:** `ghcr.io/kdknigga/saneless:latest` includes `libsane` and handles `python-sane` compilation automatically
+- **Image:** `ghcr.io/kdknigga/saneless:0.2.0-rc.7` ships with `libsane` and a prebuilt `python-sane`; nothing compiles at run time
 - **Port 8080:** The saneless web UI
 - **One place for the token:** the paperless-ngx URL and token live in `config/saneless.toml`, and this compose file deliberately sets neither. **An environment variable overrides the config file**, silently: set `SANELESS_PAPERLESS__TOKEN` here and saneless uses that value and ignores the one in `saneless.toml`. If it is a placeholder, or empty, saneless shows the status strip red and refuses to scan, and the token you carefully put in `saneless.toml` has nothing to do with it. Leave the block commented and edit the file
 - **`TZ`:** a container's clock reports UTC. Without `TZ`, every timestamp saneless displays -- the job history, `saneless jobs`, and the fallback title it gives a document in paperless-ngx -- is UTC rather than your local time. It is a standard container variable, not a saneless setting
 - **Consume mount (optional):** a directory both stacks can see is the [consume-directory fallback](../explanation/consume-directory-fallback.md). Create the shared volume with `docker volume create paperless-consume`, uncomment the mount and the external `volumes:` entry here, mount the same volume at paperless-ngx's consumption directory on its side, and set `consume_dir = "/consume"` under `[paperless]` in `saneless.toml`. Mounting without setting `consume_dir` does nothing
-- **Config mount:** `./config:/etc/saneless` -- a read-write directory mount. saneless replaces `saneless.toml` atomically (it writes a temp file in the same directory, then renames it over the original). A single-file bind mount makes that rename fail with EBUSY, and saneless reports "Mount its directory instead"
-- **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
+- **Config mount:** `./config:/etc/saneless` -- a read-write directory mount. saneless replaces `saneless.toml` atomically (it writes a temp file in the same directory, then renames it over the original). A single-file bind mount makes that rename fail with EBUSY; see [Moving from a single-file config mount](#moving-from-a-single-file-config-mount)
+- **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image sets `XDG_STATE_HOME=/var/lib`, so its defaults put the job database, `failed/` and the log of one-shot commands such as `saneless jobs` under `/var/lib/saneless`, and mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
 - **Reaching paperless-ngx:** the two stacks are separate compose projects, so each gets its own network and the name `paperless` does not resolve from here on its own. Either join the paperless-ngx network -- uncomment both `networks:` blocks above, after checking the real name with `docker network ls` -- and keep `url = "http://paperless:8000"`, or leave the networks alone and point `url` at the host the paperless-ngx stack publishes on, such as `http://192.168.1.10:8000`. Whichever you pick, the URL has to resolve from *inside* the saneless container: `localhost` there is the container itself, not your host
-- **Network scanners:** Set `SANELESS_SCANNER__HOST=192.168.1.50` to discover scanners on a remote host. See [Scanner Host Discovery](scanner-host-discovery.md) for details
+- **Scanner host (required):** uncomment `SANELESS_SCANNER__HOST` and set it to the machine running `saned`. A container reaches every scanner over the SANE network protocol and the image's `net.conf` is empty, so without it saneless finds no scanner at all -- even one plugged into the Docker host itself. For a `saned` on the Docker host, set it to `host.docker.internal` and add `extra_hosts: ["host.docker.internal:host-gateway"]` to the service, as [Which setup do I have?](../getting-started/which-setup.md) shows. See [Scanner Host Discovery](scanner-host-discovery.md) for details
+
+### Moving from a single-file config mount
+
+saneless writes `saneless.toml` by renaming a new file over it, so it needs the
+whole `/etc/saneless` directory mounted. If you mount `saneless.toml` by itself
+onto `/etc/saneless/saneless.toml`, every profile write fails: a writable
+single-file mount makes the rename fail with EBUSY, and a read-only one is
+refused before anything is written. Either way saneless reports:
+
+```text
+Cannot replace /etc/saneless/saneless.toml: it is bind-mounted as a single file. Mount its directory instead (see https://kdknigga.github.io/saneless/how-to/deploy-docker-compose/#moving-from-a-single-file-config-mount).
+```
+
+`saneless auto-profiles` exits with status 2. The server logs a warning and uses
+the generated profiles for that run only, so they are gone after a restart.
+Mount the directory instead:
+
+1. Stop the stack: `docker compose down`
+2. Move the file into a directory: `mkdir config && mv saneless.toml config/saneless.toml`
+3. In `docker-compose.yml`, change the volume line to `- ./config:/etc/saneless`
+4. Start the stack: `docker compose up -d`
 
 ## Step 3: Start saneless
 
@@ -132,32 +155,29 @@ curl http://localhost:8080/health
 Expected response:
 
 ```json
-{"status": "ok"}
+{"status":"ok"}
 ```
 
 Then open the web UI at `http://localhost:8080` in your browser. You should see the scan interface with your configured profiles.
 
 ## Environment variable configuration
 
-You can configure saneless entirely through environment variables using the `SANELESS_` prefix with `__` as the nested delimiter. This is useful when you prefer not to mount a config file:
-
-!!! warning "An environment variable overrides `saneless.toml`"
-    Environment variables sit above the config file, so a variable set in your compose file wins over the same setting in `config/saneless.toml` -- silently, with nothing in the UI to say where the value came from. That is why the example above sets the paperless-ngx connection in the file and not here. Pick one place per setting; for the token, make it `config/saneless.toml`.
-
-| Setting | Environment Variable |
-|---|---|
-| Paperless URL | `SANELESS_PAPERLESS__URL` |
-| Paperless token | `SANELESS_PAPERLESS__TOKEN` |
-| Scanner host | `SANELESS_SCANNER__HOST` |
-| Log level | `SANELESS_OUTPUT__LOG_LEVEL` |
-
-See [Environment Variables](../reference/environment-variables.md) for the full list.
+`SANELESS_SCANNER__HOST` belongs in the `environment:` block, as in the compose file above. Keep the paperless-ngx URL and token in `./config/saneless.toml` instead, because a variable that is set silently overrides the file. [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings) gives the order, and [Environment Variables](../reference/environment-variables.md) lists every variable.
 
 ## Running behind a reverse proxy
 
-saneless rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
+saneless answers only requests whose `Host` names it (see [Host check](../reference/web-api.md#host-check)), and it rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
 
-**Have the proxy pass the original `Host` header, or set `X-Forwarded-Host`, whatever the scheme.** When the browser sends no `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. Browsers never send `Sec-Fetch-Site` over plain HTTP, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it over HTTPS either. Behind an HTTPS proxy, current browsers do send it and saneless decides from that header alone, so HTTPS usually works without this step, but an older browser is then rejected. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
+**Add the proxy's public name to `[web] allowed_hosts`.** A proxy that passes the original `Host` header, as described next, sends saneless the name the browser used, such as `scan.example.com`. saneless answers to IP addresses, names without a dot, and names under `.local`, `.home.arpa`, `.internal` and `.lan` without configuration; any other name gets `421` with "saneless does not answer to this address." until you list it:
+
+```toml
+[web]
+allowed_hosts = ["scan.example.com"]
+```
+
+or `SANELESS_WEB__ALLOWED_HOSTS='["scan.example.com"]'` in the environment. A leading-dot entry such as `.example.com` covers that domain and every name under it, so use one only for a domain you control. For a dynamic DNS name, write your own full name, such as `me.duckdns.org`. Never write the shared suffix `.duckdns.org` or a registry suffix such as `.co.uk`: anybody can register a name under those and use it to reach saneless through DNS rebinding. See [Allowed host names](../reference/configuration.md#allowed-host-names).
+
+**Have the proxy pass the original `Host` header, whatever the scheme.** This is required, and setting `X-Forwarded-Host` instead is not a substitute. saneless never trusts `X-Forwarded-Host`, so a proxy that replaces `Host` with its upstream's name, such as `saneless:8080`, sends a name saneless always answers to. That turns the Host check off for every request through the proxy, DNS rebinding included, and no request is ever refused to tell you so. saneless logs a warning, at most once an hour, when it sees a `Host` beside an `X-Forwarded-Host` that names another host. When the browser sends no `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. Browsers never send `Sec-Fetch-Site` over plain HTTP, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it over HTTPS either. Behind an HTTPS proxy, current browsers do send it and saneless decides from that header alone, so HTTPS usually works without this step, but an older browser is then rejected. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
 
 ```nginx
 location / {
@@ -177,7 +197,7 @@ Other proxies:
 
 ### Answering only your own hostname
 
-The cross-site check cannot stop a DNS rebinding attack, in which a hostile site makes its own hostname resolve to saneless's address (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A proxy that answers only saneless's hostname closes that gap, because a rebinding page's requests carry the hostile hostname in `Host`. With nginx, add a default server that drops every other hostname:
+saneless itself refuses a DNS rebinding attack, in which a hostile site makes its own hostname resolve to saneless's address: the rebinding page's requests carry the hostile hostname in `Host`, and saneless answers them with `421` (see [Host check](../reference/web-api.md#host-check)). A proxy that answers only saneless's hostname adds a second layer in front of that check, as defence in depth. Its hostname still has to be in `[web] allowed_hosts`, as described above. With nginx, add a default server that drops every other hostname:
 
 ```nginx
 server {
@@ -196,189 +216,53 @@ server {
 }
 ```
 
-A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
+A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This layer protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
+
+## Stopping and restarting
+
+`docker compose stop`, `docker compose down`, `docker compose restart` and
+`docker compose up -d` after an upgrade all stop saneless the same way: Docker
+sends SIGTERM, waits for the container's grace period, and then kills it.
+
+What a stop keeps depends on where the scan is. A manual duplex job waiting
+at the flip prompt is interrupted at once and keeps its front sides as a
+`(fronts)` PDF in `failed/`, and the job records that the server restarted and
+names the file. A scan still reading pages -- pass A, pass B or a
+single-pass scan -- is stopped too: saneless asks the scanner's process to
+cancel, kills it if it has not ended within 10 seconds, and keeps the pages
+already received in `failed/`. saneless waits up to 5 seconds for the scan
+worker to finish, up to 12 seconds more while a scan's process is being
+stopped, and up to 60 seconds more only while it is writing pages into
+`failed/`.
+
+A job busy with anything else when those waits run out -- assembly or the
+upload -- is not interrupted. saneless exits under it, and its pages stay in the container's
+`/tmp`. The next start of the same container, after `docker compose restart`
+or `docker compose stop` and `start`, recovers them into `failed/`, but
+`docker compose up -d` recreates the container and they are lost. Let a scan
+finish before you stop or upgrade saneless.
+
+That copy can be slow. saneless spools pages under `/tmp` inside the
+container, and `failed/` is on the data volume: they are different
+filesystems, so keeping the pages means copying every one of them. Docker's
+default grace period is 10 seconds, which a large scan can outlast, and a copy
+that is killed half way is lost for good. `docker compose up -d` recreates the
+container and discards its `/tmp`, so the next start has nothing left to
+recover.
+
+The compose file above sets `stop_grace_period: 90s` for this reason. Keep it,
+or something at least as long, in your own compose file. If you run the image
+with `docker run` instead, pass the same budget as `--stop-timeout 90`.
 
 ## Updating
 
-Pull the latest image and recreate the container:
+The image in `docker-compose.yml` is pinned to a tag, so pulling again only
+fetches a newer image when that tag has moved. To move to another release,
+change the tag on the `image:` line to the release you want -- see
+[Image tags](../reference/docker.md#image-tags) for which tags exist and which
+of them move -- then pull it and recreate the container:
 
 ```bash
 docker compose pull saneless
 docker compose up -d
 ```
-
-### Upgrading from config.toml to saneless.toml
-
-Every container deployed from an earlier version of this guide holds
-`config/config.toml`, which saneless no longer reads: `saneless.toml` is now
-the one name it searches for, in every location. Rename the file:
-
-```bash
-mv config/config.toml config/saneless.toml
-```
-
-Then `docker compose up -d` to recreate the container.
-
-**The old name is not a fallback.** In every search location saneless reads
-`saneless.toml` and never `config.toml`, so until you rename the file your
-deployment runs on its defaults plus whatever the `environment:` block sets --
-which, if you followed this guide, is not the paperless-ngx connection.
-
-**You will not have to guess.** The status page's first row, Configuration, turns **red** and names both the `/etc/saneless/config.toml` it found and the `/etc/saneless/saneless.toml` rename that fixes it. `saneless doctor` shows the same row and exits 2.
-
-!!! warning "If you ran `auto-profiles` in the container before renaming"
-    With no config file loaded, `docker compose exec saneless saneless auto-profiles` writes `/var/lib/saneless/saneless.toml`, which sits in the data volume and loads ahead of `/etc/saneless`. Once that file exists the Configuration row is **amber** instead of red: a config file did load, and your `/etc/saneless/config.toml` is a leftover beside the loaded `/var/lib/saneless/saneless.toml`.
-
-    That leftover is probably the only copy of your paperless-ngx URL and token. **Move anything you still need into the file that is actually loaded first, and delete the leftover only afterwards.** Deleting it first throws the token away.
-
-**A `config.toml` that belongs to something else.** saneless searches its own working directory, so an unrelated tool's `config.toml` sitting there is reported in exactly the same way -- saneless reads only `saneless.toml` and cannot tell whose file it is. Move that file, or run saneless from a directory of its own.
-
-### Remove your own `SANELESS_PAPERLESS__TOKEN` line
-
-Earlier versions of this guide, and of the `docker-compose.yml` shipped in the
-repository, set the paperless-ngx connection in the `environment:` block:
-
-```yaml
-    environment:
-      # Delete both of these from your own compose file. `changeme` is one of
-      # the placeholder literals saneless now detects and refuses to scan with.
-      # - SANELESS_PAPERLESS__URL=http://paperless:8000
-      # - SANELESS_PAPERLESS__TOKEN=changeme
-```
-
-Those lines are in *your* compose file, and upgrading the image does not touch
-them. **Delete them.** An environment variable overrides `saneless.toml`, so
-while that line is there:
-
-- The token in `config/saneless.toml` is ignored, however correct it is.
-- If the value is a placeholder -- `changeme` is one of the literals saneless
-  now detects -- the status strip stays **red**, the Scan button stays
-  disabled, and `saneless scan` exits 2, no matter what you edit into the file.
-
-After deleting the lines, put the connection in `config/saneless.toml`:
-
-```toml
-[paperless]
-url = "http://paperless:8000"
-token = "your-paperless-api-token"
-```
-
-Then `docker compose up -d` to recreate the container, and check the status
-strip: the Paperless row turns green once the token is real and reachable.
-
-While you are there, add `TZ` to the `environment:` block if it is not already
-set. Without it the container reports UTC and every timestamp saneless shows is
-UTC rather than your local time.
-
-### Moving from a single-file config mount
-
-Earlier versions of this guide bind-mounted the host's config file by itself,
-read-only (`:ro`), onto `/etc/saneless/saneless.toml`. With that mount, every profile
-write fails. A writable single-file bind mount makes the rename fail with EBUSY, and
-saneless checks for a read-only mount before it writes anything. Either way it
-reports:
-
-```text
-Cannot replace /etc/saneless/saneless.toml: it is bind-mounted as a single file. Mount its directory instead (see docs/how-to/deploy-docker-compose.md).
-```
-
-`saneless auto-profiles` exits with status 2. The server logs a warning and uses
-the generated profiles for that run only; they do not survive a restart. Switch to
-the directory mount:
-
-1. Stop the stack: `docker compose down`
-2. Move the file into a directory: `mkdir config && mv config.toml config/saneless.toml`
-3. In `docker-compose.yml`, change the volume line to `- ./config:/etc/saneless`
-4. Start the stack: `docker compose up -d`
-
-### Upgrading from a pre-`data_dir` release
-
-Earlier releases kept the job database inside the scan scratch directory, and the
-compose file mounted the `saneless-data` volume at `/tmp/saneless`. Durable state now
-has its own setting, `output.data_dir`, which the image points at `/var/lib/saneless`,
-and the compose file above mounts the same named volume there instead.
-
-**saneless does not migrate anything.** It never moves, copies or reads a database
-at the old location; it simply opens `<data_dir>/saneless.db`. What that means for
-you depends on how you deployed.
-
-**Compose deployments keep their history, as long as you reuse the volume.** The
-old mount put `saneless.db` at the root of the `saneless-data` volume, and the new
-mount point is the root of that same volume. Point the `saneless-data` volume at
-`/var/lib/saneless` instead of the old path, leave the volume itself alone, and the
-existing database is found in place. Recreating or deleting the volume is what
-loses the history.
-
-**Bare-metal installs start with empty history.** The old database was at
-`<tmp_dir>/saneless.db`, typically `/tmp/saneless/saneless.db`; the new default is
-`~/.local/state/saneless/saneless.db`. Nothing copies it across. If you want your
-history, stop saneless and move the file yourself:
-
-```bash
-mkdir -p ~/.local/state/saneless
-cp -a /tmp/saneless/saneless.db* ~/.local/state/saneless/
-```
-
-!!! warning "Copy the `-wal` and `-shm` sidecars too"
-    saneless runs SQLite in WAL mode, so the database is up to three files:
-    `saneless.db`, `saneless.db-wal` and `saneless.db-shm`. After an unclean
-    shutdown the `-wal` file holds committed transactions that are not yet in the
-    main file, and copying only `saneless.db` silently loses them. Copy all three
-    -- the `saneless.db*` glob above does -- and only while saneless is stopped.
-
-If you would rather start clean, delete the old files and let saneless create a new
-database. Only job history is at stake either way: the scanned documents are in
-paperless-ngx, and profiles and settings come from `saneless.toml`. Preserved scans
-are not a concern for this upgrade, because the `failed/` directory is new in this
-release and there is nothing of that kind at the old path.
-
-### What else changed in this release
-
-- Scans that cannot be delivered to paperless-ngx are preserved as PDFs under
-  `<data_dir>/failed/` instead of being deleted, and the job's error message names
-  the file. See [Docker volumes](../reference/docker.md#volumes) for how the
-  directory grows and how to drain it.
-- A scan that fell back to the consume directory now ends in a new `FALLBACK`
-  state, shown as **Saved to folder** in amber rather than being reported as a
-  plain success. `saneless jobs` prints humanised labels (`Complete`, `Failed`,
-  `Saved to folder`) where it used to print the raw enum value;
-  `saneless jobs --json` still reports the raw `state` and now also carries
-  `outcome` and `warning`.
-- `GET /api/paperless/test` gained two outcomes: a 404 from the paperless-ngx API
-  is now `not_found` and a 5xx is `server_error`, where both were previously
-  reported as `connected`. The three original values are unchanged.
-- TLS verification now uses the operating system's trust store instead of a
-  certificate bundle shipped inside a Python package. The stock image is
-  unaffected, because it ships `ca-certificates`, and plain-`http://`
-  deployments are unaffected either way. A private or corporate CA installed in
-  the OS trust store now works where it previously did not. A private CA
-  installed only by editing the Python bundle now fails with a certificate
-  error: mount the CA file and point `SSL_CERT_FILE` at it.
-
-    ```yaml
-    services:
-      saneless:
-        environment:
-          SSL_CERT_FILE: /etc/ssl/certs/my-ca.crt
-        volumes:
-          - ./my-ca.crt:/etc/ssl/certs/my-ca.crt:ro
-    ```
-
-    Create `./my-ca.crt` on the host **before** the stack comes up. Docker
-    silently creates a *directory* at a bind-mount source that does not
-    exist, so the container finds a directory where the PEM file should be,
-    and saneless refuses to start with `Paperless error: Could not build the
-    TLS trust store for Paperless at <url>: <OS error text>;
-    check SSL_CERT_FILE and SSL_CERT_DIR`. If you hit that, put the file in
-    place and recreate the container. Note also that `SSL_CERT_FILE` replaces the
-    operating system's trust store rather than adding to it, so the file you
-    name must carry every CA saneless needs -- if `paperless.url` is signed by
-    a public CA, install the private CA into the OS trust store instead.
-
-    Both variables are described in
-    [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir),
-    and [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md#paperless-errors-exit-3)
-    shows what the failure looks like from the CLI and from the web UI -- they
-    do not look alike.
-- The outgoing `User-Agent` is now `python-httpx2/<version>`. This matters only
-  to a reverse proxy or WAF in front of paperless-ngx that filters on it.

@@ -1,16 +1,29 @@
 [scanner]
 host = ""       # SANE network host, leave empty for local
-device = ""     # SANE device string, leave empty for auto-detect
+# SANE device string. Empty auto-detects the first device listed, so a scanner
+# that appears on your network later could take your scans: pin one.
+# `saneless devices` lists the ids; `saneless auto-profiles` writes it for you.
+device = ""
 
 [paperless]
 url = "http://your-paperless-host:8000"
 token = "your-api-token-here"
-consume_dir = "/path/to/paperless/consume"
+# Optional fallback: must name an existing, mounted paperless-ngx consume directory.
+# consume_dir = "/path/to/paperless/consume"
 
 [output]
 # web_port = 8080       # bare metal only; in Docker remap with -p
-# tmp_dir = "/tmp/saneless"
+# tmp_dir = "/tmp/saneless-1000"  # default: $TMPDIR/saneless-<uid>, created 0700
 # log_level = "INFO"     # DEBUG, INFO, WARNING, ERROR or CRITICAL
+
+[web]
+# Extra host names the web UI answers to. IP addresses, localhost, names
+# without a dot and names under .local, .home.arpa, .internal and .lan always
+# work; add a reverse proxy's public name here. ".example.com" covers that
+# domain and every name under it. No "*", port, scheme or path.
+# Use a leading dot only for a domain you control; for dynamic DNS write
+# your own full name (me.duckdns.org), never ".duckdns.org".
+# allowed_hosts = ["scan.example.com"]
 
 [profiles.default]
 source = "Flatbed"
