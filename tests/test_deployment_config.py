@@ -86,6 +86,7 @@ from tests.citation_samples import (
     NON_CITATIONS,
     PLANNING_CITATION,
 )
+from tests.image_tag_support import expected_image_tag
 from tests.workflow_support import (
     CI_WORKFLOW,
     DOCS_WORKFLOW,
@@ -3174,29 +3175,6 @@ def _declared_version() -> str:
     return pyproject["project"]["version"]
 
 
-def _expected_image_tag(declared: str) -> str:
-    """
-    Return the image tag the documentation must pin for a declared version.
-
-    A release candidate publishes only its own exact tag, so that is the only
-    tag a reader can pull. The tag is the version as ``pyproject.toml`` spells
-    it, which is the spelling the release tag and so the image tag carry. A
-    final release also publishes a ``major.minor`` tag that later patch
-    releases move forward, and that is the one the documentation pins.
-
-    Args:
-        declared: ``project.version`` as written in ``pyproject.toml``.
-
-    Returns:
-        The declared string for a pre-release, else ``major.minor``.
-
-    """
-    version = Version(declared)
-    if version.is_prerelease:
-        return declared
-    return f"{version.major}.{version.minor}"
-
-
 def _read_or_report(root: Path, name: str, offenders: list[str]) -> str | None:
     """
     Return a file's text, or record it as an offender and return ``None``.
@@ -3298,7 +3276,7 @@ def test_the_expected_image_tag_follows_the_kind_of_release(
     declared: str, expected: str
 ) -> None:
     """A release candidate pins its exact tag; a final release pins major.minor."""
-    assert _expected_image_tag(declared) == expected
+    assert expected_image_tag(declared) == expected
 
 
 def test_every_shipped_image_reference_carries_the_published_image_tag() -> None:
@@ -3311,7 +3289,7 @@ def test_every_shipped_image_reference_carries_the_published_image_tag() -> None
     pulling ``latest``, or no tag at all, fails with "manifest unknown".
     """
     names = _shipped_files()
-    expected = _expected_image_tag(_declared_version())
+    expected = expected_image_tag(_declared_version())
 
     examined = _image_tag_offenders(names, REPO_ROOT, _IMPOSSIBLE_TAG)
     assert len(examined) >= 10, (
@@ -3399,7 +3377,7 @@ def test_the_image_tag_guard_moves_to_major_minor_at_a_final_release(
     )
 
     offenders = _image_tag_offenders(
-        ["rc.md", "final.md"], tmp_path, _expected_image_tag("0.2.0")
+        ["rc.md", "final.md"], tmp_path, expected_image_tag("0.2.0")
     )
 
     assert [entry.split(":", 1)[0] for entry in offenders] == ["rc.md"]
