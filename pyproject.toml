@@ -1,6 +1,6 @@
 [project]
 name = "saneless"
-version = "0.2.0-rc.7"
+version = "0.2.0"
 description = "SANE scanner to paperless-ngx bridge"
 readme = "README.md"
 license = "MIT"
@@ -243,7 +243,7 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.9",
     "ty>=0.0.84",
-    "uv>=0.12.19",
+    "uv>=0.12.20",
     "mkdocs-material>=9.7.7",
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",

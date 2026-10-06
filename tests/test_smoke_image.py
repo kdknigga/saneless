@@ -46,6 +46,7 @@ from scripts.smoke_image import (
     scan_button_enabled,
     substitute_documented_run,
 )
+from tests.image_tag_support import expected_image_tag
 
 if TYPE_CHECKING:
     import subprocess
@@ -471,7 +472,7 @@ def test_real_readme_and_quick_start_show_the_same_complete_run() -> None:
     assert run.data_volume
     assert any(item.startswith(SCANNER_HOST_ENV) for item in run.env), run.env
     assert run.stop_timeout == "90"
-    assert run.image == f"{IMAGE_NAME}:{_declared_version()}"
+    assert run.image == f"{IMAGE_NAME}:{expected_image_tag(_declared_version())}"
 
 
 def test_real_which_setup_runs_have_the_quick_start_shape() -> None:
@@ -491,7 +492,9 @@ def test_real_which_setup_runs_have_the_quick_start_shape() -> None:
         assert run.data_volume, run
         assert any(item.startswith(SCANNER_HOST_ENV) for item in run.env), run.env
         assert run.stop_timeout == "90", run
-        assert run.image == f"{IMAGE_NAME}:{_declared_version()}", run
+        assert run.image == f"{IMAGE_NAME}:{expected_image_tag(_declared_version())}", (
+            run
+        )
     assert parsed[0].add_hosts == ("host.docker.internal:host-gateway",)
 
 

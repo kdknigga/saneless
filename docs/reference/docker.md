@@ -6,7 +6,7 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 
 | Property | Value |
 |----------|-------|
-| Image | `ghcr.io/kdknigga/saneless:0.2.0-rc.7` |
+| Image | `ghcr.io/kdknigga/saneless:0.2` |
 | Base | `python:3.14-slim` |
 | Entrypoint | `saneless` |
 | Default command | `serve` |
@@ -73,17 +73,16 @@ does not exist yet. From its first final release on, they pin `X.Y`.
 
 ## Verifying the image
 
-Every image the release pipeline publishes after 0.2.0-rc.6 carries two signed
-attestations, recorded with GitHub and pushed beside the image to the registry:
-a SLSA build-provenance attestation, recording which workflow run in
+Every image the release pipeline publishes carries two signed attestations,
+recorded with GitHub and pushed beside the image to the registry: a SLSA
+build-provenance attestation, recording which workflow run in
 `kdknigga/saneless` built it from which commit, and an SPDX SBOM attestation
-listing what the image contains. **0.2.0-rc.6 and every earlier tag carry
-neither**, so verifying one of them fails.
+listing what the image contains.
 
 Attestations are bound to the image's digest, not to a tag, so start from the
 digest of the image you actually run. Replace `<image>` with the reference you
 pulled, exactly as your compose file or `docker run` line names it, tag
-included -- a release published after 0.2.0-rc.6:
+included:
 
 ```bash
 docker image inspect --format '{{index .RepoDigests 0}}' <image>
@@ -305,7 +304,7 @@ Keep the token in `config/saneless.toml` and out of the compose
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    image: ghcr.io/kdknigga/saneless:0.2
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -343,7 +342,7 @@ the container's own host, or another one:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    image: ghcr.io/kdknigga/saneless:0.2
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -378,7 +377,7 @@ Mount the file read-only over the image's own copy:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    image: ghcr.io/kdknigga/saneless:0.2
     stop_grace_period: 90s
     ports:
       - "8080:8080"
@@ -408,7 +407,7 @@ avahi-daemon to ask. Prefer the explicit `device` line.
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+    image: ghcr.io/kdknigga/saneless:0.2
     stop_grace_period: 90s
     ports:
       - "8080:8080"

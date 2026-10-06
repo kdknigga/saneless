@@ -66,7 +66,7 @@ Replace the URL and token with your actual paperless-ngx address and API token. 
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kdknigga/saneless:0.2.0-rc.7
+      ghcr.io/kdknigga/saneless:0.2
     ```
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.
