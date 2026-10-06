@@ -42,7 +42,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
     ```yaml
     services:
       saneless:
-        image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+        image: ghcr.io/kdknigga/saneless:0.2
         stop_grace_period: 90s
         ports:
           - "8080:8080"
@@ -68,7 +68,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=host.docker.internal \
-      ghcr.io/kdknigga/saneless:0.2.0-rc.7
+      ghcr.io/kdknigga/saneless:0.2
     ```
 
 On Linux Docker Engine, `host.docker.internal` resolves only because the
@@ -113,7 +113,7 @@ machine that has the scanner.
     ```yaml
     services:
       saneless:
-        image: ghcr.io/kdknigga/saneless:0.2.0-rc.7
+        image: ghcr.io/kdknigga/saneless:0.2
         stop_grace_period: 90s
         ports:
           - "8080:8080"
@@ -136,7 +136,7 @@ machine that has the scanner.
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kdknigga/saneless:0.2.0-rc.7
+      ghcr.io/kdknigga/saneless:0.2
     ```
 
 ## Notes on the container lines above
