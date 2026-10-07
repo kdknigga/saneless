@@ -2,17 +2,22 @@
 Refuse a release whose tag and ``pyproject.toml`` name different versions.
 
 The tag (minus one leading ``v``) and the declared project version are both
-parsed as PEP 440 versions and compared as versions, never as strings, so
-``v0.2.0-rc.6`` and ``v0.2.0rc6`` both match a project at ``0.2.0-rc.6``.
+parsed as PEP 440 versions and compared as versions, never as strings.
 Whether the release is a pre-release comes from the parsed version, not from
 how the tag is spelled.
+
+The tag must also be semver-shaped. The image tagger derives the version
+image tags from semver-shaped tag names only, but it pushes the floating
+``next`` tag for any tag at all, so a valid PEP 440 tag such as ``v0.2.0rc7``
+or ``v0.2`` would push an image with no version tag, move ``next`` onto it,
+and let the index upload run after it.
 
 A semver-shaped tag must also be spelled exactly as ``pyproject.toml`` spells
 the version. The image tagger publishes the tag's own spelling as the image
 tag, and the documentation pins the declared spelling, so ``v0.2.0-rc6``
 against ``0.2.0-rc.6`` would publish ``:0.2.0-rc6`` while every page points at
-``:0.2.0-rc.6``, a tag that does not exist. That mismatch is only visible
-after the image has been pushed, so the gate refuses it up front.
+``:0.2.0-rc.6``, a tag that does not exist. Both mismatches are only visible
+after the image has been pushed, so the gate refuses them up front.
 
 On success the script appends ``is_prerelease=true`` or ``is_prerelease=false``
 to the file named by ``GITHUB_OUTPUT`` (when set) and echoes the same line to
@@ -66,8 +71,8 @@ def check(tag: str, declared: str) -> bool:
 
     Raises:
         GateError: Either value is not a PEP 440 version, the two name
-            different versions, or a semver-shaped tag spells the version
-            differently from ``declared``.
+            different versions, the tag is not semver-shaped, or it spells
+            the version differently from ``declared``.
 
     """
     try:
@@ -79,7 +84,14 @@ def check(tag: str, declared: str) -> bool:
         msg = f"tag {tag} is version {tagged}, but pyproject.toml declares {project}"
         raise GateError(msg)
     image_tag = tag.removeprefix("v")
-    if _is_semver_shaped(tag) and image_tag != declared:
+    if not _is_semver_shaped(tag):
+        msg = (
+            f"tag {tag} is not semver-shaped, so the image tagger would push no "
+            "version tag for it, only the floating next tag; tag the release "
+            "as vMAJOR.MINOR.PATCH with an optional -prerelease"
+        )
+        raise GateError(msg)
+    if image_tag != declared:
         msg = (
             f"tag {tag} would publish image tag {image_tag!r}, but the docs pin "
             f"pyproject.toml's spelling {declared!r}; the tag must spell the "
@@ -165,13 +177,6 @@ def main(argv: list[str] | None = None) -> int:
     except GateError as exc:
         sys.stderr.write(f"release gate: {exc}\n")
         return 1
-
-    if not _is_semver_shaped(tag):
-        sys.stderr.write(
-            f"release gate: warning: tag {tag} is not semver-shaped, so "
-            "docker/metadata-action will emit no image tag for it and the image "
-            "publish will fail before anything is uploaded to PyPI\n"
-        )
 
     line = f"is_prerelease={'true' if prerelease else 'false'}\n"
     output = os.environ.get("GITHUB_OUTPUT")

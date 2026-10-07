@@ -33,14 +33,15 @@ jobs:
       contents: read
 
   # The tag and `pyproject.toml` must name the same PEP 440 version, or nothing
-  # publishes. The parsed version decides whether this is a pre-release, so
-  # `v0.2.0rc7` routes to TestPyPI like `v0.2.0-rc.7`. The script reads the tag
-  # from GITHUB_REF_NAME, so no tag text is pasted into a shell command, and
-  # `packaging` comes hash-checked from the lockfile's `release` group.
+  # publishes. The parsed version decides whether this is a pre-release, not
+  # the tag's spelling. The script reads the tag from GITHUB_REF_NAME, so no
+  # tag text is pasted into a shell command, and `packaging` comes hash-checked
+  # from the lockfile's `release` group.
   #
-  # A semver-shaped tag must spell the version exactly as pyproject.toml does,
-  # or the image tag would be one no page names. A valid but non-semver tag
-  # passes with a warning; publish-docker then fails before publish-pypi runs.
+  # The tag must be semver-shaped and spell the version exactly as
+  # pyproject.toml does. A non-semver tag is refused: the image tagger would
+  # push it under `next` alone, with no version tag, and publish-pypi would
+  # follow. A misspelled one would publish an image tag no page names.
   gate:
     name: gate
     runs-on: ubuntu-latest
