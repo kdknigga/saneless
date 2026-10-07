@@ -6641,6 +6641,9 @@ PUBLISH_PYPI_PERMISSIONS = {"contents": "read", "id-token": "write"}
 # and ``major.minor`` from final releases.
 SEMVER_VERSION_TAG = "type=semver,pattern={{version}}"
 SEMVER_MINOR_TAG = "type=semver,pattern={{major}}.{{minor}}"
+# The floating tag that follows the newest release of either kind, candidate
+# or final.
+NEXT_TAG = "type=raw,value=next"
 
 ATTEST_ACTION = "actions/attest@"
 SBOM_ACTION = "anchore/sbom-action@"
@@ -6996,6 +6999,25 @@ def test_release_image_tags_follow_semver_and_leave_latest_to_the_default() -> N
     assert not offenders, (
         "publish-docker names latest; leave it to the tagging action's "
         "default, which withholds it from pre-releases:\n" + "\n".join(offenders)
+    )
+
+
+def test_release_image_tags_move_next_on_every_release() -> None:
+    """
+    ``next`` moves on every release, candidate or final, with no condition.
+
+    It is the tag for whoever wants the newest build before it is final, so a
+    final release moves it too and it is never behind ``latest``. Any
+    ``enable=`` on its line would make it skip some kind of release.
+    """
+    metas = _steps_using(_release_job("publish-docker"), METADATA_ACTION)
+    assert len(metas) == 1, "publish-docker has no single metadata step"
+    lines = [
+        line.strip() for line in metas[0] if not _is_comment(line) and NEXT_TAG in line
+    ]
+    assert lines == [NEXT_TAG], (
+        f"the metadata step's tags carry {lines!r}; they must carry exactly "
+        f"one unconditional {NEXT_TAG!r} line"
     )
 
 

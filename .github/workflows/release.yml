@@ -95,10 +95,12 @@ jobs:
           # only. `latest` comes from the default `flavor: latest=auto`, which
           # withholds it from pre-releases. Never add a raw `latest` line, with
           # or without `enable=`: a release-candidate rehearsal must never
-          # leave the floating tag on a pre-release.
+          # leave the floating tag on a pre-release. `next` moves on every
+          # release, candidate or final, so it is never behind `latest`.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=next
       # The GHA build cache needs the docker-container driver, which the default
       # docker driver lacks.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

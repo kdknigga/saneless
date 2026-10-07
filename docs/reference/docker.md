@@ -58,6 +58,7 @@ gets depends on whether it is a final release or a release candidate:
 | `X.Y.Z-rc.N` | `0.2.0-rc.7` | every release candidate | Never. It always names that candidate. |
 | `X.Y` | `0.2` | final releases only | Yes. It moves to each new patch release of that minor version. |
 | `latest` | `latest` | final releases only | Yes. It moves to the newest final release. |
+| `next` | `next` | every release, candidate or final | Yes. It moves to the newest release of either kind. |
 
 **Release candidates never receive `X.Y` or `latest`.** Pulling either before
 the first final release fails with "manifest unknown", because the tag does not
@@ -66,6 +67,10 @@ exist yet.
 Pin `X.Y` to pick up patch releases when you pull, or pin `X.Y.Z` to change
 versions only when you edit the tag yourself. Avoid `latest`: it can move you
 across a minor version, and minor versions may carry breaking changes.
+
+Follow `next` to try each release candidate as it is published. Because a final
+release moves it too, it is never behind `latest`, and like `latest` it can move
+you across a minor version.
 
 Until a minor version's first final release is published, the examples in these
 docs pin the current release-candidate tag, because that version's `X.Y` tag
