@@ -2,13 +2,13 @@
 A release goes ahead only when the pushed tag names the declared version.
 
 A release is refused when the pushed tag and the version declared in
-``pyproject.toml`` name different versions. The two are compared as parsed
-PEP 440 versions, so ``v0.2.0-rc.6`` and ``v0.2.0rc6`` are the same release.
-Whether the release is a pre-release comes from the parsed version, never from
-how the tag happens to be spelled, and nothing is handed to later jobs when the
-gate refuses. A semver-shaped tag must also spell the version exactly as
-``pyproject.toml`` does, because that spelling becomes the published image tag
-the documentation pins.
+``pyproject.toml`` name different versions, compared as parsed PEP 440
+versions. Whether the release is a pre-release comes from the parsed version,
+never from how the tag happens to be spelled, and nothing is handed to later
+jobs when the gate refuses. The tag must also be semver-shaped and spell the
+version exactly as ``pyproject.toml`` does, because that spelling becomes the
+published image tag the documentation pins, and a tag the image tagger cannot
+read would publish only the floating ``next`` tag.
 """
 
 from __future__ import annotations
@@ -28,11 +28,9 @@ if TYPE_CHECKING:
     ("tag", "declared", "expected"),
     [
         ("v0.2.0-rc.6", "0.2.0-rc.6", True),
-        ("v0.2.0rc6", "0.2.0-rc.6", True),
-        ("v0.2.0rc7", "0.2.0rc7", True),
         ("v0.2.0", "0.2.0", False),
-        ("v1.0.0.dev1", "1.0.0.dev1", True),
-        ("v1.0.0.post1", "1.0.0.post1", False),
+        ("v1.0.0-beta.1", "1.0.0-beta.1", True),
+        ("v1.0.0-dev.1", "1.0.0-dev.1", True),
     ],
 )
 def test_matching_versions_report_whether_the_release_is_a_prerelease(
@@ -82,6 +80,35 @@ def test_semver_tag_spelled_unlike_the_project_is_refused(
     text = str(exc_info.value)
     assert repr(tag.removeprefix("v")) in text, text
     assert repr(declared) in text, text
+
+
+@pytest.mark.parametrize(
+    ("tag", "declared"),
+    [
+        ("v0.2.0rc6", "0.2.0-rc.6"),
+        ("v0.2.0rc7", "0.2.0rc7"),
+        ("v1.0.0.dev1", "1.0.0.dev1"),
+        ("v1.0.0.post1", "1.0.0.post1"),
+        ("v0.2.0-rc.06", "0.2.0-rc.6"),
+        ("vv0.2.0", "0.2.0"),
+        ("v0.2", "0.2.0"),
+        ("v0!0.2.0.0", "0.2.0"),
+    ],
+)
+def test_a_tag_the_image_tagger_cannot_read_is_refused(tag: str, declared: str) -> None:
+    """
+    A PEP 440 match that strict semver rejects is refused before publishing.
+
+    Each tag names the declared version, but none is a valid semver string (a
+    PEP 440-only pre-release, dev or post spelling, a leading zero in a
+    numeric pre-release identifier, a doubled ``v``, a missing patch number,
+    an epoch). The image tagger derives no version tag from such a name, so
+    the image would be pushed under the floating ``next`` tag alone.
+    """
+    with pytest.raises(GateError) as exc_info:
+        check(tag, declared)
+
+    assert "semver" in str(exc_info.value)
 
 
 def test_misspelled_tag_exits_nonzero_and_writes_no_output(
@@ -207,64 +234,14 @@ def test_missing_ref_name_fails_without_a_traceback(
     assert not output.exists()
 
 
-def test_non_semver_tag_routes_by_version_and_warns(
+def test_non_semver_tag_exits_nonzero_and_writes_no_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """
-    A PEP 440-only tag spelling still routes as a pre-release, with a warning.
-
-    The image tagger derives image tags from semver-shaped tag names only, so
-    the warning tells the maintainer the image publish will fail for this
-    spelling; the gate itself still succeeds.
-    """
+    """A tag the image tagger cannot read fails the step with no routing value."""
     code, output = _run(monkeypatch, tmp_path, "v0.2.0rc7", "0.2.0rc7")
 
-    assert code == 0
-    assert output.read_text(encoding="utf-8") == "is_prerelease=true\n"
-    err = capsys.readouterr().err
-    assert "warning" in err.lower()
-    assert "semver" in err.lower()
-
-
-@pytest.mark.parametrize(
-    ("tag", "declared"),
-    [
-        ("v0.2.0-rc.06", "0.2.0-rc.6"),
-        ("vv0.2.0", "0.2.0"),
-        ("v0.2", "0.2.0"),
-        ("v0!0.2.0.0", "0.2.0"),
-    ],
-)
-def test_a_tag_the_image_tagger_rejects_passes_with_a_warning(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    tag: str,
-    declared: str,
-) -> None:
-    """
-    A PEP 440 match that strict semver rejects is flagged in the log.
-
-    Each tag names the declared version, but none is a valid semver string (a
-    leading zero in a numeric pre-release identifier, a doubled ``v``, a
-    missing patch number, an epoch), so the image tagger publishes no tag for
-    it and the image publish fails before anything reaches the index.
-    """
-    code, _ = _run(monkeypatch, tmp_path, tag, declared)
-
-    assert code == 0
-    assert "semver" in capsys.readouterr().err.lower()
-
-
-def test_semver_tag_produces_no_warning(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A semver-shaped tag passes silently apart from the routing line."""
-    code, _ = _run(monkeypatch, tmp_path, "v0.2.0-rc.6", "0.2.0-rc.6")
-
-    assert code == 0
-    assert capsys.readouterr().err == ""
+    assert code == 1
+    assert "semver" in capsys.readouterr().err
+    assert not output.exists()

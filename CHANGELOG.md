@@ -4,6 +4,14 @@ All notable changes to saneless are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and saneless uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A `next` image tag, which moves to the newest release, candidate or final.
+  See
+  [Image tags](https://kdknigga.github.io/saneless/reference/docker/#image-tags).
+
 ## [0.2.0] - 2026-10-05
 
 The first release, 0.2.0.
@@ -53,4 +61,5 @@ The first release, 0.2.0.
   paperless-ngx request has the token struck out before it is shown or logged,
   and a config error names the setting, never its value.
 
+[Unreleased]: https://github.com/kdknigga/saneless/compare/v0.2.0...master
 [0.2.0]: https://github.com/kdknigga/saneless/releases/tag/v0.2.0
