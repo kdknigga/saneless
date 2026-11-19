@@ -25,7 +25,7 @@ FROM ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce2459468
 # The first sync installs dependencies and the build group; the second adds the
 # project and drops the build group. A source change reruns only the second.
 # `--no-editable` makes the venv self-contained once copied.
-FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS builder
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libc6-dev libsane-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -64,7 +64,7 @@ RUN uv sync --locked --no-default-groups --no-editable
 #   with no scanner attached. dll.d/ is emptied so no drop-in adds any back.
 # - pip and ensurepip's wheels are removed, so a `docker exec` finds no
 #   installer.
-FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 RUN apt-get update && apt-get install -y --no-install-recommends libsane1 \
     && rm -rf /var/lib/apt/lists/* \
     && printf 'net\nescl\n' > /etc/sane.d/dll.conf \
