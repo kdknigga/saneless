@@ -10,7 +10,7 @@
 # Pinned to the uv series pyproject.toml builds with,
 # `requires = ["uv_build>=0.12.18,<0.13.0"]`; a bump across that ceiling needs
 # the constraint widened in the same pull request.
-FROM ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.10@sha256:a3ea1357342c1a4bf9a0c53a3deb1b55379aefa037338d8113d5771efa01774f AS uv
 
 # Stage 1: Build.
 #
